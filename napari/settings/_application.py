@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
+from psutil import virtual_memory
 from pydantic import Field, validator
 
 from ..utils._base import _DEFAULT_LOCALE
@@ -15,6 +16,8 @@ from ._fields import Language
 GridStride = conint(ge=-50, le=50, ne=0)
 GridWidth = conint(ge=-1, ne=0)
 GridHeight = conint(ge=-1, ne=0)
+
+_DEFAULT_MEM_FRACTION = 0.25
 
 
 class ApplicationSettings(EventedModel):
@@ -154,6 +157,17 @@ class ApplicationSettings(EventedModel):
         default=-1,
         title=trans._("Grid Height"),
         description=trans._("Number of rows in the grid."),
+    )
+
+    dask: dict = Field(
+        default={
+            'enabled': True,
+            'cache': virtual_memory().total * _DEFAULT_MEM_FRACTION,
+        },
+        title=trans._("Enable Dask"),
+        description=trans._("Enable/disable Dask caching."),
+        max_cache=virtual_memory().total * 0.5,  # get value in mb
+        inc=100,
     )
 
     @validator('window_state')

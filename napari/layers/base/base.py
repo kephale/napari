@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple, Union
 import magicgui as mgui
 import numpy as np
 
+from ...settings import get_settings
 from ...utils._dask_utils import configure_dask
 from ...utils._magicgui import add_layer_to_viewer, get_layers
 from ...utils.events import EmitterGroup, Event
@@ -227,7 +228,12 @@ class Layer(KeymapProvider, MousemapProvider, ABC):
             name = magic_name(data)
 
         self._source = current_source()
-        self.dask_optimized_slicing = configure_dask(data, cache)
+        settings = get_settings()
+        cache = settings.application.dask['enabled']
+        nbytes = settings.application.dask['cache']
+        self.dask_optimized_slicing = configure_dask(
+            data, cache, nbytes=nbytes
+        )
         self._metadata = dict(metadata or {})
         self._opacity = opacity
         self._blending = Blending(blending)

@@ -20,7 +20,7 @@ from ..components.layerlist import LayerList
 from ..errors import MultipleReaderError, ReaderPluginError
 from ..layers.base.base import Layer
 from ..plugins import _npe2
-from ..utils import config, perf
+from ..utils import config, perf, resize_dask_cache
 from ..utils._proxies import ReadOnlyWrapper
 from ..utils.action_manager import action_manager
 from ..utils.colormaps.standardize_color import transform_color
@@ -328,6 +328,24 @@ class QtViewer(QSplitter):
 
         # bind shortcuts stored in settings last.
         self._bind_shortcuts()
+
+        # set dask preferences from settings.
+
+        settings = get_settings()
+
+        self._update_dask_settings()
+
+        settings.application.events.dask.connect(self._update_dask_settings)
+
+    def _update_dask_settings(self, event=None):
+        """Update dask cache to match settings."""
+
+        if get_settings().application.dask['enabled']:
+            # If dask is enabled, then resize cache
+            resize_dask_cache(get_settings().application.dask['cache'])
+        else:
+            # Disable dask.
+            resize_dask_cache(0)
 
     def _ensure_connect(self):
         # lazy load console
