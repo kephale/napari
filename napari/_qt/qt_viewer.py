@@ -341,8 +341,11 @@ class QtViewer(QSplitter):
         """Update dask cache to match settings."""
 
         if get_settings().application.dask['enabled']:
-            # If dask is enabled, then resize cache
-            resize_dask_cache(get_settings().application.dask['cache'])
+            # If dask is enabled, then resize cache.
+            # Value is in mb, need to convert to bytes.
+            resize_dask_cache(
+                get_settings().application.dask['cache'] * 1000000
+            )
         else:
             # Disable dask.
             resize_dask_cache(0)

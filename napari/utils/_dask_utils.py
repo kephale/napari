@@ -87,7 +87,6 @@ def _is_dask_data(data) -> bool:
 def configure_dask(
     data,
     cache=True,
-    nbytes=None,
 ) -> Callable[[], ContextManager[Optional[Tuple[dict, Cache]]]]:
     """Spin up cache and return context manager that optimizes Dask indexing.
 
@@ -138,7 +137,7 @@ def configure_dask(
     if not _is_dask_data(data):
         return contextlib.nullcontext
 
-    _cache = resize_dask_cache(nbytes) if cache else contextlib.nullcontext()
+    _cache = resize_dask_cache() if cache else contextlib.nullcontext()
 
     @contextlib.contextmanager
     def dask_optimized_slicing(memfrac=0.5):
