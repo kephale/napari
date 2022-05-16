@@ -60,7 +60,6 @@ def resize_dask_cache(
         nbytes = virtual_memory().total * mem_fraction
 
     avail = _DASK_CACHE.cache.available_bytes
-
     # if we don't have a cache already, create one.
     if avail == 1:
         # If neither nbytes nor mem_fraction was provided, use default
@@ -72,7 +71,6 @@ def resize_dask_cache(
         # resize_dask_cache() without supplying either mem_fraction or nbytes
         # is a no-op:
         _DASK_CACHE.cache.resize(nbytes)
-
     return _DASK_CACHE
 
 
@@ -85,8 +83,7 @@ def _is_dask_data(data) -> bool:
 
 
 def configure_dask(
-    data,
-    cache=True,
+    data, cache=True
 ) -> Callable[[], ContextManager[Optional[Tuple[dict, Cache]]]]:
     """Spin up cache and return context manager that optimizes Dask indexing.
 
