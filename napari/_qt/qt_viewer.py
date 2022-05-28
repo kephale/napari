@@ -334,20 +334,17 @@ class QtViewer(QSplitter):
         settings = get_settings()
         self._update_dask_settings(settings.application.dask)
 
-        settings.application.events.dask.connect(
-            lambda dask_event: self._update_dask_settings(dask_event.value)
-        )
+        settings.application.events.dask.connect(self._update_dask_settings)
 
-    def _update_dask_settings(self, dask_setting: dict):
+    def _update_dask_settings(self, dask_setting=None):
         """Update dask cache to match settings."""
+        if dask_setting:
+            if not isinstance(dask_setting, dict):
+                dask_setting = dask_setting.value
 
-        if dask_setting['enabled']:
-            # If dask is enabled, then resize cache.
-            # Value is in mb, need to convert to bytes.
-            resize_dask_cache(dask_setting['cache'] * 1e6)
-        else:
-            # Disable dask.
-            resize_dask_cache(0)
+            enabled = dask_setting['enabled']
+            size = dask_setting['cache']
+            resize_dask_cache(int(enabled) * size * 1e6)
 
     def _ensure_connect(self):
         # lazy load console
