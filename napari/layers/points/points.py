@@ -34,7 +34,7 @@ from ._points_utils import (
 DEFAULT_COLOR_CYCLE = np.array([[1, 0, 1, 1], [0, 1, 0, 1]])
 
 
-class Points(Layer):
+class _BasePoints(Layer):
     """Points layer.
 
     Parameters
@@ -359,14 +359,11 @@ class Points(Layer):
             feature_defaults=Event,
         )
 
-        # Save the point coordinates
-        self._data = np.asarray(data)
-
         self._feature_table = _FeatureTable.from_layer(
             features=features,
             properties=properties,
             property_choices=property_choices,
-            num_data=len(self.data),
+            num_data=len(self._points_data),
         )
 
         self._text = TextManager._from_layer(
@@ -414,7 +411,9 @@ class Points(Layer):
         self._round_index = False
 
         color_properties = (
-            self.properties if self._data.size > 0 else self.property_choices
+            self.properties
+            if self._points_data.size > 0
+            else self.property_choices
         )
         self._edge = ColorManager._from_layer_kwargs(
             n_colors=len(data),
@@ -453,80 +452,8 @@ class Points(Layer):
         self._update_dims()
 
     @property
-    def data(self) -> np.ndarray:
-        """(N, D) array: coordinates for N points in D dimensions."""
-        return self._data
-
-    @data.setter
-    def data(self, data: Optional[np.ndarray]):
-        data, _ = fix_data_points(data, self.ndim)
-        cur_npoints = len(self._data)
-        self._data = data
-
-        # Add/remove property and style values based on the number of new points.
-        with self.events.blocker_all():
-            with self._edge.events.blocker_all():
-                with self._face.events.blocker_all():
-                    self._feature_table.resize(len(data))
-                    self.text.apply(self.features)
-                    if len(data) < cur_npoints:
-                        # If there are now fewer points, remove the size and colors of the
-                        # extra ones
-                        if len(self._edge.colors) > len(data):
-                            self._edge._remove(
-                                np.arange(len(data), len(self._edge.colors))
-                            )
-                        if len(self._face.colors) > len(data):
-                            self._face._remove(
-                                np.arange(len(data), len(self._face.colors))
-                            )
-                        self._shown = self._shown[: len(data)]
-                        self._size = self._size[: len(data)]
-                        self._edge_width = self._edge_width[: len(data)]
-
-                    elif len(data) > cur_npoints:
-                        # If there are now more points, add the size and colors of the
-                        # new ones
-                        adding = len(data) - cur_npoints
-                        if len(self._size) > 0:
-                            new_size = copy(self._size[-1])
-                            for i in self._dims_displayed:
-                                new_size[i] = self.current_size
-                        else:
-                            # Add the default size, with a value for each dimension
-                            new_size = np.repeat(
-                                self.current_size, self._size.shape[1]
-                            )
-                        size = np.repeat([new_size], adding, axis=0)
-
-                        if len(self._edge_width) > 0:
-                            new_edge_width = copy(self._edge_width[-1])
-                        else:
-                            new_edge_width = self.current_edge_width
-                        edge_width = np.repeat(
-                            [new_edge_width], adding, axis=0
-                        )
-
-                        # add new colors
-                        self._edge._add(n_colors=adding)
-                        self._face._add(n_colors=adding)
-
-                        shown = np.repeat([True], adding, axis=0)
-                        self._shown = np.concatenate(
-                            (self._shown, shown), axis=0
-                        )
-
-                        self.size = np.concatenate((self._size, size), axis=0)
-                        self.edge_width = np.concatenate(
-                            (self._edge_width, edge_width), axis=0
-                        )
-                        self.selected_data = set(
-                            np.arange(cur_npoints, len(data))
-                        )
-
-        self._update_dims()
-        self.events.data(value=self.data)
-        self._set_editable()
+    def _points_data(self) -> np.ndarray:
+        raise NotImplementedError
 
     def _on_selection(self, selected):
         if selected:
@@ -559,7 +486,9 @@ class Points(Layer):
         self,
         features: Union[Dict[str, np.ndarray], pd.DataFrame],
     ) -> None:
-        self._feature_table.set_values(features, num_data=len(self.data))
+        self._feature_table.set_values(
+            features, num_data=len(self._points_data)
+        )
         self._update_color_manager(
             self._face, self._feature_table, "face_color"
         )
@@ -662,7 +591,7 @@ class Points(Layer):
 
     def _get_ndim(self) -> int:
         """Determine number of dimensions of the layer."""
-        return self.data.shape[1]
+        return self._points_data.shape[1]
 
     @property
     def _extent_data(self) -> np.ndarray:
@@ -672,11 +601,11 @@ class Points(Layer):
         -------
         extent_data : array, shape (2, D)
         """
-        if len(self.data) == 0:
+        if len(self._points_data) == 0:
             extrema = np.full((2, self.ndim), np.nan)
         else:
-            maxs = np.max(self.data, axis=0)
-            mins = np.min(self.data, axis=0)
+            maxs = np.max(self._points_data, axis=0)
+            mins = np.min(self._points_data, axis=0)
             extrema = np.vstack([mins, maxs])
         return extrema
 
@@ -728,11 +657,11 @@ class Points(Layer):
     @size.setter
     def size(self, size: Union[int, float, np.ndarray, list]) -> None:
         try:
-            self._size = np.broadcast_to(size, self.data.shape).copy()
+            self._size = np.broadcast_to(size, self._points_data.shape).copy()
         except Exception:
             try:
                 self._size = np.broadcast_to(
-                    size, self.data.shape[::-1]
+                    size, self._points_data.shape[::-1]
                 ).T.copy()
             except Exception:
                 raise ValueError(
@@ -804,7 +733,9 @@ class Points(Layer):
 
     @shown.setter
     def shown(self, shown):
-        self._shown = np.broadcast_to(shown, self.data.shape[0]).astype(bool)
+        self._shown = np.broadcast_to(
+            shown, self._points_data.shape[0]
+        ).astype(bool)
         self.refresh()
 
     @property
@@ -816,7 +747,9 @@ class Points(Layer):
     def edge_width(
         self, edge_width: Union[int, float, np.ndarray, list]
     ) -> None:
-        edge_width = np.broadcast_to(edge_width, self.data.shape[0]).copy()
+        edge_width = np.broadcast_to(
+            edge_width, self._points_data.shape[0]
+        ).copy()
         if self.edge_width_is_relative and np.any(
             (edge_width > 1) | (edge_width < 0)
         ):
@@ -875,7 +808,7 @@ class Points(Layer):
     def edge_color(self, edge_color):
         self._edge._set_color(
             color=edge_color,
-            n_colors=len(self.data),
+            n_colors=len(self._points_data),
             properties=self.properties,
             current_properties=self.current_properties,
         )
@@ -966,7 +899,7 @@ class Points(Layer):
     def face_color(self, face_color):
         self._face._set_color(
             color=face_color,
-            n_colors=len(self.data),
+            n_colors=len(self._points_data),
             properties=self.properties,
             current_properties=self.current_properties,
         )
@@ -1129,48 +1062,6 @@ class Points(Layer):
         """
         self._edge._refresh_colors(self.properties, update_color_mapping)
         self._face._refresh_colors(self.properties, update_color_mapping)
-
-    def _get_state(self):
-        """Get dictionary of layer state.
-
-        Returns
-        -------
-        state : dict
-            Dictionary of layer state.
-        """
-        state = self._get_base_state()
-        state.update(
-            {
-                'symbol': self.symbol,
-                'edge_width': self.edge_width,
-                'edge_width_is_relative': self.edge_width_is_relative,
-                'face_color': self.face_color
-                if self.data.size
-                else [self.current_face_color],
-                'face_color_cycle': self.face_color_cycle,
-                'face_colormap': self.face_colormap.name,
-                'face_contrast_limits': self.face_contrast_limits,
-                'edge_color': self.edge_color
-                if self.data.size
-                else [self.current_edge_color],
-                'edge_color_cycle': self.edge_color_cycle,
-                'edge_colormap': self.edge_colormap.name,
-                'edge_contrast_limits': self.edge_contrast_limits,
-                'properties': self.properties,
-                'property_choices': self.property_choices,
-                'text': self.text.dict(),
-                'out_of_slice_display': self.out_of_slice_display,
-                'n_dimensional': self.out_of_slice_display,
-                'size': self.size,
-                'ndim': self.ndim,
-                'data': self.data,
-                'features': self.features,
-                'shading': self.shading,
-                'experimental_canvas_size_limits': self.experimental_canvas_size_limits,
-                'shown': self.shown,
-            }
-        )
-        return state
 
     @property
     def selected_data(self) -> set:
@@ -1336,7 +1227,9 @@ class Points(Layer):
             Array of coordinates for the N points in view
         """
         if len(self._indices_view) > 0:
-            data = self.data[np.ix_(self._indices_view, self._dims_displayed)]
+            data = self._points_data[
+                np.ix_(self._indices_view, self._dims_displayed)
+            ]
         else:
             # if no points in this slice send dummy data
             data = np.zeros((0, self._ndisplay))
@@ -1475,9 +1368,11 @@ class Points(Layer):
         # arithmetic below. As Points._round_index is always False, we can safely
         # convert to float to get a major performance improvement.
         not_disp_indices = np.array(dims_indices)[not_disp].astype(float)
-        if len(self.data) > 0:
+        if len(self._points_data) > 0:
             if self.out_of_slice_display is True and self.ndim > 2:
-                distances = abs(self.data[:, not_disp] - not_disp_indices)
+                distances = abs(
+                    self._points_data[:, not_disp] - not_disp_indices
+                )
                 sizes = self.size[:, not_disp] / 2
                 matches = np.all(distances <= sizes, axis=1)
                 size_match = sizes[matches]
@@ -1488,7 +1383,7 @@ class Points(Layer):
                 slice_indices = np.where(matches)[0].astype(int)
                 return slice_indices, scale
             else:
-                data = self.data[:, not_disp]
+                data = self._points_data[:, not_disp]
                 distances = np.abs(data - not_disp_indices)
                 matches = np.all(distances <= 0.5, axis=1)
                 slice_indices = np.where(matches)[0].astype(int)
@@ -1807,6 +1702,332 @@ class Points(Layer):
         colormapped[..., 3] *= self.opacity
         self.thumbnail = colormapped
 
+    def get_status(
+        self,
+        position,
+        *,
+        view_direction: Optional[np.ndarray] = None,
+        dims_displayed: Optional[List[int]] = None,
+        world: bool = False,
+    ) -> str:
+        """Status message of the data at a coordinate position.
+
+        Parameters
+        ----------
+        position : tuple
+            Position in either data or world coordinates.
+        view_direction : Optional[np.ndarray]
+            A unit vector giving the direction of the ray in nD world coordinates.
+            The default value is None.
+        dims_displayed : Optional[List[int]]
+            A list of the dimensions currently being displayed in the viewer.
+            The default value is None.
+        world : bool
+            If True the position is taken to be in world coordinates
+            and converted into data coordinates. False by default.
+
+        Returns
+        -------
+        msg : string
+            String containing a message that can be used as a status update.
+        """
+        value = self.get_value(
+            position,
+            view_direction=view_direction,
+            dims_displayed=dims_displayed,
+            world=world,
+        )
+        msg = generate_layer_status(self.name, position, value)
+
+        # if this labels layer has properties
+        properties = self._get_properties(
+            position,
+            view_direction=view_direction,
+            dims_displayed=dims_displayed,
+            world=world,
+        )
+        if properties:
+            msg += "; " + ", ".join(properties)
+
+        return msg
+
+    def _get_tooltip_text(
+        self,
+        position,
+        *,
+        view_direction: Optional[np.ndarray] = None,
+        dims_displayed: Optional[List[int]] = None,
+        world: bool = False,
+    ):
+        """
+        tooltip message of the data at a coordinate position.
+
+        Parameters
+        ----------
+        position : tuple
+            Position in either data or world coordinates.
+        view_direction : Optional[np.ndarray]
+            A unit vector giving the direction of the ray in nD world coordinates.
+            The default value is None.
+        dims_displayed : Optional[List[int]]
+            A list of the dimensions currently being displayed in the viewer.
+            The default value is None.
+        world : bool
+            If True the position is taken to be in world coordinates
+            and converted into data coordinates. False by default.
+
+        Returns
+        -------
+        msg : string
+            String containing a message that can be used as a tooltip.
+        """
+        return "\n".join(
+            self._get_properties(
+                position,
+                view_direction=view_direction,
+                dims_displayed=dims_displayed,
+                world=world,
+            )
+        )
+
+    def _get_properties(
+        self,
+        position,
+        *,
+        view_direction: Optional[np.ndarray] = None,
+        dims_displayed: Optional[List[int]] = None,
+        world: bool = False,
+    ) -> list:
+        if self.features.shape[1] == 0:
+            return []
+
+        value = self.get_value(
+            position,
+            view_direction=view_direction,
+            dims_displayed=dims_displayed,
+            world=world,
+        )
+        # if the cursor is not outside the image or on the background
+        if value is None or value > self._points_data.shape[0]:
+            return []
+
+        return [
+            f'{k}: {v[value]}'
+            for k, v in self.features.items()
+            if k != 'index'
+            and len(v) > value
+            and v[value] is not None
+            and not (isinstance(v[value], float) and np.isnan(v[value]))
+        ]
+
+
+class Points(_BasePoints):
+    def __init__(
+        self,
+        data=None,
+        *,
+        ndim=None,
+        features=None,
+        properties=None,
+        text=None,
+        symbol='o',
+        size=10,
+        edge_width=0.1,
+        edge_width_is_relative=True,
+        edge_color='black',
+        edge_color_cycle=None,
+        edge_colormap='viridis',
+        edge_contrast_limits=None,
+        face_color='white',
+        face_color_cycle=None,
+        face_colormap='viridis',
+        face_contrast_limits=None,
+        out_of_slice_display=False,
+        n_dimensional=None,
+        name=None,
+        metadata=None,
+        scale=None,
+        translate=None,
+        rotate=None,
+        shear=None,
+        affine=None,
+        opacity=1,
+        blending='translucent',
+        visible=True,
+        cache=True,
+        property_choices=None,
+        experimental_clipping_planes=None,
+        shading='none',
+        experimental_canvas_size_limits=(0, 10000),
+        shown=True,
+    ):
+        if ndim is None and scale is not None:
+            ndim = len(scale)
+
+        data, ndim = fix_data_points(data, ndim)
+        # Save the point coordinates
+        self._data = np.asarray(data)
+
+        super().__init__(
+            data,
+            ndim=ndim,
+            features=features,
+            properties=properties,
+            text=text,
+            symbol=symbol,
+            size=size,
+            edge_width=edge_width,
+            edge_width_is_relative=edge_width_is_relative,
+            edge_color=edge_color,
+            edge_color_cycle=edge_color_cycle,
+            edge_colormap=edge_colormap,
+            edge_contrast_limits=edge_contrast_limits,
+            face_color=face_color,
+            face_color_cycle=face_color_cycle,
+            face_colormap=face_colormap,
+            face_contrast_limits=face_contrast_limits,
+            out_of_slice_display=out_of_slice_display,
+            n_dimensional=n_dimensional,
+            name=name,
+            metadata=metadata,
+            scale=scale,
+            translate=translate,
+            rotate=rotate,
+            shear=shear,
+            affine=affine,
+            opacity=opacity,
+            blending=blending,
+            visible=visible,
+            cache=cache,
+            property_choices=property_choices,
+            experimental_clipping_planes=experimental_clipping_planes,
+            shading=shading,
+            experimental_canvas_size_limits=experimental_canvas_size_limits,
+            shown=shown,
+        )
+
+    @property
+    def _points_data(self) -> np.ndarray:
+        return self.data
+
+    @property
+    def data(self) -> np.ndarray:
+        """(N, D) array: coordinates for N points in D dimensions."""
+        return self._data
+
+    @data.setter
+    def data(self, data: Optional[np.ndarray]):
+        data, _ = fix_data_points(data, self.ndim)
+        cur_npoints = len(self._data)
+        self._data = data
+
+        # Add/remove property and style values based on the number of new points.
+        with self.events.blocker_all():
+            with self._edge.events.blocker_all():
+                with self._face.events.blocker_all():
+                    self._feature_table.resize(len(data))
+                    self.text.apply(self.features)
+                    if len(data) < cur_npoints:
+                        # If there are now fewer points, remove the size and colors of the
+                        # extra ones
+                        if len(self._edge.colors) > len(data):
+                            self._edge._remove(
+                                np.arange(len(data), len(self._edge.colors))
+                            )
+                        if len(self._face.colors) > len(data):
+                            self._face._remove(
+                                np.arange(len(data), len(self._face.colors))
+                            )
+                        self._shown = self._shown[: len(data)]
+                        self._size = self._size[: len(data)]
+                        self._edge_width = self._edge_width[: len(data)]
+
+                    elif len(data) > cur_npoints:
+                        # If there are now more points, add the size and colors of the
+                        # new ones
+                        adding = len(data) - cur_npoints
+                        if len(self._size) > 0:
+                            new_size = copy(self._size[-1])
+                            for i in self._dims_displayed:
+                                new_size[i] = self.current_size
+                        else:
+                            # Add the default size, with a value for each dimension
+                            new_size = np.repeat(
+                                self.current_size, self._size.shape[1]
+                            )
+                        size = np.repeat([new_size], adding, axis=0)
+
+                        if len(self._edge_width) > 0:
+                            new_edge_width = copy(self._edge_width[-1])
+                        else:
+                            new_edge_width = self.current_edge_width
+                        edge_width = np.repeat(
+                            [new_edge_width], adding, axis=0
+                        )
+
+                        # add new colors
+                        self._edge._add(n_colors=adding)
+                        self._face._add(n_colors=adding)
+
+                        shown = np.repeat([True], adding, axis=0)
+                        self._shown = np.concatenate(
+                            (self._shown, shown), axis=0
+                        )
+
+                        self.size = np.concatenate((self._size, size), axis=0)
+                        self.edge_width = np.concatenate(
+                            (self._edge_width, edge_width), axis=0
+                        )
+                        self.selected_data = set(
+                            np.arange(cur_npoints, len(data))
+                        )
+
+        self._update_dims()
+        self.events.data(value=self.data)
+        self._set_editable()
+
+    def _get_state(self):
+        """Get dictionary of layer state.
+
+        Returns
+        -------
+        state : dict
+            Dictionary of layer state.
+        """
+        state = self._get_base_state()
+        state.update(
+            {
+                'symbol': self.symbol,
+                'edge_width': self.edge_width,
+                'edge_width_is_relative': self.edge_width_is_relative,
+                'face_color': self.face_color
+                if self.data.size
+                else [self.current_face_color],
+                'face_color_cycle': self.face_color_cycle,
+                'face_colormap': self.face_colormap.name,
+                'face_contrast_limits': self.face_contrast_limits,
+                'edge_color': self.edge_color
+                if self.data.size
+                else [self.current_edge_color],
+                'edge_color_cycle': self.edge_color_cycle,
+                'edge_colormap': self.edge_colormap.name,
+                'edge_contrast_limits': self.edge_contrast_limits,
+                'properties': self.properties,
+                'property_choices': self.property_choices,
+                'text': self.text.dict(),
+                'out_of_slice_display': self.out_of_slice_display,
+                'n_dimensional': self.out_of_slice_display,
+                'size': self.size,
+                'ndim': self.ndim,
+                'data': self.data,
+                'features': self.features,
+                'shading': self.shading,
+                'experimental_canvas_size_limits': self.experimental_canvas_size_limits,
+                'shown': self.shown,
+            }
+        )
+        return state
+
     def add(self, coord):
         """Adds point at coordinate.
 
@@ -2025,121 +2246,3 @@ class Points(Layer):
             )
             mask[np.ix_(*submask_coords)] |= normalized_square_distances <= 1
         return mask
-
-    def get_status(
-        self,
-        position,
-        *,
-        view_direction: Optional[np.ndarray] = None,
-        dims_displayed: Optional[List[int]] = None,
-        world: bool = False,
-    ) -> str:
-        """Status message of the data at a coordinate position.
-
-        Parameters
-        ----------
-        position : tuple
-            Position in either data or world coordinates.
-        view_direction : Optional[np.ndarray]
-            A unit vector giving the direction of the ray in nD world coordinates.
-            The default value is None.
-        dims_displayed : Optional[List[int]]
-            A list of the dimensions currently being displayed in the viewer.
-            The default value is None.
-        world : bool
-            If True the position is taken to be in world coordinates
-            and converted into data coordinates. False by default.
-
-        Returns
-        -------
-        msg : string
-            String containing a message that can be used as a status update.
-        """
-        value = self.get_value(
-            position,
-            view_direction=view_direction,
-            dims_displayed=dims_displayed,
-            world=world,
-        )
-        msg = generate_layer_status(self.name, position, value)
-
-        # if this labels layer has properties
-        properties = self._get_properties(
-            position,
-            view_direction=view_direction,
-            dims_displayed=dims_displayed,
-            world=world,
-        )
-        if properties:
-            msg += "; " + ", ".join(properties)
-
-        return msg
-
-    def _get_tooltip_text(
-        self,
-        position,
-        *,
-        view_direction: Optional[np.ndarray] = None,
-        dims_displayed: Optional[List[int]] = None,
-        world: bool = False,
-    ):
-        """
-        tooltip message of the data at a coordinate position.
-
-        Parameters
-        ----------
-        position : tuple
-            Position in either data or world coordinates.
-        view_direction : Optional[np.ndarray]
-            A unit vector giving the direction of the ray in nD world coordinates.
-            The default value is None.
-        dims_displayed : Optional[List[int]]
-            A list of the dimensions currently being displayed in the viewer.
-            The default value is None.
-        world : bool
-            If True the position is taken to be in world coordinates
-            and converted into data coordinates. False by default.
-
-        Returns
-        -------
-        msg : string
-            String containing a message that can be used as a tooltip.
-        """
-        return "\n".join(
-            self._get_properties(
-                position,
-                view_direction=view_direction,
-                dims_displayed=dims_displayed,
-                world=world,
-            )
-        )
-
-    def _get_properties(
-        self,
-        position,
-        *,
-        view_direction: Optional[np.ndarray] = None,
-        dims_displayed: Optional[List[int]] = None,
-        world: bool = False,
-    ) -> list:
-        if self.features.shape[1] == 0:
-            return []
-
-        value = self.get_value(
-            position,
-            view_direction=view_direction,
-            dims_displayed=dims_displayed,
-            world=world,
-        )
-        # if the cursor is not outside the image or on the background
-        if value is None or value > self.data.shape[0]:
-            return []
-
-        return [
-            f'{k}: {v[value]}'
-            for k, v in self.features.items()
-            if k != 'index'
-            and len(v) > value
-            and v[value] is not None
-            and not (isinstance(v[value], float) and np.isnan(v[value]))
-        ]
