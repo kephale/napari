@@ -1,4 +1,5 @@
 import warnings
+from abc import abstractmethod
 from copy import copy, deepcopy
 from itertools import cycle
 from typing import Dict, List, Optional, Tuple, Union
@@ -315,10 +316,16 @@ class _BasePoints(Layer):
         experimental_canvas_size_limits=(0, 10000),
         shown=True,
     ):
-        if ndim is None and scale is not None:
-            ndim = len(scale)
+        if ndim is None:
+            ndim = self._points_data.ndim
 
-        data, ndim = fix_data_points(data, ndim)
+        if scale is not None and len(scale) != ndim:
+            raise ValueError(
+                trans._(
+                    "Scale dimension must be equal to ndim",
+                    deferred=True,
+                )
+            )
 
         super().__init__(
             data,
@@ -452,6 +459,7 @@ class _BasePoints(Layer):
         self._update_dims()
 
     @property
+    @abstractmethod
     def _points_data(self) -> np.ndarray:
         raise NotImplementedError
 
@@ -1062,6 +1070,48 @@ class _BasePoints(Layer):
         """
         self._edge._refresh_colors(self.properties, update_color_mapping)
         self._face._refresh_colors(self.properties, update_color_mapping)
+
+    def _get_state(self):
+        """Get dictionary of layer state.
+
+        Returns
+        -------
+        state : dict
+            Dictionary of layer state.
+        """
+        state = self._get_base_state()
+        state.update(
+            {
+                'symbol': self.symbol,
+                'edge_width': self.edge_width,
+                'edge_width_is_relative': self.edge_width_is_relative,
+                'face_color': self.face_color
+                if self.data.size
+                else [self.current_face_color],
+                'face_color_cycle': self.face_color_cycle,
+                'face_colormap': self.face_colormap.name,
+                'face_contrast_limits': self.face_contrast_limits,
+                'edge_color': self.edge_color
+                if self.data.size
+                else [self.current_edge_color],
+                'edge_color_cycle': self.edge_color_cycle,
+                'edge_colormap': self.edge_colormap.name,
+                'edge_contrast_limits': self.edge_contrast_limits,
+                'properties': self.properties,
+                'property_choices': self.property_choices,
+                'text': self.text.dict(),
+                'out_of_slice_display': self.out_of_slice_display,
+                'n_dimensional': self.out_of_slice_display,
+                'size': self.size,
+                'ndim': self.ndim,
+                'data': self.data,
+                'features': self.features,
+                'shading': self.shading,
+                'experimental_canvas_size_limits': self.experimental_canvas_size_limits,
+                'shown': self.shown,
+            }
+        )
+        return state
 
     @property
     def selected_data(self) -> set:
@@ -1702,6 +1752,139 @@ class _BasePoints(Layer):
         colormapped[..., 3] *= self.opacity
         self.thumbnail = colormapped
 
+    def _update_props_and_style(self, data_size: int, prev_size: int) -> None:
+        # Add/remove property and style values based on the number of new points.
+        with self.events.blocker_all():
+            with self._edge.events.blocker_all():
+                with self._face.events.blocker_all():
+                    self._feature_table.resize(data_size)
+                    self.text.apply(self.features)
+                    if data_size < prev_size:
+                        # If there are now fewer points, remove the size and colors of the
+                        # extra ones
+                        if len(self._edge.colors) > data_size:
+                            self._edge._remove(
+                                np.arange(data_size, len(self._edge.colors))
+                            )
+                        if len(self._face.colors) > data_size:
+                            self._face._remove(
+                                np.arange(data_size, len(self._face.colors))
+                            )
+                        self._shown = self._shown[:data_size]
+                        self._size = self._size[:data_size]
+                        self._edge_width = self._edge_width[:data_size]
+
+                    elif data_size > prev_size:
+                        # If there are now more points, add the size and colors of the
+                        # new ones
+                        adding = data_size - prev_size
+                        if len(self._size) > 0:
+                            new_size = copy(self._size[-1])
+                            for i in self._dims_displayed:
+                                new_size[i] = self.current_size
+                        else:
+                            # Add the default size, with a value for each dimension
+                            new_size = np.repeat(
+                                self.current_size, self._size.shape[1]
+                            )
+                        size = np.repeat([new_size], adding, axis=0)
+
+                        if len(self._edge_width) > 0:
+                            new_edge_width = copy(self._edge_width[-1])
+                        else:
+                            new_edge_width = self.current_edge_width
+                        edge_width = np.repeat(
+                            [new_edge_width], adding, axis=0
+                        )
+
+                        # add new colors
+                        self._edge._add(n_colors=adding)
+                        self._face._add(n_colors=adding)
+
+                        shown = np.repeat([True], adding, axis=0)
+                        self._shown = np.concatenate(
+                            (self._shown, shown), axis=0
+                        )
+
+                        self.size = np.concatenate((self._size, size), axis=0)
+                        self.edge_width = np.concatenate(
+                            (self._edge_width, edge_width), axis=0
+                        )
+                        self.selected_data = set(
+                            np.arange(prev_size, data_size)
+                        )
+
+    def remove_selected(self):
+        """Removes selected points if any."""
+        index = list(self.selected_data)
+        index.sort()
+        if len(index):
+            self._shown = np.delete(self._shown, index, axis=0)
+            self._size = np.delete(self._size, index, axis=0)
+            self._edge_width = np.delete(self._edge_width, index, axis=0)
+            with self._edge.events.blocker_all():
+                self._edge._remove(indices_to_remove=index)
+            with self._face.events.blocker_all():
+                self._face._remove(indices_to_remove=index)
+            self._feature_table.remove(index)
+            self.text.remove(index)
+            if self._value in self.selected_data:
+                self._value = None
+            else:
+                if self._value is not None:
+                    # update the index of self._value to account for the
+                    # data being removed
+                    indices_removed = np.array(index) < self._value
+                    offset = np.sum(indices_removed)
+                    self._value -= offset
+                    self._value_stored -= offset
+
+            self._remove_from_data(index)
+            self.selected_data = set()
+
+    @abstractmethod
+    def _remove_from_data(self, indices: np.ndarray) -> None:
+        """Auxiliary function to remove items given their indices."""
+        raise NotImplementedError
+
+    def _move(self, index, coord):
+        """Moves points relative drag start location.
+
+        Parameters
+        ----------
+        index : list
+            Integer indices of points to move
+        coord : tuple
+            Coordinates to move points to
+        """
+        if len(index) > 0:
+            index = list(index)
+            disp = list(self._dims_displayed)
+            ixgrid = np.ix_(index, disp)
+            center = self._points_data[ixgrid].mean(axis=0)
+            coord = np.asarray(coord)
+            if self._drag_start is None:
+                self._drag_start = coord[disp] - center
+            shift = coord[disp] - center - self._drag_start
+            self._move_points(ixgrid, shift)
+            self.refresh()
+        self.events.data(value=self.data)
+
+    @abstractmethod
+    def _move_points(
+        self, ixgrid: Tuple[np.ndarray, np.ndarray], shift: np.ndarray
+    ) -> None:
+        """Move points along a set a coordinates given a shift.
+
+        Parameters
+        ----------
+        ixgrid : Tuple[np.ndarray, np.ndarray]
+            Crossproduct indexing grid of node indices and dimensions, see `np.ix_`
+        shift : np.ndarray
+            Selected coordinates shift
+        """
+        raise NotImplementedError
+
     def get_status(
         self,
         position,
@@ -1921,112 +2104,11 @@ class Points(_BasePoints):
         cur_npoints = len(self._data)
         self._data = data
 
-        # Add/remove property and style values based on the number of new points.
-        with self.events.blocker_all():
-            with self._edge.events.blocker_all():
-                with self._face.events.blocker_all():
-                    self._feature_table.resize(len(data))
-                    self.text.apply(self.features)
-                    if len(data) < cur_npoints:
-                        # If there are now fewer points, remove the size and colors of the
-                        # extra ones
-                        if len(self._edge.colors) > len(data):
-                            self._edge._remove(
-                                np.arange(len(data), len(self._edge.colors))
-                            )
-                        if len(self._face.colors) > len(data):
-                            self._face._remove(
-                                np.arange(len(data), len(self._face.colors))
-                            )
-                        self._shown = self._shown[: len(data)]
-                        self._size = self._size[: len(data)]
-                        self._edge_width = self._edge_width[: len(data)]
-
-                    elif len(data) > cur_npoints:
-                        # If there are now more points, add the size and colors of the
-                        # new ones
-                        adding = len(data) - cur_npoints
-                        if len(self._size) > 0:
-                            new_size = copy(self._size[-1])
-                            for i in self._dims_displayed:
-                                new_size[i] = self.current_size
-                        else:
-                            # Add the default size, with a value for each dimension
-                            new_size = np.repeat(
-                                self.current_size, self._size.shape[1]
-                            )
-                        size = np.repeat([new_size], adding, axis=0)
-
-                        if len(self._edge_width) > 0:
-                            new_edge_width = copy(self._edge_width[-1])
-                        else:
-                            new_edge_width = self.current_edge_width
-                        edge_width = np.repeat(
-                            [new_edge_width], adding, axis=0
-                        )
-
-                        # add new colors
-                        self._edge._add(n_colors=adding)
-                        self._face._add(n_colors=adding)
-
-                        shown = np.repeat([True], adding, axis=0)
-                        self._shown = np.concatenate(
-                            (self._shown, shown), axis=0
-                        )
-
-                        self.size = np.concatenate((self._size, size), axis=0)
-                        self.edge_width = np.concatenate(
-                            (self._edge_width, edge_width), axis=0
-                        )
-                        self.selected_data = set(
-                            np.arange(cur_npoints, len(data))
-                        )
+        self._update_props_and_style(len(data), cur_npoints)
 
         self._update_dims()
         self.events.data(value=self.data)
         self._set_editable()
-
-    def _get_state(self):
-        """Get dictionary of layer state.
-
-        Returns
-        -------
-        state : dict
-            Dictionary of layer state.
-        """
-        state = self._get_base_state()
-        state.update(
-            {
-                'symbol': self.symbol,
-                'edge_width': self.edge_width,
-                'edge_width_is_relative': self.edge_width_is_relative,
-                'face_color': self.face_color
-                if self.data.size
-                else [self.current_face_color],
-                'face_color_cycle': self.face_color_cycle,
-                'face_colormap': self.face_colormap.name,
-                'face_contrast_limits': self.face_contrast_limits,
-                'edge_color': self.edge_color
-                if self.data.size
-                else [self.current_edge_color],
-                'edge_color_cycle': self.edge_color_cycle,
-                'edge_colormap': self.edge_colormap.name,
-                'edge_contrast_limits': self.edge_contrast_limits,
-                'properties': self.properties,
-                'property_choices': self.property_choices,
-                'text': self.text.dict(),
-                'out_of_slice_display': self.out_of_slice_display,
-                'n_dimensional': self.out_of_slice_display,
-                'size': self.size,
-                'ndim': self.ndim,
-                'data': self.data,
-                'features': self.features,
-                'shading': self.shading,
-                'experimental_canvas_size_limits': self.experimental_canvas_size_limits,
-                'shown': self.shown,
-            }
-        )
-        return state
 
     def add(self, coord):
         """Adds point at coordinate.
@@ -2037,56 +2119,23 @@ class Points(_BasePoints):
         """
         self.data = np.append(self.data, np.atleast_2d(coord), axis=0)
 
-    def remove_selected(self):
-        """Removes selected points if any."""
-        index = list(self.selected_data)
-        index.sort()
-        if len(index):
-            self._shown = np.delete(self._shown, index, axis=0)
-            self._size = np.delete(self._size, index, axis=0)
-            self._edge_width = np.delete(self._edge_width, index, axis=0)
-            with self._edge.events.blocker_all():
-                self._edge._remove(indices_to_remove=index)
-            with self._face.events.blocker_all():
-                self._face._remove(indices_to_remove=index)
-            self._feature_table.remove(index)
-            self.text.remove(index)
-            if self._value in self.selected_data:
-                self._value = None
-            else:
-                if self._value is not None:
-                    # update the index of self._value to account for the
-                    # data being removed
-                    indices_removed = np.array(index) < self._value
-                    offset = np.sum(indices_removed)
-                    self._value -= offset
-                    self._value_stored -= offset
+    def _remove_from_data(self, indices: np.ndarray) -> None:
+        """Auxiliary function to remove items given their indices."""
+        self.data = np.delete(self.data, indices, axis=0)
 
-            self.data = np.delete(self.data, index, axis=0)
-            self.selected_data = set()
-
-    def _move(self, index, coord):
-        """Moves points relative drag start location.
+    def _move_points(
+        self, ixgrid: Tuple[np.ndarray, np.ndarray], shift: np.ndarray
+    ) -> None:
+        """Move points along a set a coordinates given a shift.
 
         Parameters
         ----------
-        index : list
-            Integer indices of points to move
-        coord : tuple
-            Coordinates to move points to
+        ixgrid : Tuple[np.ndarray, np.ndarray]
+            Crossproduct indexing grid of node indices and dimensions, see `np.ix_`
+        shift : np.ndarray
+            Selected coordinates shift
         """
-        if len(index) > 0:
-            index = list(index)
-            disp = list(self._dims_displayed)
-            ixgrid = np.ix_(index, disp)
-            center = self.data[ixgrid].mean(axis=0)
-            coord = np.asarray(coord)
-            if self._drag_start is None:
-                self._drag_start = coord[disp] - center
-            shift = coord[disp] - center - self._drag_start
-            self.data[ixgrid] += shift
-            self.refresh()
-        self.events.data(value=self.data)
+        self.data[ixgrid] += shift
 
     def _paste_data(self):
         """Paste any point from clipboard and select them."""

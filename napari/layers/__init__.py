@@ -9,6 +9,7 @@ from importlib import import_module as _imp
 
 from ..utils.misc import all_subclasses as _all_subcls
 from .base import Layer
+from .graph import Graph
 from .image import Image
 from .labels import Labels
 from .points import Points
@@ -25,6 +26,7 @@ NAMES = {
 }
 
 __all__ = [
+    'Graph',
     'Image',
     'Labels',
     'Layer',

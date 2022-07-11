@@ -4,6 +4,7 @@ import numpy as np
 from vispy.scene.widgets.viewbox import ViewBox
 
 from ...layers import (
+    Graph,
     Image,
     Labels,
     Layer,
@@ -16,6 +17,7 @@ from ...layers import (
 from ...utils.config import async_octree
 from ...utils.translations import trans
 from ..layers.base import VispyBaseLayer
+from ..layers.graph import VispyGraphLayer
 from ..layers.image import VispyImageLayer
 from ..layers.labels import VispyLabelsLayer
 from ..layers.points import VispyPointsLayer
@@ -25,6 +27,7 @@ from ..layers.tracks import VispyTracksLayer
 from ..layers.vectors import VispyVectorsLayer
 
 layer_to_visual = {
+    Graph: VispyGraphLayer,
     Image: VispyImageLayer,
     Labels: VispyLabelsLayer,
     Points: VispyPointsLayer,

@@ -136,7 +136,7 @@ class VispyPointsLayer(VispyBaseLayer):
 
     def _get_text_node(self):
         """Function to get the text node from the Compound visual"""
-        text_node = self.node._subvisuals[-1]
+        text_node = self.node._subvisuals[3]
         return text_node
 
     def _on_text_change(self, event=None):

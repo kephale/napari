@@ -1,7 +1,10 @@
+from typing import Tuple
+
 import numpy as np
 from napari_graph import UndirectedGraph
 from napari_graph._base_graph import BaseGraph
 
+from ...utils.translations import trans
 from ..points.points import _BasePoints
 
 
@@ -102,10 +105,96 @@ class Graph(_BasePoints):
         return self._data.coordinates()
 
     @property
-    def data(self) -> np.ndarray:
-        """(N, D) array: coordinates for N points in D dimensions."""
-        pass
+    def edges_coordinates(self) -> np.ndarray:
+        _, edges = self.data.edges_buffers()
+        coords = self.data.coordinates()[edges]
+        coords = coords[..., self._dims_displayed]
+        return coords
+
+    @property
+    def data(self) -> BaseGraph:
+        return self._data
 
     @data.setter
     def data(self, data) -> None:
-        pass
+        prev_size = len(self.data)
+        self._data = data_to_graph(data)
+        self._data_changed(prev_size)
+
+    def _get_state(self):
+        """Get dictionary of layer state.
+
+        Returns
+        -------
+        state : dict
+            Dictionary of layer state.
+        """
+        state = super()._get_state()
+        # state.update({})   # FIXME
+        return state
+
+    def add(self, coords, indices=None) -> None:
+        """Adds nodes at coordinates.
+
+        Parameters
+        ----------
+        coords : sequence of indices to add point at
+        indices : optional indices of the newly inserted nodes.
+        """
+        coords = np.atleast_2d(coords)
+        if indices is None:
+            new_starting_idx = self.data._buffer2world.max() + 1
+            indices = np.arange(
+                new_starting_idx, new_starting_idx + len(coords)
+            )
+
+        if len(coords) != len(indices):
+            raise ValueError(
+                trans._(
+                    'coordinates and indices must have the same length. Found {coords_size} and {idx_size}',
+                    coords_size=len(coords),
+                    idx_size=len(indices),
+                )
+            )
+
+        prev_size = len(self.data)
+
+        for idx, coord in zip(indices, coords):
+            self.data.add_node(idx, coord)
+
+        self._data_changed(prev_size)
+
+    def _remove_from_data(self, indices: np.ndarray) -> None:
+        """Auxiliary function to remove items given their indices."""
+        prev_size = len(self.data)
+
+        for idx in indices:
+            self.data.remove_node(idx, is_buffer_index=True)
+
+        self._data_changed(prev_size)
+
+    def _data_changed(self, prev_size: int) -> None:
+        self._update_props_and_style(len(self.data), prev_size)
+        self._update_dims()
+        self.events.data(value=self.data)
+        self._set_editable()
+
+    def _move_points(
+        self, ixgrid: Tuple[np.ndarray, np.ndarray], shift: np.ndarray
+    ) -> None:
+        """Move points along a set a coordinates given a shift.
+
+        Parameters
+        ----------
+        ixgrid : Tuple[np.ndarray, np.ndarray]
+            Crossproduct indexing grid of node indices and dimensions, see `np.ix_`
+        shift : np.ndarray
+            Selected coordinates shift
+        """
+        self.data._coords[ixgrid] += shift
+
+    def _paste_data(self):
+        raise NotImplementedError
+
+    def _copy_data(self):
+        raise NotImplementedError

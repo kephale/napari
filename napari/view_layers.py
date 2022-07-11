@@ -21,6 +21,7 @@ from napari.components.dims import Dims
 from .viewer import Viewer
 
 __all__ = [
+    "view_graph",
     'view_image',
     'view_labels',
     'view_path',
@@ -135,6 +136,11 @@ def _make_viewer_then(add_method: str, args, kwargs) -> Viewer:
 #     viewer = Viewer(**viewer_kwargs)
 #     viewer.add_image(*args, **kwargs)
 #     return viewer
+
+
+@_merge_layer_viewer_sigs_docs
+def view_graph(*args, **kwargs):
+    return _make_viewer_then('add_graph', args, kwargs)
 
 
 @_merge_layer_viewer_sigs_docs

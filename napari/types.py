@@ -109,6 +109,7 @@ else:
     ArrayBase = np.ndarray  # type: ignore
 
 
+GraphData = NewType("GraphData", tuple)  # FIXME
 ImageData = NewType("ImageData", ArrayBase)
 LabelsData = NewType("LabelsData", ArrayBase)
 PointsData = NewType("PointsData", ArrayBase)

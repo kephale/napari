@@ -1,8 +1,18 @@
 from qtpy.QtWidgets import QFrame, QStackedWidget
 
-from ...layers import Image, Labels, Points, Shapes, Surface, Tracks, Vectors
+from ...layers import (
+    Graph,
+    Image,
+    Labels,
+    Points,
+    Shapes,
+    Surface,
+    Tracks,
+    Vectors,
+)
 from ...utils import config
 from ...utils.translations import trans
+from .qt_graph_controls import QtGraphControls
 from .qt_image_controls import QtImageControls
 from .qt_labels_controls import QtLabelsControls
 from .qt_points_controls import QtPointsControls
@@ -14,6 +24,7 @@ from .qt_vectors_controls import QtVectorsControls
 layer_to_controls = {
     Labels: QtLabelsControls,
     Image: QtImageControls,
+    Graph: QtGraphControls,
     Points: QtPointsControls,
     Shapes: QtShapesControls,
     Surface: QtSurfaceControls,
