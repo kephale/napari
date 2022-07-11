@@ -2078,14 +2078,13 @@ class Points(_BasePoints):
         if len(index) > 0:
             index = list(index)
             disp = list(self._dims_displayed)
+            ixgrid = np.ix_(index, disp)
+            center = self.data[ixgrid].mean(axis=0)
+            coord = np.asarray(coord)
             if self._drag_start is None:
-                center = self.data[np.ix_(index, disp)].mean(axis=0)
-                self._drag_start = np.array(coord)[disp] - center
-            center = self.data[np.ix_(index, disp)].mean(axis=0)
-            shift = np.array(coord)[disp] - center - self._drag_start
-            self.data[np.ix_(index, disp)] = (
-                self.data[np.ix_(index, disp)] + shift
-            )
+                self._drag_start = coord[disp] - center
+            shift = coord[disp] - center - self._drag_start
+            self.data[ixgrid] += shift
             self.refresh()
         self.events.data(value=self.data)
 
