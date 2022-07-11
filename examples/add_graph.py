@@ -16,7 +16,7 @@ def build_graph(n_nodes: int, sparsity: float) -> UndirectedGraph:
     )
 
     graph = UndirectedGraph(len(nodes_df), ndim=3, n_edges=len(edges))
-    graph.init_nodes_from_dataframe(nodes_df, ['z', 'y', 'x'])
+    graph.init_nodes_from_dataframe(nodes_df, ["z", "y", "x"])
     graph.add_edges(edges)
 
     return graph
@@ -25,8 +25,8 @@ def build_graph(n_nodes: int, sparsity: float) -> UndirectedGraph:
 if __name__ == "__main__":
 
     viewer = napari.Viewer()
-    graph = build_graph(100, 0.01)
-    layer = Graph(graph)
+    graph = build_graph(10000, 0.01)
+    layer = Graph(graph, out_of_slice_display=True)
     viewer.add_layer(layer)
 
     napari.run()

@@ -20,11 +20,17 @@ class VispyGraphLayer(VispyPointsLayer):
         if len(self.node._subvisuals) <= 4:
             return
 
-        edges = self.layer.edges_coordinates
+        subvisual = self.node._subvisuals[4]
+        edges = self.layer._view_edges_coordinates
+
+        if len(edges) == 0:
+            subvisual.visible = False
+            return
+
+        subvisual.visible = True
         flat_edges = edges.reshape((-1, edges.shape[-1]))  # (N x 2, D)
         flat_edges = flat_edges[:, ::-1]
 
-        subvisual = self.node._subvisuals[4]
         subvisual._line_visual._pos_vbo = gloo.VertexBuffer()
         subvisual.set_data(
             flat_edges,

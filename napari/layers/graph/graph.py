@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import List, Tuple, Union
 
 import numpy as np
 from napari_graph import UndirectedGraph
@@ -61,6 +61,7 @@ class Graph(_BasePoints):
     ):
         # Save the point coordinates
         self._data = data_to_graph(data)
+        self._edges_indices_view = []
 
         super().__init__(
             data,
@@ -104,12 +105,45 @@ class Graph(_BasePoints):
     def _points_data(self) -> np.ndarray:
         return self._data.coordinates()
 
+    def _slice_data(
+        self, dims_indices
+    ) -> Tuple[List[int], Union[float, np.ndarray]]:
+        """Determines the slice of points given the indices."""
+        slice_indices, scale = super()._slice_data(dims_indices)
+        valid = (
+            self.data._buffer2world[slice_indices] != BaseGraph._NODE_EMPTY_PTR
+        )
+        slice_indices = slice_indices[valid]
+        if isinstance(scale, np.ndarray):
+            scale = scale[valid]
+        return slice_indices, scale
+
+    def _set_view_slice(self) -> None:
+        """Sets the view given the indices to slice with."""
+        super()._set_view_slice()
+        self._set_edges_indices_view()
+
+    def _set_edges_indices_view(self):
+        """Sets edges indices view from `_indices_view`"""
+        if len(self.data) == 0 or len(self._indices_view) == 0:
+            self._edges_indices_view = []
+        else:
+            mask = np.zeros(self.data.n_allocated_nodes, dtype=bool)
+            mask[self._indices_view] = True
+            _, edges = self.data.edges_buffers(is_buffer_domain=True)
+            both_in_view = np.logical_and(mask[edges[:, 0]], mask[edges[:, 1]])
+            (self._edges_indices_view,) = np.nonzero(both_in_view)
+
     @property
     def edges_coordinates(self) -> np.ndarray:
-        _, edges = self.data.edges_buffers()
-        coords = self.data.coordinates()[edges]
+        _, edges = self.data.edges_buffers(is_buffer_domain=True)
+        coords = self.data._coords[edges]
         coords = coords[..., self._dims_displayed]
         return coords
+
+    @property
+    def _view_edges_coordinates(self) -> np.ndarray:
+        return self.edges_coordinates[self._edges_indices_view]
 
     @property
     def data(self) -> BaseGraph:
@@ -117,7 +151,7 @@ class Graph(_BasePoints):
 
     @data.setter
     def data(self, data) -> None:
-        prev_size = len(self.data)
+        prev_size = self.data.n_allocated_nodes
         self._data = data_to_graph(data)
         self._data_changed(prev_size)
 
@@ -157,24 +191,30 @@ class Graph(_BasePoints):
                 )
             )
 
-        prev_size = len(self.data)
+        prev_size = self.data.n_allocated_nodes
 
         for idx, coord in zip(indices, coords):
             self.data.add_node(idx, coord)
 
         self._data_changed(prev_size)
 
-    def _remove_from_data(self, indices: np.ndarray) -> None:
-        """Auxiliary function to remove items given their indices."""
-        prev_size = len(self.data)
-
+    def remove(self, indices: Union[np.ndarray, List[int]]) -> None:
+        """Removes nodes given their indices."""
+        prev_size = self.data.n_allocated_nodes
+        if isinstance(indices, np.ndarray):
+            indices = indices.tolist()
+        indices.sort(reverse=True)
         for idx in indices:
-            self.data.remove_node(idx, is_buffer_index=True)
-
+            self.data.remove_node(idx)
         self._data_changed(prev_size)
 
+    def _remove_from_data(self, indices: Union[np.ndarray, List[int]]) -> None:
+        """Auxiliary function to remove items given their indices."""
+        indices = self.data._buffer2world[indices]
+        self.remove(indices)
+
     def _data_changed(self, prev_size: int) -> None:
-        self._update_props_and_style(len(self.data), prev_size)
+        self._update_props_and_style(self.data.n_allocated_nodes, prev_size)
         self._update_dims()
         self.events.data(value=self.data)
         self._set_editable()
