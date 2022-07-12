@@ -13,11 +13,12 @@ from .base import VispyBaseLayer
 class VispyPointsLayer(VispyBaseLayer):
     _highlight_color = (0, 0.6, 1)
     _highlight_width = None
+    _visual = PointsVisual
 
     def __init__(self, layer):
         self._highlight_width = get_settings().appearance.highlight_thickness
 
-        node = PointsVisual()
+        node = self._visual()
         super().__init__(layer, node)
 
         self.layer.events.symbol.connect(self._on_symbol_change)
