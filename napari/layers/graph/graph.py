@@ -61,7 +61,7 @@ class Graph(_BasePoints):
     ):
         # Save the point coordinates
         self._data = data_to_graph(data)
-        self._edges_indices_view = []
+        self._graph_edges_view = []
 
         super().__init__(
             data,
@@ -126,24 +126,26 @@ class Graph(_BasePoints):
     def _set_edges_indices_view(self):
         """Sets edges indices view from `_indices_view`"""
         if len(self.data) == 0 or len(self._indices_view) == 0:
-            self._edges_indices_view = []
+            self._graph_edges_view = []
         else:
             mask = np.zeros(self.data.n_allocated_nodes, dtype=bool)
             mask[self._indices_view] = True
             _, edges = self.data.edges_buffers(is_buffer_domain=True)
-            both_in_view = np.logical_and(mask[edges[:, 0]], mask[edges[:, 1]])
-            (self._edges_indices_view,) = np.nonzero(both_in_view)
+            self._graph_edges_view = edges[
+                np.logical_and(mask[edges[:, 0]], mask[edges[:, 1]])
+            ]
 
     @property
     def edges_coordinates(self) -> np.ndarray:
         _, edges = self.data.edges_buffers(is_buffer_domain=True)
-        coords = self.data._coords[edges]
-        coords = coords[..., self._dims_displayed]
+        coords = self.data._coords[edges][..., self._dims_displayed]
         return coords
 
     @property
     def _view_edges_coordinates(self) -> np.ndarray:
-        return self.edges_coordinates[self._edges_indices_view]
+        return self.data._coords[self._graph_edges_view][
+            ..., self._dims_displayed
+        ]
 
     @property
     def data(self) -> BaseGraph:

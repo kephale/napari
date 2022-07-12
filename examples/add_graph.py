@@ -5,11 +5,10 @@ from napari.layers import Graph
 from napari_graph import UndirectedGraph
 
 
-def build_graph(n_nodes: int, sparsity: float) -> UndirectedGraph:
-    adj_matrix = np.random.uniform(size=(n_nodes, n_nodes)) < sparsity
-    np.fill_diagonal(adj_matrix, 0)
+def build_graph(n_nodes: int, n_neighbors: int) -> UndirectedGraph:
+    neighbors = np.random.randint(n_nodes, size=(n_nodes * n_neighbors))
+    edges = np.stack([np.repeat(np.arange(n_nodes), n_neighbors), neighbors], axis=1)
 
-    edges = np.stack(adj_matrix.nonzero()).T
     nodes_df = pd.DataFrame(
         400 * np.random.uniform(size=(n_nodes, 4)),
         columns=["t", "z", "y", "x"],
@@ -25,8 +24,8 @@ def build_graph(n_nodes: int, sparsity: float) -> UndirectedGraph:
 if __name__ == "__main__":
 
     viewer = napari.Viewer()
-    n_nodes = 10000
-    graph = build_graph(n_nodes, 2 / n_nodes)
+    n_nodes = 1000000
+    graph = build_graph(n_nodes, 5)
     layer = Graph(graph, out_of_slice_display=True)
     viewer.add_layer(layer)
 
