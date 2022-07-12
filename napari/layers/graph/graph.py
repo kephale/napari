@@ -103,7 +103,7 @@ class Graph(_BasePoints):
 
     @property
     def _points_data(self) -> np.ndarray:
-        return self._data.coordinates()
+        return self._data._coords
 
     def _slice_data(
         self, dims_indices
@@ -198,6 +198,13 @@ class Graph(_BasePoints):
 
         self._data_changed(prev_size)
 
+    def remove_selected(self):
+        """Removes selected points if any."""
+        if len(self.selected_data):
+            indices = self.data._buffer2world[list(self.selected_data)]
+            self.remove(indices)
+            self.selected_data = set()
+
     def remove(self, indices: Union[np.ndarray, List[int]]) -> None:
         """Removes nodes given their indices."""
         prev_size = self.data.n_allocated_nodes
@@ -207,11 +214,6 @@ class Graph(_BasePoints):
         for idx in indices:
             self.data.remove_node(idx)
         self._data_changed(prev_size)
-
-    def _remove_from_data(self, indices: Union[np.ndarray, List[int]]) -> None:
-        """Auxiliary function to remove items given their indices."""
-        indices = self.data._buffer2world[indices]
-        self.remove(indices)
 
     def _data_changed(self, prev_size: int) -> None:
         self._update_props_and_style(self.data.n_allocated_nodes, prev_size)

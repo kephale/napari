@@ -1814,37 +1814,9 @@ class _BasePoints(Layer):
                             np.arange(prev_size, data_size)
                         )
 
+    @abstractmethod
     def remove_selected(self):
         """Removes selected points if any."""
-        index = list(self.selected_data)
-        index.sort()
-        if len(index):
-            self._shown = np.delete(self._shown, index, axis=0)
-            self._size = np.delete(self._size, index, axis=0)
-            self._edge_width = np.delete(self._edge_width, index, axis=0)
-            with self._edge.events.blocker_all():
-                self._edge._remove(indices_to_remove=index)
-            with self._face.events.blocker_all():
-                self._face._remove(indices_to_remove=index)
-            self._feature_table.remove(index)
-            self.text.remove(index)
-            if self._value in self.selected_data:
-                self._value = None
-            else:
-                if self._value is not None:
-                    # update the index of self._value to account for the
-                    # data being removed
-                    indices_removed = np.array(index) < self._value
-                    offset = np.sum(indices_removed)
-                    self._value -= offset
-                    self._value_stored -= offset
-
-            self._remove_from_data(index)
-            self.selected_data = set()
-
-    @abstractmethod
-    def _remove_from_data(self, indices: np.ndarray) -> None:
-        """Auxiliary function to remove items given their indices."""
         raise NotImplementedError
 
     def _move(self, index, coord):
@@ -2110,6 +2082,34 @@ class Points(_BasePoints):
         self.events.data(value=self.data)
         self._set_editable()
 
+    def remove_selected(self):
+        """Removes selected points if any."""
+        index = list(self.selected_data)
+        index.sort()
+        if len(index):
+            self._shown = np.delete(self._shown, index, axis=0)
+            self._size = np.delete(self._size, index, axis=0)
+            self._edge_width = np.delete(self._edge_width, index, axis=0)
+            with self._edge.events.blocker_all():
+                self._edge._remove(indices_to_remove=index)
+            with self._face.events.blocker_all():
+                self._face._remove(indices_to_remove=index)
+            self._feature_table.remove(index)
+            self.text.remove(index)
+            if self._value in self.selected_data:
+                self._value = None
+            else:
+                if self._value is not None:
+                    # update the index of self._value to account for the
+                    # data being removed
+                    indices_removed = np.array(index) < self._value
+                    offset = np.sum(indices_removed)
+                    self._value -= offset
+                    self._value_stored -= offset
+
+            self.data = np.delete(self.data, index, axis=0)
+            self.selected_data = set()
+
     def add(self, coord):
         """Adds point at coordinate.
 
@@ -2118,10 +2118,6 @@ class Points(_BasePoints):
         coord : sequence of indices to add point at
         """
         self.data = np.append(self.data, np.atleast_2d(coord), axis=0)
-
-    def _remove_from_data(self, indices: np.ndarray) -> None:
-        """Auxiliary function to remove items given their indices."""
-        self.data = np.delete(self.data, indices, axis=0)
 
     def _move_points(
         self, ixgrid: Tuple[np.ndarray, np.ndarray], shift: np.ndarray
