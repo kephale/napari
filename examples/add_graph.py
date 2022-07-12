@@ -11,12 +11,12 @@ def build_graph(n_nodes: int, sparsity: float) -> UndirectedGraph:
 
     edges = np.stack(adj_matrix.nonzero()).T
     nodes_df = pd.DataFrame(
-        100 * np.random.randn(n_nodes, 3),
-        columns=["z", "y", "x"]
+        400 * np.random.uniform(size=(n_nodes, 4)),
+        columns=["t", "z", "y", "x"],
     )
 
-    graph = UndirectedGraph(len(nodes_df), ndim=3, n_edges=len(edges))
-    graph.init_nodes_from_dataframe(nodes_df, ["z", "y", "x"])
+    graph = UndirectedGraph(len(nodes_df), ndim=4, n_edges=len(edges))
+    graph.init_nodes_from_dataframe(nodes_df, ["t", "z", "y", "x"])
     graph.add_edges(edges)
 
     return graph
@@ -25,7 +25,8 @@ def build_graph(n_nodes: int, sparsity: float) -> UndirectedGraph:
 if __name__ == "__main__":
 
     viewer = napari.Viewer()
-    graph = build_graph(10000, 0.01)
+    n_nodes = 10000
+    graph = build_graph(n_nodes, 2 / n_nodes)
     layer = Graph(graph, out_of_slice_display=True)
     viewer.add_layer(layer)
 
