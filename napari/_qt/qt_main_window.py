@@ -130,7 +130,7 @@ class _QtMainWindow(QMainWindow):
         return super().statusBar()
 
     @classmethod
-    def current(cls):
+    def current(cls) -> Optional['_QtMainWindow']:
         return cls._instances[-1] if cls._instances else None
 
     @classmethod
@@ -294,6 +294,7 @@ class _QtMainWindow(QMainWindow):
 
     def show(self, block=False):
         super().show()
+        self._qt_viewer.setFocus()
         if block:
             self._ev = QEventLoop()
             self._ev.exec()
