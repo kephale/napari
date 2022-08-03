@@ -1,3 +1,4 @@
+from unittest import TestCase
 from unittest.mock import patch
 
 import numpy as np
@@ -121,3 +122,22 @@ def test_data_change_ndisplay_surface(make_napari_viewer):
     # Switch to 3D rendering mode and back to 2D rendering mode
     test_ndisplay_change(ndisplay=3)
     test_ndisplay_change(ndisplay=2)
+
+
+def test_zero_scale_layer(make_napari_viewer):
+    """Test the exception raised when a layer has 0 for a scale dimension."""
+    viewer = make_napari_viewer()
+
+    tc = TestCase()
+    layer_name = 'ZeroScaleTest'
+
+    # The layer will still be in the scene after this exception
+    with tc.assertRaises(Exception) as context:
+        viewer.add_image(np.random.rand(64, 64), scale=(0, 1), name=layer_name)
+
+    tc.assertTrue('scale is currently' in str(context.exception))
+
+    # Find the bad layer that we need to remove
+    layer = [layer for layer in viewer.layers if layer.name == layer_name][0]
+
+    viewer.layers.remove(layer)
