@@ -151,6 +151,12 @@ class VispyBaseLayer(ABC):
             affine_offset = np.eye(4)
             affine_offset[-1, : len(offset)] = offset[::-1]
             affine_matrix = affine_matrix @ affine_offset
+
+        if np.linalg.det(affine_matrix) == 0:
+            raise Exception(
+                f'Layer "{self.layer.name}" has a singular affine matrix. This can be caused by the Layer\'s scale having zero values. The layer\'s scale is currently "{self.layer.scale}"'
+            )
+
         self._master_transform.matrix = affine_matrix
 
     def _on_experimental_clipping_planes_change(self):
