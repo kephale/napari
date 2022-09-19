@@ -4,6 +4,7 @@ import numpy as np
 from vispy.color import Colormap as VispyColormap
 from vispy.scene.node import Node
 
+from ...layers.base._base_constants import Blending
 from ...utils.translations import trans
 from ..utils.gl import fix_data_dtype, get_gl_extensions
 from ..visuals.image import Image as ImageNode
@@ -59,7 +60,12 @@ class VispyImageLayer(VispyBaseLayer):
 
         self.layer.events.rendering.connect(self._on_rendering_change)
         self.layer.events.depiction.connect(self._on_depiction_change)
-        self.layer.events.interpolation.connect(self._on_interpolation_change)
+        self.layer.events.interpolation2d.connect(
+            self._on_interpolation_change
+        )
+        self.layer.events.interpolation3d.connect(
+            self._on_interpolation_change
+        )
         self.layer.events.colormap.connect(self._on_colormap_change)
         self.layer.events.contrast_limits.connect(
             self._on_contrast_limits_change
@@ -145,7 +151,11 @@ class VispyImageLayer(VispyBaseLayer):
         node.update()
 
     def _on_interpolation_change(self):
-        self.node.interpolation = self.layer.interpolation
+        self.node.interpolation = (
+            self.layer.interpolation2d
+            if self.layer._ndisplay == 2
+            else self.layer.interpolation3d
+        )
 
     def _on_rendering_change(self):
         if isinstance(self.node, VolumeNode):
@@ -160,11 +170,29 @@ class VispyImageLayer(VispyBaseLayer):
     def _on_colormap_change(self):
         self.node.cmap = VispyColormap(*self.layer.colormap)
 
+    def _update_mip_minip_cutoff(self):
+        # discard fragments beyond contrast limits, but only with translucent blending
+        if isinstance(self.node, VolumeNode):
+            if self.layer.blending in {
+                Blending.TRANSLUCENT,
+                Blending.TRANSLUCENT_NO_DEPTH,
+            }:
+                self.node.mip_cutoff = self.node._texture.clim_normalized[0]
+                self.node.minip_cutoff = self.node._texture.clim_normalized[1]
+            else:
+                self.node.mip_cutoff = None
+                self.node.minip_cutoff = None
+
     def _on_contrast_limits_change(self):
         self.node.clim = self.layer.contrast_limits
-        if isinstance(self.node, VolumeNode):
-            self.node.mip_cutoff = self.node._texture.clim_normalized[0]
-            self.node.minip_cutoff = self.node._texture.clim_normalized[1]
+        # cutoffs must be updated after clims, so we can set them to the new values
+        self._update_mip_minip_cutoff()
+
+    def _on_blending_change(self):
+        super()._on_blending_change()
+        # cutoffs must be updated after blending, so we can know if
+        # the new blending is a translucent one
+        self._update_mip_minip_cutoff()
 
     def _on_gamma_change(self):
         if len(self.node.shared_program.frag._set_items) > 0:

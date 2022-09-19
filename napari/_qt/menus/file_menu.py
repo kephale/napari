@@ -7,6 +7,7 @@ from qtpy.QtWidgets import QAction
 from napari._qt.dialogs.qt_reader_dialog import handle_gui_reading
 from napari.errors.reader_errors import MultipleReaderError
 
+from ...components._viewer_key_bindings import register_viewer_action
 from ...settings import get_settings
 from ...utils.history import get_save_history, update_save_history
 from ...utils.misc import running_as_bundled_app
@@ -16,6 +17,7 @@ from ..dialogs.screenshot_dialog import ScreenshotDialog
 from ._util import NapariMenu, populate_menu
 
 if TYPE_CHECKING:
+    from ... import Viewer
     from ..qt_main_window import Window
 
 
@@ -39,6 +41,23 @@ class FileMenu(NapariMenu):
                 'text': trans._('Open Folder...'),
                 'slot': window._qt_viewer._open_folder_dialog,
                 'shortcut': 'Ctrl+Shift+O',
+            },
+            {
+                'menu': trans._('Open with Plugin'),
+                'items': [
+                    {
+                        'text': 'Open File(s)...',
+                        'slot': self._open_files_w_plugin,
+                    },
+                    {
+                        'text': 'Open Files as Stack...',
+                        'slot': self._open_files_as_stack_w_plugin,
+                    },
+                    {
+                        'text': 'Open Folder...',
+                        'slot': self._open_folder_w_plugin,
+                    },
+                ],
             },
             {'menu': self.open_sample_menu},
             {},
@@ -85,7 +104,7 @@ class FileMenu(NapariMenu):
             {
                 'text': trans._('Copy Screenshot to Clipboard'),
                 'slot': window._qt_viewer.clipboard,
-                'shortcut': 'Alt+Shift+S',
+                'shortcut': 'Alt+C',
                 'statusTip': trans._(
                     'Copy screenshot of current display to the clipboard'
                 ),
@@ -93,7 +112,7 @@ class FileMenu(NapariMenu):
             {
                 'text': trans._('Copy Screenshot with Viewer to Clipboard'),
                 'slot': window.clipboard,
-                'shortcut': 'Alt+Shift+S',
+                'shortcut': 'Alt+Shift+C',
                 'statusTip': trans._(
                     'Copy screenshot of current display with the viewer to the clipboard'
                 ),
@@ -101,7 +120,7 @@ class FileMenu(NapariMenu):
             {},
             {
                 'text': trans._('Close Window'),
-                'slot': window._qt_window.close_window,
+                'slot': self._close_window,
                 'shortcut': 'Ctrl+W',
             },
             {
@@ -113,7 +132,7 @@ class FileMenu(NapariMenu):
             # This quits the entire QApplication and closes all windows.
             {
                 'text': trans._('Exit'),
-                'slot': lambda: window._qt_window.close(quit_app=True),
+                'slot': self._close_app,
                 'shortcut': 'Ctrl+Q',
                 'menuRole': QAction.QuitRole,
             },
@@ -130,6 +149,12 @@ class FileMenu(NapariMenu):
         plugin_manager.events.unregistered.connect(self._rebuild_samples_menu)
         self._rebuild_samples_menu()
         self.update()
+
+    def _close_app(self):
+        self._win._qt_window.close(quit_app=True, confirm_need=True)
+
+    def _close_window(self):
+        self._win._qt_window.close(quit_app=False, confirm_need=True)
 
     def _layer_count(self, event=None):
         return len(self._win._qt_viewer.viewer.layers)
@@ -202,3 +227,26 @@ class FileMenu(NapariMenu):
 
                 menu.addAction(action)
                 action.triggered.connect(_add_sample)
+
+    def _open_files_w_plugin(self):
+        """Helper method for forcing plugin choice"""
+        self._win._qt_viewer._open_files_dialog(choose_plugin=True)
+
+    def _open_files_as_stack_w_plugin(self):
+        """Helper method for forcing plugin choice"""
+        self._win._qt_viewer._open_files_dialog_as_stack_dialog(
+            choose_plugin=True
+        )
+
+    def _open_folder_w_plugin(self):
+        """Helper method for forcing plugin choice"""
+        self._win._qt_viewer._open_folder_dialog(choose_plugin=True)
+
+
+@register_viewer_action(trans._("Show all key bindings"))
+def show_shortcuts(viewer: 'Viewer'):
+    viewer.window.file_menu._open_preferences()
+    pref_list = viewer.window.file_menu._pref_dialog._list
+    for i in range(pref_list.count()):
+        if pref_list.item(i).text() == "Shortcuts":
+            pref_list.setCurrentRow(i)

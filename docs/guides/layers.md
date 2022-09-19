@@ -43,8 +43,8 @@ to adjust the layer opacity between 0, fully invisible and 1, fully visible.
 globally to all the points in the layer, and so you don't need to have any
 points selected for it to have an effect.
 * For the [shapes layer](napari.layers.Shapes), the opacity value applies
-individually to each shape in the layer, and so you must have shapes selected
-for it to have an effect.
+globally to all shapes in the layer, and so you don't need to have any
+shape selected for it to have an effect.
 * For the [vectors layer](napari.layers.Vectors), the opacity value applies
 globally to all the vectors in the layer.
 * For the [tracks layer](napari.layers.Tracks), the opacity value applies globally to all the tracks in the layer.
@@ -56,11 +56,12 @@ All our layers support three blending modes: `translucent`, `additive`, and
 `opaque`. These modes determine how the visuals for this layer get mixed with
 the visuals from the other layers.
 
-* An `opaque` layer renders all the other layers below it invisible and will
-fade to black as you decrease its opacity.
+* An `opaque` layer hides any layer data below it.
 * A `translucent` setting will cause the layer to blend with the layers below
 it if you decrease its opacity but will fully block those layers if its opacity
 is `1`. This is a reasonable default, useful for many applications.
+* A `minimum` blending mode will cause the layer to blend using the minimum of each pixel's R, G, and B values. This mode is uniquely useful for
+blending multiple layers with inverted colormaps/LUTs, which represent measured signal with color on a white background. For some inspiration, see the twitter hashtag [#invertedLUT](https://twitter.com/hashtag/invertedLUT).
 * An `additive` blending mode will cause the layer to blend with the layers
 below even when it has full opacity. This mode is especially useful for
 visualizing multiple layers at the same time, such as cell biology applications

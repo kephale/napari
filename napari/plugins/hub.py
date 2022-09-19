@@ -28,9 +28,9 @@ def hub_plugin_info(
     ----------
     name : str
         name of the package
-    min_dev_statur : int, optional
+    min_dev_status : int, optional
         Development status. Default is 3.
-    conda_forge: bool, optional
+    conda_forge : bool, optional
         Check if package is available in conda-forge. Default is True.
 
     Returns
@@ -42,6 +42,21 @@ def hub_plugin_info(
         with request.urlopen(NAPARI_HUB_PLUGINS + "/" + name) as resp:
             info = json.loads(resp.read().decode())
     except error.HTTPError:
+        return None, False
+
+    # If the napari hub returns an info dict missing the required keys,
+    # simply return None, False like the above except
+    if (
+        not {
+            'name',
+            'version',
+            'authors',
+            'summary',
+            'license',
+            'project_site',
+        }
+        <= info.keys()
+    ):
         return None, False
 
     version = info["version"]

@@ -199,14 +199,13 @@ def test_non_rgb_image():
     assert layer._data_view.shape == shape[-2:]
 
 
-def test_error_non_rgb_image():
+@pytest.mark.parametrize("shape", [(10, 15, 6), (10, 10)])
+def test_error_non_rgb_image(shape):
     """Test error on trying non rgb as rgb."""
     # If rgb is set to be True in constructor but the last dim has a
-    # size > 4 then data cannot actually be rgb
-    shape = (10, 15, 6)
-    np.random.seed(0)
-    data = np.random.random(shape)
-    with pytest.raises(ValueError):
+    # size > 4 or ndim not >= 3 then data cannot actually be rgb
+    data = np.empty(shape)
+    with pytest.raises(ValueError, match="'rgb' was set to True but"):
         Image(data, rgb=True)
 
 
@@ -308,19 +307,29 @@ def test_blending():
     layer.blending = 'opaque'
     assert layer.blending == 'opaque'
 
+    layer.blending = 'minimum'
+    assert layer.blending == 'minimum'
+
 
 def test_interpolation():
     """Test setting image interpolation mode."""
     np.random.seed(0)
     data = np.random.random((10, 15))
     layer = Image(data)
-    assert layer.interpolation == 'nearest'
+    with pytest.deprecated_call():
+        assert layer.interpolation == 'nearest'
+    assert layer.interpolation2d == 'nearest'
+    assert layer.interpolation3d == 'linear'
 
-    layer = Image(data, interpolation='bicubic')
-    assert layer.interpolation == 'bicubic'
+    layer = Image(data, interpolation2d='bicubic')
+    assert layer.interpolation2d == 'bicubic'
+    with pytest.deprecated_call():
+        assert layer.interpolation == 'bicubic'
 
-    layer.interpolation = 'bilinear'
-    assert layer.interpolation == 'bilinear'
+    layer.interpolation2d = 'linear'
+    assert layer.interpolation2d == 'linear'
+    with pytest.deprecated_call():
+        assert layer.interpolation == 'linear'
 
 
 def test_colormaps():
@@ -546,7 +555,7 @@ def test_message():
     data = np.random.random((10, 15))
     layer = Image(data)
     msg = layer.get_status((0,) * 2)
-    assert type(msg) == str
+    assert type(msg) == dict
 
 
 def test_message_3d():
@@ -558,7 +567,7 @@ def test_message_3d():
     msg = layer.get_status(
         (0, 0, 0), view_direction=[1, 0, 0], dims_displayed=[0, 1, 2]
     )
-    assert type(msg) == str
+    assert type(msg) == dict
 
 
 def test_thumbnail():

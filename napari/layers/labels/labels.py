@@ -1,6 +1,7 @@
 import warnings
 from collections import deque
-from typing import Dict, List, Optional, Union
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -19,7 +20,7 @@ from ...utils.events import Event
 from ...utils.events.custom_types import Array
 from ...utils.geometry import clamp_point_to_bounding_box
 from ...utils.naming import magic_name
-from ...utils.status_messages import generate_layer_status
+from ...utils.status_messages import generate_layer_coords_status
 from ...utils.translations import trans
 from ..base import no_op
 from ..image._image_utils import guess_multiscale
@@ -28,31 +29,11 @@ from ..utils.color_transformations import transform_color
 from ..utils.layer_utils import _FeatureTable
 from ._labels_constants import LabelColorMode, LabelsRendering, Mode
 from ._labels_mouse_bindings import draw, pick
-from ._labels_utils import indices_in_shape, sphere_indices
-
-_REV_SHAPE_HELP = {
-    trans._('enter paint or fill mode to edit labels'): {
-        Mode.PAN_ZOOM,
-        Mode.TRANSFORM,
-    },
-    trans._('hold <space> to pan/zoom, click to pick a label'): {
-        Mode.PICK,
-        Mode.FILL,
-    },
-    trans._(
-        'hold <space> to pan/zoom, hold <shift> to toggle preserve_labels, hold <control> to fill, hold <alt> to erase, drag to paint a label'
-    ): {Mode.PAINT},
-    trans._('hold <space> to pan/zoom, drag to erase a label'): {Mode.ERASE},
-}
-
-# This avoid duplicating the trans._ help messages above
-# as some modes have the same help.
-# while most tooling will recognise identical messages,
-# this can lead to human error.
-_FWD_SHAPE_HELP = {}
-for t, modes in _REV_SHAPE_HELP.items():
-    for m in modes:
-        _FWD_SHAPE_HELP[m] = t
+from ._labels_utils import (
+    indices_in_shape,
+    interpolate_coordinates,
+    sphere_indices,
+)
 
 
 class Labels(_ImageBase):
@@ -167,7 +148,9 @@ class Labels(_ImageBase):
         to background.
     color : dict of int to str or array
         Custom label to color mapping. Values must be valid color names or RGBA
-        arrays.
+        arrays. While there is no limit to the number of custom labels, the
+        the layer will render incorrectly if they map to more than 1024 distinct
+        colors.
     seed : float
         Seed for colormap random generator.
     opacity : float
@@ -266,7 +249,8 @@ class Labels(_ImageBase):
             rgb=False,
             colormap=self._random_colormap,
             contrast_limits=[0.0, 1.0],
-            interpolation='nearest',
+            interpolation2d='nearest',
+            interpolation3d='nearest',
             rendering=rendering,
             depiction=depiction,
             iso_threshold=0,
@@ -297,6 +281,7 @@ class Labels(_ImageBase):
             brush_shape=Event,
             contour=Event,
             features=Event,
+            paint=Event,
         )
 
         self._feature_table = _FeatureTable.from_layer(
@@ -315,9 +300,7 @@ class Labels(_ImageBase):
         self._mode = Mode.PAN_ZOOM
         self._status = self.mode
         self._preserve_labels = False
-        self._help = trans._('enter paint or fill mode to edit labels')
 
-        self._block_saving = False
         self._reset_history()
 
         # Trigger generation of view slice and thumbnail
@@ -732,9 +715,7 @@ class Labels(_ImageBase):
         if not changed:
             return
 
-        self.help = _FWD_SHAPE_HELP[mode]
-
-        if mode in (Mode.PAINT, Mode.ERASE):
+        if mode in {Mode.PAINT, Mode.ERASE}:
             self.cursor_size = self._calculate_cursor_size()
 
         self.events.mode(mode=mode)
@@ -773,10 +754,7 @@ class Labels(_ImageBase):
     def _set_editable(self, editable=None):
         """Set editable mode based on layer properties."""
         if editable is None:
-            if self.multiscale:
-                self.editable = False
-            else:
-                self.editable = True
+            self.editable = not self.multiscale
 
         if not self.editable:
             self.mode = Mode.PAN_ZOOM
@@ -1078,6 +1056,42 @@ class Labels(_ImageBase):
     def _reset_history(self, event=None):
         self._undo_history = deque(maxlen=self._history_limit)
         self._redo_history = deque(maxlen=self._history_limit)
+        self._staged_history = []
+        self._block_history = False
+
+    @contextmanager
+    def block_history(self):
+        """Context manager to group history-editing operations together.
+
+        While in the context, history atoms are grouped together into a
+        "staged" history. When exiting the context, that staged history is
+        committed to the undo history queue, and an event is emitted
+        containing the change.
+        """
+        prev = self._block_history
+        self._block_history = True
+        try:
+            yield
+            self._commit_staged_history()
+        finally:
+            self._block_history = prev
+
+    def _commit_staged_history(self):
+        """Save staged history to undo history and clear it."""
+        if self._staged_history:
+            self._append_to_undo_history(self._staged_history)
+            self._staged_history = []
+
+    def _append_to_undo_history(self, item):
+        """Append item to history and emit paint event.
+
+        Parameters
+        ----------
+        item : List[Tuple[ndarray, ndarray, int]]
+            list of history atoms to append to undo history.
+        """
+        self._undo_history.append(item)
+        self.events.paint(value=item)
 
     def _save_history(self, value):
         """Save a history "atom" to the undo history.
@@ -1099,11 +1113,11 @@ class Labels(_ImageBase):
             - the values corresponding to those elements before the change
             - the value(s) after the change
         """
-        self._redo_history = deque()
-        if not self._block_saving:
-            self._undo_history.append([value])
+        self._redo_history.clear()
+        if self._block_history:
+            self._staged_history.append(value)
         else:
-            self._undo_history[-1].append(value)
+            self._append_to_undo_history([value])
 
     def _load_history(self, before, after, undoing=True):
         """Load a history item and apply it to the array.
@@ -1211,19 +1225,39 @@ class Labels(_ImageBase):
             self.data, match_indices
         )
 
-        self._save_history(
-            (
-                match_indices,
-                np.array(self.data[match_indices], copy=True),
-                new_label,
-            )
+        self.data_setitem(match_indices, new_label, refresh)
+
+    def _draw(self, new_label, last_cursor_coord, coordinates):
+        """Paint into coordinates, accounting for mode and cursor movement.
+
+        The draw operation depends on the current mode of the layer.
+
+        Parameters
+        ----------
+        new_label : int
+            value of label to paint
+        last_cursor_coord : sequence
+            last painted cursor coordinates
+        coordinates : sequence
+            new cursor coordinates
+        """
+        if coordinates is None:
+            return
+        ndisplay = len(self._dims_displayed)
+        interp_coord = interpolate_coordinates(
+            last_cursor_coord, coordinates, self.brush_size
         )
-
-        # Replace target pixels with new_label
-        self.data[match_indices] = new_label
-
-        if refresh is True:
-            self.refresh()
+        for c in interp_coord:
+            if (
+                ndisplay == 3
+                and self.data[tuple(np.round(c).astype(int))] == 0
+            ):
+                continue
+            if self._mode in [Mode.PAINT, Mode.ERASE]:
+                self.paint(c, new_label, refresh=False)
+            elif self._mode == Mode.FILL:
+                self.fill(c, new_label, refresh=False)
+        self.refresh()
 
     def paint(self, coord, new_label, refresh=True):
         """Paint over existing labels with a new label, using the selected
@@ -1291,30 +1325,48 @@ class Labels(_ImageBase):
                 keep_coords = self.data[slice_coord] == self._background_label
             slice_coord = tuple(sc[keep_coords] for sc in slice_coord)
 
-        # save the existing values to the history
+        self.data_setitem(slice_coord, new_label, refresh)
+
+    def data_setitem(self, indices, value, refresh=True):
+        """Set `indices` in `data` to `value`, while writing to edit history.
+
+        Parameters
+        ----------
+        indices : tuple of int, slice, or sequence of int
+            Indices in data to overwrite. Can be any valid NumPy indexing
+            expression [1]_.
+        value : int or array of int
+            New label value(s). If more than one value, must match or
+            broadcast with the given indices.
+        refresh : bool, default True
+            whether to refresh the view, by default True
+
+        References
+        ----------
+        ..[1] https://numpy.org/doc/stable/user/basics.indexing.html
+        """
         self._save_history(
             (
-                slice_coord,
-                np.array(self.data[slice_coord], copy=True),
-                new_label,
+                indices,
+                np.array(self.data[indices], copy=True),
+                value,
             )
         )
 
         # update the labels image
-        self.data[slice_coord] = new_label
-
+        self.data[indices] = value
         if refresh is True:
             self.refresh()
 
     def get_status(
         self,
-        position,
+        position: Optional[Tuple] = None,
         *,
         view_direction: Optional[np.ndarray] = None,
         dims_displayed: Optional[List[int]] = None,
         world: bool = False,
-    ) -> str:
-        """Status message of the data at a coordinate position.
+    ) -> dict:
+        """Status message information of the data at a coordinate position.
 
         Parameters
         ----------
@@ -1332,16 +1384,23 @@ class Labels(_ImageBase):
 
         Returns
         -------
-        msg : string
-            String containing a message that can be used as a status update.
+        source_info : dict
+            Dict containing a information that can be used in a status update.
         """
-        value = self.get_value(
-            position,
-            view_direction=view_direction,
-            dims_displayed=dims_displayed,
-            world=world,
+        if position is not None:
+            value = self.get_value(
+                position,
+                view_direction=view_direction,
+                dims_displayed=dims_displayed,
+                world=world,
+            )
+        else:
+            value = None
+
+        source_info = self._get_source_info()
+        source_info['coordinates'] = generate_layer_coords_status(
+            position, value
         )
-        msg = generate_layer_status(self.name, position, value)
 
         # if this labels layer has properties
         properties = self._get_properties(
@@ -1351,9 +1410,9 @@ class Labels(_ImageBase):
             world=world,
         )
         if properties:
-            msg += "; " + ", ".join(properties)
+            source_info['coordinates'] += "; " + ", ".join(properties)
 
-        return msg
+        return source_info
 
     def _get_tooltip_text(
         self,
