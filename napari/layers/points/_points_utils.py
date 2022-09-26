@@ -212,6 +212,7 @@ def fix_data_points(
 ) -> Tuple[np.ndarray, int]:
     """
     Ensure that points array is 2d and have second dimension of size ndim (default 2 for empty arrays)
+    and promotes dtype to floating point
 
     Parameters
     ----------
@@ -223,7 +224,7 @@ def fix_data_points(
     Returns
     -------
     points : (N, M) array
-        Points array
+        Floating point points array
     ndim : int
         number of dimensions
 
@@ -235,7 +236,7 @@ def fix_data_points(
     if points is None or len(points) == 0:
         if ndim is None:
             ndim = 2
-        points = np.empty((0, ndim))
+        points = np.empty((0, ndim), dtype=float)
     else:
         points = np.atleast_2d(points)
         data_ndim = points.shape[1]
@@ -247,4 +248,9 @@ def fix_data_points(
                 )
             )
         ndim = data_ndim
+
+    # converts to float if integer, necessary due to inplace movement
+    if np.issubdtype(points.dtype, np.integer):
+        points = points.astype(float)
+
     return points, ndim

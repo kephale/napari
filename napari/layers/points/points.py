@@ -3,7 +3,7 @@ import warnings
 from abc import abstractmethod
 from copy import copy, deepcopy
 from itertools import cycle
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -146,7 +146,7 @@ class _BasePoints(Layer):
           Shading and depth buffer are changed to give a 3D spherical look to the points
     antialiasing: float
         Amount of antialiasing in canvas pixels.
-    experimental_canvas_size_limits : tuple of float
+    canvas_size_limits : tuple of float
         Lower and upper limits for the size of points in canvas pixels.
     shown : 1-D array of bool
         Whether to show each point.
@@ -247,7 +247,7 @@ class _BasePoints(Layer):
         Shading mode.
     antialiasing: float
         Amount of antialiasing in canvas pixels.
-    experimental_canvas_size_limits : tuple of float
+    canvas_size_limit : tuple of float
         Lower and upper limits for the size of points in canvas pixels.
     shown : 1-D array of bool
         Whether each point is shown.
@@ -290,9 +290,9 @@ class _BasePoints(Layer):
         text=None,
         symbol='o',
         size=10,
-        edge_width=0.1,
+        edge_width=0.05,
         edge_width_is_relative=True,
-        edge_color='black',
+        edge_color='dimgray',
         edge_color_cycle=None,
         edge_colormap='viridis',
         edge_contrast_limits=None,
@@ -316,8 +316,8 @@ class _BasePoints(Layer):
         property_choices=None,
         experimental_clipping_planes=None,
         shading='none',
+        canvas_size_limits=(0, 10000),
         antialiasing=1,
-        experimental_canvas_size_limits=(0, 10000),
         shown=True,
     ):
         if ndim is None:
@@ -365,7 +365,7 @@ class _BasePoints(Layer):
             highlight=Event,
             shading=Event,
             antialiasing=Event,
-            experimental_canvas_size_limits=Event,
+            canvas_size_limits=Event,
             features=Event,
             feature_defaults=Event,
         )
@@ -455,7 +455,7 @@ class _BasePoints(Layer):
         self.edge_width = edge_width
         self.edge_width_is_relative = edge_width_is_relative
 
-        self.experimental_canvas_size_limits = experimental_canvas_size_limits
+        self.canvas_size_limits = canvas_size_limits
         self.shading = shading
         self.antialiasing = antialiasing
 
@@ -719,7 +719,10 @@ class _BasePoints(Layer):
         """
         if value < 0:
             warnings.warn(
-                message='antialiasing value must be positive, value will be set to 0.',
+                message=trans._(
+                    'antialiasing value must be positive, value will be set to 0.',
+                    deferred=True,
+                ),
                 category=RuntimeWarning,
             )
         self._antialiasing = max(0, value)
@@ -736,16 +739,14 @@ class _BasePoints(Layer):
         self.events.shading()
 
     @property
-    def experimental_canvas_size_limits(self) -> Tuple[float, float]:
+    def canvas_size_limits(self) -> Tuple[float, float]:
         """Limit the canvas size of points"""
-        return self._experimental_canvas_size_limits
+        return self._canvas_size_limits
 
-    @experimental_canvas_size_limits.setter
-    def experimental_canvas_size_limits(self, value):
-        self._experimental_canvas_size_limits = float(value[0]), float(
-            value[1]
-        )
-        self.events.experimental_canvas_size_limits()
+    @canvas_size_limits.setter
+    def canvas_size_limits(self, value):
+        self._canvas_size_limits = float(value[0]), float(value[1])
+        self.events.canvas_size_limits()
 
     @property
     def shown(self):
@@ -770,18 +771,29 @@ class _BasePoints(Layer):
     def edge_width(
         self, edge_width: Union[int, float, np.ndarray, list]
     ) -> None:
+
+        # broadcast to np.array
         edge_width = np.broadcast_to(
             edge_width, self._points_data.shape[0]
         ).copy()
-        if self.edge_width_is_relative and np.any(
-            (edge_width > 1) | (edge_width < 0)
-        ):
+
+        # edge width cannot be negative
+        if np.any(edge_width < 0):
             raise ValueError(
                 trans._(
-                    'edge_width must be between 0 and 1 if edge_width_is_relative is enabled',
+                    'All edge_width must be > 0',
                     deferred=True,
                 )
             )
+        # if relative edge width is enabled, edge_width must be between 0 and 1
+        if self.edge_width_is_relative and np.any(edge_width > 1):
+            raise ValueError(
+                trans._(
+                    'All edge_width must be between 0 and 1 if edge_width_is_relative is enabled',
+                    deferred=True,
+                )
+            )
+
         self._edge_width = edge_width
         self.refresh()
 
@@ -1111,7 +1123,7 @@ class _BasePoints(Layer):
                 'features': self.features,
                 'shading': self.shading,
                 'antialiasing': self.antialiasing,
-                'experimental_canvas_size_limits': self.experimental_canvas_size_limits,
+                'canvas_size_limits': self.canvas_size_limits,
                 'shown': self.shown,
             }
         )
@@ -1819,25 +1831,55 @@ class _BasePoints(Layer):
         """Removes selected points if any."""
         raise NotImplementedError
 
-    def _move(self, index, coord):
-        """Moves points relative drag start location.
+    def _set_drag_start(
+        self,
+        selection_indices: Sequence[int],
+        position: Sequence[Union[int, float]],
+        center_by_data: bool = True,
+    ) -> None:
+        """Store the initial position at the start of a drag event.
 
         Parameters
         ----------
-        index : list
-            Integer indices of points to move
-        coord : tuple
-            Coordinates to move points to
+        selection_indices : set of int
+            integer indices of selected data used to index into self.data
+        position : Sequence of numbers
+            position of the drag start in data coordinates.
+        center_by_data: bool
+            Center the drag start based on the selected data.
+            Used for modifier drag_box selection.
         """
-        if len(index) > 0:
-            index = list(index)
+        selection_indices = list(selection_indices)
+        dims_displayed = list(self._dims_displayed)
+        if self._drag_start is None:
+            self._drag_start = np.array(position, dtype=float)[dims_displayed]
+            if len(selection_indices) > 0 and center_by_data:
+                center = self._points_data[
+                    np.ix_(selection_indices, dims_displayed)
+                ].mean(axis=0)
+                self._drag_start -= center
+
+    def _move(
+        self,
+        selection_indices: Sequence[int],
+        position: Sequence[Union[int, float]],
+    ) -> None:
+        """Move points relative to drag start location.
+
+        Parameters
+        ----------
+        selection_indices : Sequence[int]
+            Integer indices of points to move in self.data
+        position : tuple
+            Position to move points to in data coordinates.
+        """
+        if len(selection_indices) > 0:
+            selection_indices = list(selection_indices)
             disp = list(self._dims_displayed)
-            ixgrid = np.ix_(index, disp)
+            ixgrid = np.ix_(selection_indices, disp)
+            self._set_drag_start(selection_indices, position)
             center = self._points_data[ixgrid].mean(axis=0)
-            coord = np.asarray(coord)
-            if self._drag_start is None:
-                self._drag_start = coord[disp] - center
-            shift = coord[disp] - center - self._drag_start
+            shift = np.array(position)[disp] - center - self._drag_start
             self._move_points(ixgrid, shift)
             self.refresh()
         self.events.data(value=self.data)
@@ -1859,13 +1901,13 @@ class _BasePoints(Layer):
 
     def get_status(
         self,
-        position,
+        position: Optional[Tuple] = None,
         *,
         view_direction: Optional[np.ndarray] = None,
         dims_displayed: Optional[List[int]] = None,
         world: bool = False,
-    ) -> str:
-        """Status message of the data at a coordinate position.
+    ) -> dict:
+        """Status message information of the data at a coordinate position.
 
         Parameters
         ----------
@@ -1883,18 +1925,25 @@ class _BasePoints(Layer):
 
         Returns
         -------
-        msg : string
-            String containing a message that can be used as a status update.
+        source_info : dict
+            Dict containing information that can be used in a status update.
         """
-        value = self.get_value(
-            position,
-            view_direction=view_direction,
-            dims_displayed=dims_displayed,
-            world=world,
-        )
-        msg = generate_layer_status(self.name, position, value)
+        if position is not None:
+            value = self.get_value(
+                position,
+                view_direction=view_direction,
+                dims_displayed=dims_displayed,
+                world=world,
+            )
+        else:
+            value = None
 
-        # if this labels layer has properties
+        source_info = self._get_source_info()
+        source_info['coordinates'] = generate_layer_coords_status(
+            position, value
+        )
+
+        # if this points layer has properties
         properties = self._get_properties(
             position,
             view_direction=view_direction,
@@ -1902,9 +1951,9 @@ class _BasePoints(Layer):
             world=world,
         )
         if properties:
-            msg += "; " + ", ".join(properties)
+            source_info['coordinates'] += "; " + ", ".join(properties)
 
-        return msg
+        return source_info
 
     def _get_tooltip_text(
         self,
@@ -1987,9 +2036,9 @@ class Points(_BasePoints):
         text=None,
         symbol='o',
         size=10,
-        edge_width=0.1,
+        edge_width=0.05,
         edge_width_is_relative=True,
-        edge_color='black',
+        edge_color='dimgray',
         edge_color_cycle=None,
         edge_colormap='viridis',
         edge_contrast_limits=None,
@@ -2013,7 +2062,8 @@ class Points(_BasePoints):
         property_choices=None,
         experimental_clipping_planes=None,
         shading='none',
-        experimental_canvas_size_limits=(0, 10000),
+        canvas_size_limits=(0, 10000),
+        antialiasing=1,
         shown=True,
     ):
         if ndim is None and scale is not None:
@@ -2057,7 +2107,8 @@ class Points(_BasePoints):
             property_choices=property_choices,
             experimental_clipping_planes=experimental_clipping_planes,
             shading=shading,
-            experimental_canvas_size_limits=experimental_canvas_size_limits,
+            canvas_size_limits=canvas_size_limits,
+            antialiasing=antialiasing,
             shown=shown,
         )
 
@@ -2290,128 +2341,3 @@ class Points(_BasePoints):
             )
             mask[np.ix_(*submask_coords)] |= normalized_square_distances <= 1
         return mask
-
-    def get_status(
-        self,
-        position: Optional[Tuple] = None,
-        *,
-        view_direction: Optional[np.ndarray] = None,
-        dims_displayed: Optional[List[int]] = None,
-        world: bool = False,
-    ) -> dict:
-        """Status message information of the data at a coordinate position.
-
-        # Parameters
-        # ----------
-        # position : tuple
-        #     Position in either data or world coordinates.
-        # view_direction : Optional[np.ndarray]
-        #     A unit vector giving the direction of the ray in nD world coordinates.
-        #     The default value is None.
-        # dims_displayed : Optional[List[int]]
-        #     A list of the dimensions currently being displayed in the viewer.
-        #     The default value is None.
-        # world : bool
-        #     If True the position is taken to be in world coordinates
-        #     and converted into data coordinates. False by default.
-
-        # Returns
-        # -------
-        # source_info : dict
-        #     Dict containing information that can be used in a status update.
-        #"""
-        if position is not None:
-            value = self.get_value(
-                position,
-                view_direction=view_direction,
-                dims_displayed=dims_displayed,
-                world=world,
-            )
-        else:
-            value = None
-
-        source_info = self._get_source_info()
-        source_info['coordinates'] = generate_layer_coords_status(
-            position, value
-        )
-
-        # if this points layer has properties
-        properties = self._get_properties(
-            position,
-            view_direction=view_direction,
-            dims_displayed=dims_displayed,
-            world=world,
-        )
-        if properties:
-            source_info['coordinates'] += "; " + ", ".join(properties)
-
-        return source_info
-
-    def _get_tooltip_text(
-        self,
-        position,
-        *,
-        view_direction: Optional[np.ndarray] = None,
-        dims_displayed: Optional[List[int]] = None,
-        world: bool = False,
-    ):
-        """
-        tooltip message of the data at a coordinate position.
-
-        Parameters
-        ----------
-        position : tuple
-            Position in either data or world coordinates.
-        view_direction : Optional[np.ndarray]
-            A unit vector giving the direction of the ray in nD world coordinates.
-            The default value is None.
-        dims_displayed : Optional[List[int]]
-            A list of the dimensions currently being displayed in the viewer.
-            The default value is None.
-        world : bool
-            If True the position is taken to be in world coordinates
-            and converted into data coordinates. False by default.
-
-        Returns
-        -------
-        msg : string
-            String containing a message that can be used as a tooltip.
-        """
-        return "\n".join(
-            self._get_properties(
-                position,
-                view_direction=view_direction,
-                dims_displayed=dims_displayed,
-                world=world,
-            )
-        )
-
-    def _get_properties(
-        self,
-        position,
-        *,
-        view_direction: Optional[np.ndarray] = None,
-        dims_displayed: Optional[List[int]] = None,
-        world: bool = False,
-    ) -> list:
-        if self.features.shape[1] == 0:
-            return []
-
-        value = self.get_value(
-            position,
-            view_direction=view_direction,
-            dims_displayed=dims_displayed,
-            world=world,
-        )
-        # if the cursor is not outside the image or on the background
-        if value is None or value > self.data.shape[0]:
-            return []
-
-        return [
-            f'{k}: {v[value]}'
-            for k, v in self.features.items()
-            if k != 'index'
-            and len(v) > value
-            and v[value] is not None
-            and not (isinstance(v[value], float) and np.isnan(v[value]))
-        ]
