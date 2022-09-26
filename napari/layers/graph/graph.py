@@ -56,7 +56,7 @@ class Graph(_BasePoints):
         property_choices=None,
         experimental_clipping_planes=None,
         shading='none',
-        experimental_canvas_size_limits=(0, 10000),
+        canvas_size_limits=(0, 10000),
         shown=True,
     ):
         # Save the point coordinates
@@ -97,7 +97,7 @@ class Graph(_BasePoints):
             property_choices=property_choices,
             experimental_clipping_planes=experimental_clipping_planes,
             shading=shading,
-            experimental_canvas_size_limits=experimental_canvas_size_limits,
+            canvas_size_limits=canvas_size_limits,
             shown=shown,
         )
 
