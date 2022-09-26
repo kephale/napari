@@ -1006,6 +1006,9 @@
     "napari/_vispy/layers/base.py": [
       "clipping_planes"
     ],
+    "napari/_vispy/layers/graph.py": [
+      "white"
+    ],
     "napari/_vispy/layers/image.py": [
       "auto",
       "tile2data",
@@ -1153,6 +1156,9 @@
     ],
     "napari/_vispy/visuals/clipping_planes_mixin.py": [
       "_PVisual"
+    ],
+    "napari/_vispy/visuals/graph.py": [
+      "segments"
     ],
     "napari/_vispy/visuals/markers.py": [
       "a_position",
@@ -1828,6 +1834,14 @@
       "depiction",
       "coordinates",
       "xarray.DataArray"
+    ],
+    "napari/layers/graph/graph.py": [
+      "dimgray",
+      "none",
+      "o",
+      "translucent",
+      "viridis",
+      "white"
     ],
     "napari/layers/points/__init__.py": [],
     "napari/layers/points/_points_constants.py": [
@@ -2522,6 +2536,7 @@
       "1",
       "20",
       "FunctionGui",
+      "GraphData",
       "ImageData",
       "LabelsData",
       "LayerDataTuple",
@@ -3321,6 +3336,7 @@
       "n",
       "open",
       "path",
+      "add_graph",
       "add_image",
       "add_labels",
       "add_points",
