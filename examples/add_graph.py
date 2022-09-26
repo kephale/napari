@@ -13,10 +13,7 @@ def build_graph(n_nodes: int, n_neighbors: int) -> UndirectedGraph:
         400 * np.random.uniform(size=(n_nodes, 4)),
         columns=["t", "z", "y", "x"],
     )
-
-    graph = UndirectedGraph(len(nodes_df), ndim=4, n_edges=len(edges))
-    graph.init_nodes_from_dataframe(nodes_df, ["t", "z", "y", "x"])
-    graph.add_edges(edges)
+    graph = UndirectedGraph(edges=edges, coords=nodes_df[["t", "z", "y", "x"]])
 
     return graph
 
