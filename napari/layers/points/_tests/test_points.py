@@ -12,6 +12,7 @@ from napari._tests.utils import (
     assert_layer_state_equal,
     check_layer_world_data_extent,
 )
+from napari.components import Dims
 from napari.layers import Points
 from napari.layers.points._points_constants import Mode
 from napari.layers.points._points_utils import points_to_squares
@@ -2502,3 +2503,12 @@ def test_set_drag_start():
     assert all(
         layer._drag_start[i] == position[i] for i in layer._dims_displayed
     )
+
+
+def test_points_request():
+    """Test the slicing request code for Points."""
+    data = [[0, 0], [0, 13], [1, 1], [13, 0]]
+    layer = Points(data)
+    dims = Dims()
+    request = layer._make_slice_request(dims)
+    assert request.size.shape == (4, 2)

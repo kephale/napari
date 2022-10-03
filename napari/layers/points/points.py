@@ -12,9 +12,6 @@ from scipy.stats import gmean
 
 from ...components.dims import Dims
 
-# TODO consider refactoring Request/Response inheritance
-from ...layers.base.base import _LayerSliceRequest, _LayerSliceResponse
-
 from ...utils.colormaps import Colormap, ValidColormapArg
 from ...utils.colormaps.standardize_color import hex_to_name, rgb_to_hex
 from ...utils.events import Event
@@ -46,7 +43,8 @@ LOGGER = logging.getLogger("napari.layers.points")
 
 
 @dataclass(frozen=True)
-class _PointsSliceRequest(_LayerSliceRequest):
+class _PointsSliceRequest:
+    #    data: np.ndarray = field(repr=False)
     out_of_slice_display: bool = field(repr=False)
     size: np.ndarray = field(repr=False)
     face_color: np.ndarray = field(repr=False)
@@ -57,7 +55,7 @@ class _PointsSliceRequest(_LayerSliceRequest):
 
 
 @dataclass(frozen=True)
-class _PointsSliceResponse(_LayerSliceResponse):
+class _PointsSliceResponse:
     indices: np.ndarray = field(repr=False)
     size: np.ndarray = field(repr=False)
     view_size_scale: Union[int, np.ndarray] = field(repr=False)
@@ -1738,7 +1736,6 @@ class Points(Layer):
         can then be used with the static _get_slice function to create a
         _PointsSliceResponse object."""
         LOGGER.debug('Points._make_slice_request: %s', dims)
-        base_request = super()._make_slice_request(dims)
         return _PointsSliceRequest(
             out_of_slice_display=self.out_of_slice_display,
             size=self.size,
@@ -1747,7 +1744,6 @@ class Points(Layer):
             edge_color=self.edge_color,
             edge_width=self.edge_width,
             edge_width_is_relative=self.edge_width_is_relative,
-            **(base_request.asdict()),
         )
 
     def _set_slice(self, response: _PointsSliceResponse) -> None:

@@ -15,6 +15,7 @@ import magicgui as mgui
 import numpy as np
 from npe2 import plugin_manager as pm
 
+from ...components.dims import Dims
 from ...utils._dask_utils import configure_dask, DaskIndexer
 from ...utils._magicgui import (
     add_layer_to_viewer,
@@ -75,37 +76,6 @@ logging.basicConfig(
     level=logging.DEBUG,
 )
 LOGGER = logging.getLogger("napari.layers.base")
-
-
-@dataclass(frozen=True)
-class _LayerSliceRequest:
-    data: Any = field(repr=False)
-    data_to_world: Affine = field(repr=False)
-    ndim: int
-    ndisplay: int
-    point: Tuple[float, ...]
-    dims_order: Tuple[int, ...]
-    dims_displayed: Tuple[int, ...] = field(repr=False)
-    dims_not_displayed: Tuple[int, ...] = field(repr=False)
-    multiscale: bool = field(repr=False)
-    corner_pixels: np.ndarray
-    round_index: bool = field(repr=False)
-    dask_config: DaskIndexer = field(repr=False)
-
-    def asdict(self) -> dict:
-        """Shallow copy of the request as a dict.
-        From the official Python docs: https://docs.python.org/3/library/dataclasses.html#dataclasses.asdict
-        """
-        return {
-            field.name: getattr(self, field.name) for field in fields(self)
-        }
-
-
-@dataclass(frozen=True)
-class _LayerSliceResponse:
-    request: _LayerSliceRequest
-    data: Any = field(repr=False)
-    data_to_world: Affine = field(repr=False)
 
 
 @mgui.register_type(choices=get_layers, return_callback=add_layer_to_viewer)
