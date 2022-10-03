@@ -1,12 +1,19 @@
+import logging
 import numbers
 import warnings
 from copy import copy, deepcopy
+from dataclasses import dataclass, field
 from itertools import cycle
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from scipy.stats import gmean
+
+from ...components.dims import Dims
+
+# TODO consider refactoring Request/Response inheritance
+from ...layers.base.base import _LayerSliceRequest, _LayerSliceResponse
 
 from ...utils.colormaps import Colormap, ValidColormapArg
 from ...utils.colormaps.standardize_color import hex_to_name, rgb_to_hex
@@ -33,6 +40,31 @@ from ._points_utils import (
 )
 
 DEFAULT_COLOR_CYCLE = np.array([[1, 0, 1, 1], [0, 1, 0, 1]])
+
+
+LOGGER = logging.getLogger("napari.layers.points")
+
+
+@dataclass(frozen=True)
+class _PointsSliceRequest(_LayerSliceRequest):
+    out_of_slice_display: bool = field(repr=False)
+    size: np.ndarray = field(repr=False)
+    face_color: np.ndarray = field(repr=False)
+    edge_color: np.ndarray = field(repr=False)
+    edge_width: np.ndarray = field(repr=False)
+    edge_width_is_relative: bool = field(repr=False)
+    shown: np.ndarray = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _PointsSliceResponse(_LayerSliceResponse):
+    indices: np.ndarray = field(repr=False)
+    size: np.ndarray = field(repr=False)
+    view_size_scale: Union[int, np.ndarray] = field(repr=False)
+    face_color: np.ndarray = field(repr=False)
+    edge_color: np.ndarray = field(repr=False)
+    edge_width: np.ndarray = field(repr=False)
+    edge_width_is_relative: bool = field(repr=False)
 
 
 class Points(Layer):
@@ -1478,18 +1510,37 @@ class Points(Layer):
             values of 1 corresponds to points located in the slice, and values
             less than 1 correspond to points located in neighboring slices.
         """
+        return Points._get_slice_data(
+            data=self.data,
+            ndim=self.ndim,
+            dims_indices=dims_indices,
+            dims_not_displayed=self._dims_not_displayed,
+            size=self.size,
+            out_of_slice_display=self.out_of_slice_display,
+        )
+
+    @staticmethod
+    def _get_slice_data(
+        *,
+        data,
+        ndim,
+        dims_indices,
+        dims_not_displayed,
+        size,
+        out_of_slice_display,
+    ):
         # Get a list of the data for the points in this slice
-        not_disp = list(self._dims_not_displayed)
+        not_disp = list(dims_not_displayed)
         # We want a numpy array so we can use fancy indexing with the non-displayed
         # indices, but as dims_indices can (and often/always does) contain slice
         # objects, the array has dtype=object which is then very slow for the
         # arithmetic below. As Points._round_index is always False, we can safely
         # convert to float to get a major performance improvement.
         not_disp_indices = np.array(dims_indices)[not_disp].astype(float)
-        if len(self.data) > 0:
-            if self.out_of_slice_display is True and self.ndim > 2:
-                distances = abs(self.data[:, not_disp] - not_disp_indices)
-                sizes = self.size[:, not_disp] / 2
+        if len(data) > 0:
+            if out_of_slice_display is True and ndim > 2:
+                distances = abs(data[:, not_disp] - not_disp_indices)
+                sizes = size[:, not_disp] / 2
                 matches = np.all(distances <= sizes, axis=1)
                 size_match = sizes[matches]
                 size_match[size_match == 0] = 1
@@ -1499,7 +1550,7 @@ class Points(Layer):
                 slice_indices = np.where(matches)[0].astype(int)
                 return slice_indices, scale
             else:
-                data = self.data[:, not_disp]
+                data = data[:, not_disp]
                 distances = np.abs(data - not_disp_indices)
                 matches = np.all(distances <= 0.5, axis=1)
                 slice_indices = np.where(matches)[0].astype(int)
@@ -1678,6 +1729,83 @@ class Points(Layer):
             bounding_box=bounding_box,
         )
         return start_point, end_point
+
+    def _is_async(self) -> bool:
+        return True
+
+    def _make_slice_request(self, dims: "Dims") -> _PointsSliceRequest:
+        """Create a PointsSliceRequest based upon a Dims object. The request
+        can then be used with the static _get_slice function to create a
+        _PointsSliceResponse object."""
+        LOGGER.debug('Points._make_slice_request: %s', dims)
+        base_request = super()._make_slice_request(dims)
+        return _PointsSliceRequest(
+            out_of_slice_display=self.out_of_slice_display,
+            size=self.size,
+            shown=self.shown,
+            face_color=self.face_color,
+            edge_color=self.edge_color,
+            edge_width=self.edge_width,
+            edge_width_is_relative=self.edge_width_is_relative,
+            **(base_request.asdict()),
+        )
+
+    def _set_slice(self, response: _PointsSliceResponse) -> None:
+        super()._set_slice(response)
+        self._indices_view = response.indices
+        self._selected_view = list(
+            np.intersect1d(
+                np.array(list(self._selected_data)),
+                self._indices_view,
+                return_indices=True,
+            )[2]
+        )
+        self._view_size_scale = response.view_size_scale
+
+    # We upgrade the parameter type of this overridden method, which is
+    # problematic for anything with a reference typed with the base Layer.
+    # This is a code smell that should make us reconsider this design.
+    @staticmethod
+    def _get_slice(request: _PointsSliceRequest) -> _PointsSliceResponse:
+        LOGGER.debug('Points._get_slice : %s', request)
+        slice_indices = Layer._get_slice_indices(request)
+        indices, scale = Points._get_slice_data(
+            data=request.data,
+            ndim=request.ndim,
+            dims_indices=slice_indices,
+            dims_not_displayed=request.dims_not_displayed,
+            size=request.size,
+            out_of_slice_display=request.out_of_slice_display,
+        )
+        data_index = np.ix_(indices, request.dims_displayed)
+        data = request.data[data_index]
+        transform = request.data_to_world.set_slice(
+            list(request.dims_displayed)
+        )
+
+        # TODO: would be great to not need this.
+        if not isinstance(scale, np.ndarray):
+            view_size_scale = scale
+        elif len(request.shown) == 0:
+            view_size_scale = np.empty(0, int)
+        else:
+            view_size_scale = scale[request.shown[indices]]
+
+        # TODO: do we need shown here?
+        size = scale * request.size[data_index].mean(axis=1)
+
+        return _PointsSliceResponse(
+            request=request,
+            data=data,
+            data_to_world=transform,
+            indices=indices,
+            face_color=request.face_color[indices],
+            edge_color=request.edge_color[indices],
+            edge_width=request.edge_width[indices],
+            edge_width_is_relative=request.edge_width_is_relative,
+            size=size,
+            view_size_scale=view_size_scale,
+        )
 
     def _set_view_slice(self):
         """Sets the view given the indices to slice with."""
