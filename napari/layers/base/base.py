@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import os.path
 import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict, namedtuple
 from contextlib import contextmanager
+from dataclasses import dataclass, field, fields
 from functools import cached_property
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import magicgui as mgui
 import numpy as np
 from npe2 import plugin_manager as pm
 
-from ...utils._dask_utils import configure_dask
+from ...utils._dask_utils import configure_dask, DaskIndexer
 from ...utils._magicgui import (
     add_layer_to_viewer,
     add_layers_to_viewer,
@@ -65,6 +67,45 @@ def no_op(layer: Layer, event: Event) -> None:
 
     """
     return None
+
+
+# Configuration should be done elsewhere, but this is good enough for now.
+logging.basicConfig(
+    format='%(levelname)s : %(asctime)s : %(threadName)s : %(pathname)s:%(lineno)d : %(message)s',
+    level=logging.DEBUG,
+)
+LOGGER = logging.getLogger("napari.layers.base")
+
+
+@dataclass(frozen=True)
+class _LayerSliceRequest:
+    data: Any = field(repr=False)
+    data_to_world: Affine = field(repr=False)
+    ndim: int
+    ndisplay: int
+    point: Tuple[float, ...]
+    dims_order: Tuple[int, ...]
+    dims_displayed: Tuple[int, ...] = field(repr=False)
+    dims_not_displayed: Tuple[int, ...] = field(repr=False)
+    multiscale: bool = field(repr=False)
+    corner_pixels: np.ndarray
+    round_index: bool = field(repr=False)
+    dask_config: DaskIndexer = field(repr=False)
+
+    def asdict(self) -> dict:
+        """Shallow copy of the request as a dict.
+        From the official Python docs: https://docs.python.org/3/library/dataclasses.html#dataclasses.asdict
+        """
+        return {
+            field.name: getattr(self, field.name) for field in fields(self)
+        }
+
+
+@dataclass(frozen=True)
+class _LayerSliceResponse:
+    request: _LayerSliceRequest
+    data: Any = field(repr=False)
+    data_to_world: Affine = field(repr=False)
 
 
 @mgui.register_type(choices=get_layers, return_callback=add_layer_to_viewer)
