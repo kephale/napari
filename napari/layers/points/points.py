@@ -9,29 +9,42 @@ import numpy as np
 import pandas as pd
 from scipy.stats import gmean
 
-from ...utils.colormaps import Colormap, ValidColormapArg
-from ...utils.colormaps.standardize_color import hex_to_name, rgb_to_hex
-from ...utils.events import Event
-from ...utils.events.custom_types import Array
-from ...utils.geometry import project_points_onto_plane, rotate_points
-from ...utils.status_messages import generate_layer_coords_status
-from ...utils.transforms import Affine
-from ...utils.translations import trans
-from ..base import Layer, no_op
-from ..utils._color_manager_constants import ColorMode
-from ..utils.color_manager import ColorManager
-from ..utils.color_transformations import ColorType
-from ..utils.interactivity_utils import displayed_plane_from_nd_line_segment
-from ..utils.layer_utils import _features_to_properties, _FeatureTable
-from ..utils.text_manager import TextManager
-from ._points_constants import SYMBOL_ALIAS, Mode, Shading, Symbol
-from ._points_mouse_bindings import add, highlight, select
-from ._points_utils import (
+from napari.layers.base import Layer, no_op
+from napari.layers.points._points_constants import (
+    SYMBOL_ALIAS,
+    Mode,
+    Shading,
+    Symbol,
+)
+from napari.layers.points._points_mouse_bindings import add, highlight, select
+from napari.layers.points._points_utils import (
     _create_box_from_corners_3d,
     create_box,
     fix_data_points,
     points_to_squares,
 )
+from napari.layers.points._slice import _PointSliceRequest, _PointSliceResponse
+from napari.layers.utils._color_manager_constants import ColorMode
+from napari.layers.utils._slice_input import _SliceInput
+from napari.layers.utils.color_manager import ColorManager
+from napari.layers.utils.color_transformations import ColorType
+from napari.layers.utils.interactivity_utils import (
+    displayed_plane_from_nd_line_segment,
+)
+from napari.layers.utils.layer_utils import (
+    _features_to_properties,
+    _FeatureTable,
+    _unique_element,
+)
+from napari.layers.utils.text_manager import TextManager
+from napari.utils.colormaps import Colormap, ValidColormapArg
+from napari.utils.colormaps.standardize_color import hex_to_name, rgb_to_hex
+from napari.utils.events import Event
+from napari.utils.events.custom_types import Array
+from napari.utils.geometry import project_points_onto_plane, rotate_points
+from napari.utils.status_messages import generate_layer_coords_status
+from napari.utils.transforms import Affine
+from napari.utils.translations import trans
 
 DEFAULT_COLOR_CYCLE = np.array([[1, 0, 1, 1], [0, 1, 0, 1]])
 
@@ -321,8 +334,8 @@ class _BasePoints(Layer):
         shown=True,
     ):
         if ndim is None:
-            ndim = self._points_data.ndim
-
+            ndim = self._points_data.shape[1]
+        
         if scale is not None and len(scale) != ndim:
             raise ValueError(
                 trans._(
@@ -460,7 +473,7 @@ class _BasePoints(Layer):
         self.antialiasing = antialiasing
 
         # Trigger generation of view slice and thumbnail
-        self._update_dims()
+        self.refresh()
 
     @property
     @abstractmethod
@@ -1150,46 +1163,40 @@ class _BasePoints(Layer):
             self._set_highlight()
             return
         index = list(self._selected_data)
-        edge_colors = np.unique(self.edge_color[index], axis=0)
-        if len(edge_colors) == 1:
-            edge_color = edge_colors[0]
+        if (
+            unique_edge_color := _unique_element(self.edge_color[index])
+        ) is not None:
             with self.block_update_properties():
-                self.current_edge_color = edge_color
+                self.current_edge_color = unique_edge_color
 
-        face_colors = np.unique(self.face_color[index], axis=0)
-        if len(face_colors) == 1:
-            face_color = face_colors[0]
+        if (
+            unique_face_color := _unique_element(self.face_color[index])
+        ) is not None:
             with self.block_update_properties():
-                self.current_face_color = face_color
+                self.current_face_color = unique_face_color
 
         # Calculate the mean size across the displayed dimensions for
         # each point to be consistent with `_view_size`.
         mean_size = np.mean(
-            self.size[np.ix_(index, self._dims_displayed)], axis=1
+            self.size[np.ix_(index, self._slice_input.displayed)], axis=1
         )
-        size = np.unique(mean_size)
-        if len(size) == 1:
-            size = size[0]
+        if (unique_size := _unique_element(mean_size)) is not None:
             with self.block_update_properties():
-                self.current_size = size
+                self.current_size = unique_size
 
-        edge_width = np.unique(self.edge_width[index])
-        if len(edge_width) == 1:
-            edge_width = edge_width[0]
+        if (
+            unique_edge_width := _unique_element(self.edge_width[index])
+        ) is not None:
             with self.block_update_properties():
-                self.current_edge_width = edge_width
+                self.current_edge_width = unique_edge_width
 
-        properties = {}
+        unique_properties = {}
         for k, v in self.properties.items():
-            # pandas uses `object` as dtype for strings by default, which
-            # combined with the axis argument breaks np.unique
-            axis = 0 if v.ndim > 1 else None
-            properties[k] = np.unique(v[index], axis=axis)
+            unique_properties[k] = _unique_element(v[index])
 
-        n_unique_properties = np.array([len(v) for v in properties.values()])
-        if np.all(n_unique_properties == 1):
+        if all(p is not None for p in unique_properties.values()):
             with self.block_update_properties():
-                self.current_properties = properties
+                self.current_properties = unique_properties
         self._set_highlight()
 
     def interaction_box(self, index) -> Optional[np.ndarray]:
@@ -1289,12 +1296,10 @@ class _BasePoints(Layer):
             Array of coordinates for the N points in view
         """
         if len(self._indices_view) > 0:
-            data = self._points_data[
-                np.ix_(self._indices_view, self._dims_displayed)
-            ]
+            data = self._points_data[np.ix_(self._indices_view, self._slice_input.displayed)]
         else:
             # if no points in this slice send dummy data
-            data = np.zeros((0, self._ndisplay))
+            data = np.zeros((0, self._slice_input.ndisplay))
 
         return data
 
@@ -1325,7 +1330,11 @@ class _BasePoints(Layer):
         anchor_y : str
             The vispy text anchor for the y axis
         """
-        return self.text.compute_text_coords(self._view_data, self._ndisplay)
+        return self.text.compute_text_coords(
+            self._view_data,
+            self._slice_input.ndisplay,
+            self._slice_input.order,
+        )
 
     @property
     def _view_text_color(self) -> np.ndarray:
@@ -1346,7 +1355,7 @@ class _BasePoints(Layer):
             # Get the point sizes and scale for ndim display
             sizes = (
                 self.size[
-                    np.ix_(self._indices_view, self._dims_displayed)
+                    np.ix_(self._indices_view, self._slice_input.displayed)
                 ].mean(axis=1)
                 * self._view_size_scale
             )
@@ -1398,7 +1407,7 @@ class _BasePoints(Layer):
         if not self.editable:
             self.mode = Mode.PAN_ZOOM
 
-        if self.ndim < 3 and self._ndisplay == 3:
+        if self.ndim < 3 and self._slice_input.ndisplay == 3:
             # interaction currently does not work for 2D
             # layers being rendered in 3D.
             self.editable = False
@@ -1423,7 +1432,7 @@ class _BasePoints(Layer):
             less than 1 correspond to points located in neighboring slices.
         """
         # Get a list of the data for the points in this slice
-        not_disp = list(self._dims_not_displayed)
+        not_disp = list(self._slice_input.not_displayed)
         # We want a numpy array so we can use fancy indexing with the non-displayed
         # indices, but as dims_indices can (and often/always does) contain slice
         # objects, the array has dtype=object which is then very slow for the
@@ -1432,9 +1441,7 @@ class _BasePoints(Layer):
         not_disp_indices = np.array(dims_indices)[not_disp].astype(float)
         if len(self._points_data) > 0:
             if self.out_of_slice_display is True and self.ndim > 2:
-                distances = abs(
-                    self._points_data[:, not_disp] - not_disp_indices
-                )
+                distances = abs(self._points_data[:, not_disp] - not_disp_indices)
                 sizes = self.size[:, not_disp] / 2
                 matches = np.all(distances <= sizes, axis=1)
                 size_match = sizes[matches]
@@ -1470,7 +1477,9 @@ class _BasePoints(Layer):
         view_data = self._view_data
         selection = None
         if len(view_data) > 0:
-            displayed_position = [position[i] for i in self._dims_displayed]
+            displayed_position = [
+                position[i] for i in self._slice_input.displayed
+            ]
             # Get the point sizes
             # TODO: calculate distance in canvas space to account for canvas_size_limits.
             # Without this implementation, point hover and selection (and anything depending
@@ -1549,7 +1558,7 @@ class _BasePoints(Layer):
         return selection
 
     def _display_bounding_box_augmented(self, dims_displayed: np.ndarray):
-        """An augmented, axis-aligned (self._ndisplay, 2) bounding box.
+        """An augmented, axis-aligned (ndisplay, 2) bounding box.
 
         This bounding box for includes the full size of displayed points
         and enables calculation of intersections in `Layer._get_value_3d()`.
@@ -1627,8 +1636,46 @@ class _BasePoints(Layer):
 
     def _set_view_slice(self):
         """Sets the view given the indices to slice with."""
-        # get the indices of points in view
-        indices, scale = self._slice_data(self._slice_indices)
+
+        # The new slicing code makes a request from the existing state and
+        # executes the request on the calling thread directly.
+        # For async slicing, the calling thread will not be the main thread.
+        request = self._make_slice_request_internal(
+            self._slice_input, self._slice_indices
+        )
+        response = request()
+        self._set_slice_response(response)
+
+    def _make_slice_request(self, dims) -> _PointSliceRequest:
+        """Make a Points slice request based on the given dims and these data."""
+        slice_input = self._make_slice_input(
+            dims.point, dims.ndisplay, dims.order
+        )
+        # TODO: [see Image]
+        #   For the existing sync slicing, slice_indices is passed through
+        # to avoid some performance issues related to the evaluation of the
+        # data-to-world transform and its inverse. Async slicing currently
+        # absorbs these performance issues here, but we can likely improve
+        # things either by caching the world-to-data transform on the layer
+        # or by lazily evaluating it in the slice task itself.
+        slice_indices = slice_input.data_indices(self._data_to_world.inverse)
+        return self._make_slice_request_internal(slice_input, slice_indices)
+
+    def _make_slice_request_internal(
+        self, slice_input: _SliceInput, dims_indices
+    ):
+        return _PointSliceRequest(
+            dims=slice_input,
+            data=self._points_data,
+            dims_indices=dims_indices,
+            out_of_slice_display=self.out_of_slice_display,
+            size=self.size,
+        )
+
+    def _set_slice_response(self, response: _PointSliceResponse):
+        """Handle a slicing response."""
+        indices = response.indices
+        scale = response.scale
 
         # Update the _view_size_scale in accordance to the self._indices_view setter.
         # If out_of_slice_display is False, scale is a number and not an array.
@@ -1726,9 +1773,9 @@ class _BasePoints(Layer):
         if len(view_data) > 0:
             # Get the zoom factor required to fit all data in the thumbnail.
             de = self._extent_data
-            min_vals = [de[0, i] for i in self._dims_displayed]
+            min_vals = [de[0, i] for i in self._slice_input.displayed]
             shape = np.ceil(
-                [de[1, i] - de[0, i] + 1 for i in self._dims_displayed]
+                [de[1, i] - de[0, i] + 1 for i in self._slice_input.displayed]
             ).astype(int)
             zoom_factor = np.divide(
                 self._thumbnail_shape[:2], shape[-2:]
@@ -1792,7 +1839,7 @@ class _BasePoints(Layer):
                         adding = data_size - prev_size
                         if len(self._size) > 0:
                             new_size = copy(self._size[-1])
-                            for i in self._dims_displayed:
+                            for i in self._slice_input.displayed:
                                 new_size[i] = self.current_size
                         else:
                             # Add the default size, with a value for each dimension
@@ -1850,7 +1897,7 @@ class _BasePoints(Layer):
             Used for modifier drag_box selection.
         """
         selection_indices = list(selection_indices)
-        dims_displayed = list(self._dims_displayed)
+        dims_displayed = list(self._slice_input.displayed)
         if self._drag_start is None:
             self._drag_start = np.array(position, dtype=float)[dims_displayed]
             if len(selection_indices) > 0 and center_by_data:
@@ -1875,7 +1922,7 @@ class _BasePoints(Layer):
         """
         if len(selection_indices) > 0:
             selection_indices = list(selection_indices)
-            disp = list(self._dims_displayed)
+            disp = list(self._slice_input.displayed)
             ixgrid = np.ix_(selection_indices, disp)
             self._set_drag_start(selection_indices, position)
             center = self._points_data[ixgrid].mean(axis=0)
@@ -2366,7 +2413,66 @@ class Points(_BasePoints):
         cur_npoints = len(self._data)
         self._data = data
 
-        self._update_props_and_style(len(data), cur_npoints)
+        # Add/remove property and style values based on the number of new points.
+        with self.events.blocker_all():
+            with self._edge.events.blocker_all():
+                with self._face.events.blocker_all():
+                    self._feature_table.resize(len(data))
+                    self.text.apply(self.features)
+                    if len(data) < cur_npoints:
+                        # If there are now fewer points, remove the size and colors of the
+                        # extra ones
+                        if len(self._edge.colors) > len(data):
+                            self._edge._remove(
+                                np.arange(len(data), len(self._edge.colors))
+                            )
+                        if len(self._face.colors) > len(data):
+                            self._face._remove(
+                                np.arange(len(data), len(self._face.colors))
+                            )
+                        self._shown = self._shown[: len(data)]
+                        self._size = self._size[: len(data)]
+                        self._edge_width = self._edge_width[: len(data)]
+
+                    elif len(data) > cur_npoints:
+                        # If there are now more points, add the size and colors of the
+                        # new ones
+                        adding = len(data) - cur_npoints
+                        if len(self._size) > 0:
+                            new_size = copy(self._size[-1])
+                            for i in self._slice_input.displayed:
+                                new_size[i] = self.current_size
+                        else:
+                            # Add the default size, with a value for each dimension
+                            new_size = np.repeat(
+                                self.current_size, self._size.shape[1]
+                            )
+                        size = np.repeat([new_size], adding, axis=0)
+
+                        if len(self._edge_width) > 0:
+                            new_edge_width = copy(self._edge_width[-1])
+                        else:
+                            new_edge_width = self.current_edge_width
+                        edge_width = np.repeat(
+                            [new_edge_width], adding, axis=0
+                        )
+
+                        # add new colors
+                        self._edge._add(n_colors=adding)
+                        self._face._add(n_colors=adding)
+
+                        shown = np.repeat([True], adding, axis=0)
+                        self._shown = np.concatenate(
+                            (self._shown, shown), axis=0
+                        )
+
+                        self.size = np.concatenate((self._size, size), axis=0)
+                        self.edge_width = np.concatenate(
+                            (self._edge_width, edge_width), axis=0
+                        )
+                        self.selected_data = set(
+                            np.arange(cur_npoints, len(data))
+                        )
 
         self._update_dims()
         self.events.data(value=self.data)
@@ -2416,10 +2522,13 @@ class Points(_BasePoints):
 
         Parameters
         ----------
-        ixgrid : Tuple[np.ndarray, np.ndarray]
-            Crossproduct indexing grid of node indices and dimensions, see `np.ix_`
-        shift : np.ndarray
-            Selected coordinates shift
+        selection_indices : set of int
+            integer indices of selected data used to index into self.data
+        position : Sequence of numbers
+            position of the drag start in data coordinates.
+        center_by_data: bool
+            Center the drag start based on the selected data.
+            Used for modifier drag_box selection.
         """
         self.data[ixgrid] += shift
 
@@ -2429,7 +2538,7 @@ class Points(_BasePoints):
         totpoints = len(self.data)
 
         if len(self._clipboard.keys()) > 0:
-            not_disp = self._dims_not_displayed
+            not_disp = self._slice_input.not_displayed
             data = deepcopy(self._clipboard['data'])
             offset = [
                 self._slice_indices[i] - self._clipboard['indices'][i]

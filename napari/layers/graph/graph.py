@@ -255,13 +255,13 @@ class Graph(_BasePoints):
     @property
     def edges_coordinates(self) -> np.ndarray:
         _, edges = self.data.edges_buffers(is_buffer_domain=True)
-        coords = self.data._coords[edges][..., self._dims_displayed]
+        coords = self.data._coords[edges][..., self._slice_input.displayed]
         return coords
 
     @property
     def _view_edges_coordinates(self) -> np.ndarray:
         return self.data._coords[self._graph_edges_view][
-            ..., self._dims_displayed
+            ..., self._slice_input.displayed
         ]
 
     @property
