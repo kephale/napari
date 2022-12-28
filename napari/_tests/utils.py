@@ -9,6 +9,7 @@ import pytest
 
 from napari import Viewer
 from napari.layers import (
+    Graph,
     Image,
     Labels,
     Points,
@@ -92,7 +93,7 @@ try:
 except ImportError:
     pass
 
-classes = [Labels, Points, Vectors, Shapes, Surface, Tracks, Image]
+classes = [Graph, Labels, Points, Vectors, Shapes, Surface, Tracks, Image]
 names = [cls.__name__.lower() for cls in classes]
 layer2addmethod = {
     cls: getattr(Viewer, 'add_' + name) for cls, name in zip(classes, names)
