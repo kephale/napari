@@ -94,6 +94,14 @@ def _n_selected_tracks(s: LayerSel) -> int:
     return sum(x._type_string == "tracks" for x in s)
 
 
+def _only_graphs(s: LayerSel) -> bool:
+    return bool(s and all(x._type_string == "graph" for x in s))
+
+
+def _n_selected_graphs(s: LayerSel) -> int:
+    return sum(x._type_string == "graph" for x in s)
+
+
 def _active_type(s: LayerSel) -> Optional[str]:
     return s.active._type_string if s.active else None
 
@@ -193,6 +201,11 @@ class LayerListContextKeys(ContextNamespace['LayerSel']):
         0,
         trans._("Number of selected tracks layers."),
         _n_selected_tracks,
+    )
+    num_selected_graph_layers = ContextKey(
+        0,
+        trans._("Number of selected graph layers."),
+        _n_selected_graphs,
     )
     active_layer_ndim = ContextKey['LayerSel', Optional[int]](
         None,
