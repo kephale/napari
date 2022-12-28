@@ -1,8 +1,7 @@
 from typing import List, Tuple, Union
 
 import numpy as np
-from napari_graph import UndirectedGraph
-from napari_graph._base_graph import BaseGraph
+from napari_graph import BaseGraph, UndirectedGraph
 
 from ...utils.translations import trans
 from ..points.points import _BasePoints
