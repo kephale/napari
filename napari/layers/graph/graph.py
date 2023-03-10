@@ -246,7 +246,7 @@ class Graph(_BasePoints):
         else:
             mask = np.zeros(self.data.n_allocated_nodes, dtype=bool)
             mask[self._indices_view] = True
-            _, edges = self.data.edges_buffers(is_buffer_domain=True)
+            _, edges = self.data.get_edges_buffers(is_buffer_domain=True)
             self._graph_edges_view = edges[
                 np.logical_and(mask[edges[:, 0]], mask[edges[:, 1]])
             ]
