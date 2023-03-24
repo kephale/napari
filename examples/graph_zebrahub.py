@@ -16,8 +16,6 @@ def build_graph(n_nodes: int, n_neighbors: int) -> UndirectedGraph:
         columns=["t", "z", "y", "x"],
     )
     graph = UndirectedGraph(edges=edges, coords=nodes_df[["t", "z", "y", "x"]])
-
-    import pdb; pdb.set_trace()
     
     return graph
 
