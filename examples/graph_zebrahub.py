@@ -7,9 +7,6 @@ from napari_graph import UndirectedGraph, DirectedGraph
 # Data from zebrahub
 # See the paper for more details: https://www.biorxiv.org/content/10.1101/2023.03.06.531398v1.full.pdf
 
-# filename = "/Users/kharrington/Data/Zebrahub/ZSNS001_tail_tracks.csv"
-filename = "/Users/kharrington/Data/Zebrahub/ZSNS001_tracks.csv"
-
 def build_graph(n_nodes: int, n_neighbors: int) -> UndirectedGraph:
     neighbors = np.random.randint(n_nodes, size=(n_nodes * n_neighbors))
     edges = np.stack([np.repeat(np.arange(n_nodes), n_neighbors), neighbors], axis=1)
@@ -70,14 +67,20 @@ def load_graph(filename, scale_factors=(1, 1.24, 0.439, 0.439)):
 
 
 if __name__ == "__main__":
+    import pooch
 
+    dest_path = pooch.retrieve(
+        url="https://public.czbiohub.org/royerlab/zebrahub/imaging/single-objective/ZSNS001_tracks.csv",  # noqa: E501
+        known_hash="b674b385cb98f7a892ecc6d44258b9fbc6108f4e94b3343ac93143539b780922",  # noqa: E501
+    )    
+    
     viewer = napari.Viewer()
     n_nodes = 1000000
-    graph, df = load_graph(filename)
+    graph, df = load_graph(dest_path)
 
     # graph = build_graph(n_nodes, 5)
     layer = Graph(graph, out_of_slice_display=True, features=df[["t", "z", "y", "x"]], face_color="z", size=4)
     
     viewer.add_layer(layer)
 
-    # napari.run()
+    napari.run()
