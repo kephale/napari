@@ -4,6 +4,9 @@ import napari
 from napari.layers import Graph
 from napari_graph import UndirectedGraph, DirectedGraph
 
+# Data from zebrahub
+# See the paper for more details: https://www.biorxiv.org/content/10.1101/2023.03.06.531398v1.full.pdf
+
 # filename = "/Users/kharrington/Data/Zebrahub/ZSNS001_tail_tracks.csv"
 filename = "/Users/kharrington/Data/Zebrahub/ZSNS001_tracks.csv"
 
@@ -43,9 +46,10 @@ def load_graph(filename, scale_factors=(1, 1.24, 0.439, 0.439)):
     print(f"Number of tracks: {len(all_track_ids)}")
     
     # Collect tracks
-    for track_id in all_track_ids[:16000]:
-        if track_id % 100 == 0:
-            print(f"Track {track_id}")
+    # TODO this is a hardcoded subset because otherwise this gets slow, number chosen to be >1M edges
+    for idx, track_id in enumerate(all_track_ids[:16000]):
+        if idx % 100 == 0:
+            print(f"Track idx {idx}")
         nodes = df.loc[df["TrackID"] == track_id]        
         pairs = zip(nodes["NodeID"], nodes["NodeID"][1:])
         neighbors += tuple(pairs)
