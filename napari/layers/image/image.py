@@ -759,7 +759,7 @@ class _ImageBase(IntensityVisualizationMixin, Layer):
             lazy=True,
             dask_indexer=nullcontext,
         )
-        response = request()
+        response = request(self)
         self._update_slice_response(response)
 
     def _make_slice_request(self, dims: Dims) -> _ImageSliceRequest:
