@@ -724,7 +724,7 @@ def render_sequence_3D(
 @tz.curry
 def _on_yield_2D(coord, layer=None):
     chunk_slice, scale, chunk = coord
-    layer.data[chunk_slice] = chunk
+    layer.data[scale][chunk_slice] = chunk
     layer.refresh()
     
 # # TODO consider filling these chunks into a queue and processing them in batches
