@@ -124,7 +124,7 @@ class _ImageSliceRequest:
             indices=self.indices,
         )
 
-    def _call_multi_scale_progressive_loading(self, layer) -> _ImageSliceResponse:        
+    def _call_multi_scale_progressive_loading(self, layer) -> _ImageSliceResponse:
         # If we're not ready, then do single scale on lowest res
         if "viewer" not in layer.metadata:
             indices = self._slice_indices_at_level(-1)
@@ -251,16 +251,13 @@ class _ImageSliceRequest:
                 else:
                     raise Exception(f"No render sequence for {ndim}")
 
-
-    
-
         
         worker = render_sequence(rendering_inputs)
         worker.yielded.connect(on_yield)
         worker.start()
-
         layer.metadata["worker"] = worker
-                
+
+        
         image = self.data[0][tuple(indices)]
         thumbnail = self.data[self.thumbnail_level][tuple(thumbnail_indices)]
 

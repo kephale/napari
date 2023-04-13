@@ -14,6 +14,21 @@ import toolz as tz
 from skimage.transform import resize
 import dask.array as da
 
+import sys
+import logging
+
+LOGGER = logging.getLogger("_progressive_loading")
+LOGGER.setLevel(logging.DEBUG)
+
+streamHandler = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+streamHandler.setFormatter(formatter)
+LOGGER.addHandler(streamHandler)
+
+
+
 # A ChunkCacheManager manages multiple chunk caches
 class ChunkCacheManager:
     def __init__(self, cache_size=1e9, cost_cutoff=0):
@@ -1049,24 +1064,30 @@ def get_and_process_chunk_2D(chunk_slice, scale, array, full_shape, cache_manage
         cache_manager=cache_manager,
     )
     
-    upscale_factor = [el * 2**scale for el in real_array.shape]
+    # upscale_factor = [el * 2**scale for el in real_array.shape]
     
     # Upscale the data to highest resolution
-    upscaled = resize(
-        real_array,
-        upscale_factor,
-        preserve_range=True,
-    )
+    # upscaled = resize(
+    #     real_array,
+    #     upscale_factor,
+    #     preserve_range=True,
+    # )
 
     # TODO imposes 3D
     z, y, x = [sl.start for sl in chunk_slice]
 
     # Use this to overwrite data and then use a colormap to debug where resolution levels go
     # upscaled = np.ones_like(upscaled) * scale
-
+    LOGGER.info(
+        f"yielding: {(z * 2**scale, y * 2**scale, x * 2**scale, scale, real_array.shape)} sample {real_array[10:20,10]} with sum {real_array.sum()}"
+    )
     # Return upscaled coordinates, the scale, and chunk
-    chunk_size = upscaled.shape
+    chunk_size = real_array.shape
 
+    LOGGER.info(
+        f"yield will be placed at: {(z * 2**scale, y * 2**scale, x * 2**scale, scale, real_array.shape)}"
+    )
+    
     upscaled_chunk_size = [0, 0]
     upscaled_chunk_size[0] = min(
         full_shape[-2] - y * 2**scale,
@@ -1077,25 +1098,25 @@ def get_and_process_chunk_2D(chunk_slice, scale, array, full_shape, cache_manage
         chunk_size[-1],
     )
 
-    upscaled = upscaled[: upscaled_chunk_size[-2], : upscaled_chunk_size[-1]]
+    # upscaled = upscaled[: upscaled_chunk_size[-2], : upscaled_chunk_size[-1]]
 
     # TODO This is unclean!
-    upscaled_chunk_slice = [None] * 3
-    for idx, sl in enumerate(chunk_slice):
-        start_coord = sl.start * 2**scale
-        stop_coord = sl.stop * 2**scale
-        # Check for ragged edges
-        if idx > 0:
-            stop_coord = start_coord + min(
-                stop_coord - start_coord, upscaled_chunk_size[idx - 1]
-            )
+    # upscaled_chunk_slice = [None] * 3
+    # for idx, sl in enumerate(chunk_slice):
+    #     start_coord = sl.start * 2**scale
+    #     stop_coord = sl.stop * 2**scale
+    #     # Check for ragged edges
+    #     if idx > 0:
+    #         stop_coord = start_coord + min(
+    #             stop_coord - start_coord, upscaled_chunk_size[idx - 1]
+    #         )
 
-        upscaled_chunk_slice[idx] = slice(start_coord, stop_coord)
+    #     upscaled_chunk_slice[idx] = slice(start_coord, stop_coord)
 
     return (
-        tuple(upscaled_chunk_slice),
+        tuple(chunk_slice),
         scale,
-        upscaled,
+        real_array,
     )
 
 
