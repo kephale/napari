@@ -589,7 +589,7 @@ def render_sequence_3D(
 
     # This node's offset in world space
     world_offset = np.array(min_coord) * np.array(scale_factor)
-
+    
     # Iterate over points/chunks and add corresponding nodes when appropriate
     for idx, point in enumerate(points):
         # TODO: There are 2 strategies here:
@@ -616,8 +616,8 @@ def render_sequence_3D(
             #     f"Fetching: {(scale, chunk_slice)} World offset: {node_offset}"
             # )
 
-            scale_dataset = f"{dataset}/s{scale}"
-
+            scale_dataset = f"{dataset}/s{scale}"            
+            
             # When we get_chunk chunk_slice needs to be in data space, but chunk slices are 3D
             data_slice = tuple(
                 [slice(el, el + 1) for el in dims.current_step[:-3]]
@@ -642,7 +642,7 @@ def render_sequence_3D(
                     for sl, offset in zip(chunk_slice, min_coord)
                 ]
             )
-            if texture_slice[1].start < 0:
+            if texture_slice[0].start < 0:
                 import pdb
 
                 pdb.set_trace()
@@ -661,6 +661,9 @@ def render_sequence_3D(
     # TODO make sure that all of low res loads first
     # TODO take this 1 step further and fill all high resolutions with low res
 
+    min_coord = [st.start for st in view_slice]
+    min_coord = [0, 0, 0]
+    
     # recurse on best priorities
     if scale > 0:
         # The next priorities for loading in higher resolution are the best ones
@@ -684,6 +687,11 @@ def render_sequence_3D(
                     for sl, offset in zip(chunk_slice, min_coord)
                 ]
             )
+
+            if texture_slice[0].start < 0:
+                import pdb
+
+                pdb.set_trace()
 
             # Compute the relative scale factor between these layers
             relative_scale_factor = [
@@ -737,7 +745,7 @@ def render_sequence_3D(
 
     
 @tz.curry
-def _on_yield_2D(coord, layer=None):
+def _on_yield_2D(coord, layer=None, viewer=None):
     chunk_slice, scale, chunk = coord
     layer.data[scale][chunk_slice] = chunk
     layer.refresh()
@@ -796,29 +804,19 @@ def _on_yield_3D(
         data,
         dtype=dtype,
     )
-    
-    # Note: due to odd dimensions in scale pyramids sometimes we have off by 1
-    ntd_slice = (
-        slice(0, layer.data[texture_slice].shape[1]),
-        slice(0, layer.data[texture_slice].shape[2]),
-        slice(0, layer.data[texture_slice].shape[3]),
-    )
-    if len(new_texture_data.shape) == 3:
-        import pdb
-        
-        pdb.set_trace()
 
-    layer.data[texture_slice] = new_texture_data[
-        : layer.data[texture_slice].shape[0],
-        : layer.data[texture_slice].shape[1],
-        : layer.data[texture_slice].shape[2],
-        : layer.data[texture_slice].shape[3],
+    LOGGER.info(f"on_yield_3D: texture slice {[(sl.start, sl.stop) for sl in texture_slice]}")
+
+    layer.data[scale][texture_slice] = new_texture_data[
+        : layer.data[scale][texture_slice].shape[0],
+        : layer.data[scale][texture_slice].shape[1],
+        : layer.data[scale][texture_slice].shape[2],
     ]
 
     # TODO explore efficiency of either approach, or maybe even an alternative
     # Writing a texture with an offset is slower
     # texture.set_data(new_texture_data, offset=texture_offset)
-    texture.set_data(np.asarray(layer.data[texture_slice]).squeeze())
+    texture.set_data(np.asarray(layer.data[scale][texture_slice]).squeeze())
     # TODO we might need to zero out parts of the texture when there is a ragged boundary size
 
     volume.update()
@@ -828,24 +826,24 @@ def _on_yield_3D(
     # Note: this can trigger a refresh, we should do it after setting data to not trigger an
     #       extra materialization with
     # TODO this might be a race condition with multiple on_yielded events
-    if node_offset is not None:
-        try:
-            # Trigger a refresh of our layer
-            layer.refresh()
+    # if node_offset is not None:
+    #     try:
+    #         # Trigger a refresh of our layer
+    #         layer.refresh()
 
-            container = layer.metadata["zarr_container"]
-            dataset = layer.metadata["zarr_dataset"]
+    #         container = layer.metadata["zarr_container"]
+    #         dataset = layer.metadata["zarr_dataset"]
             
-            next_layer_name = f"{container}/{dataset}/s{scale - 1}"
-            next_layer = viewer.layers[next_layer_name]
-            next_layer.translate = node_offset
-        except Exception as e:
-            import pdb
+    #         next_layer_name = f"{container}/{dataset}/s{scale - 1}"
+    #         next_layer = viewer.layers[next_layer_name]
+    #         next_layer.translate = node_offset
+    #     except Exception as e:
+    #         import pdb
 
-            pdb.traceback.print_exception(e)
-            pdb.traceback.print_stack()
+    #         pdb.traceback.print_exception(e)
+    #         pdb.traceback.print_stack()
 
-            pdb.set_trace()
+    #         pdb.set_trace()
 
     # The node translate calls made when zeroing will update everyone except 0
     if scale == 0:

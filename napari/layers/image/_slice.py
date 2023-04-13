@@ -185,8 +185,8 @@ class _ImageSliceRequest:
         on_yield = None
         chunk_maps = None
         if self.dims.ndisplay == 3:
-            on_yield = _on_yield_3D(layer=layer)
-            chunk_maps = chunk_centers_3D(self.data)
+            on_yield = _on_yield_3D(layer=layer, viewer=viewer)
+            chunk_maps = [chunk_centers_3D(array) for array in self.data]
         else:
             on_yield = _on_yield_2D(layer=layer)
             
@@ -197,7 +197,7 @@ class _ImageSliceRequest:
                             "corners": self.corner_pixels,# Prob wrong
                             "cache_manager": layer.metadata["cache_manager"],
                             "arrays": self.data,
-                            "scale": len(self.data),
+                            "scale": len(self.data) - 1,
                             "camera": camera,
                             "zarr_container": layer.metadata["zarr_container"],
                             "zarr_dataset": layer.metadata["zarr_dataset"],
@@ -206,7 +206,8 @@ class _ImageSliceRequest:
                             "chunk_maps": chunk_maps,
                             "dims": self.dims
                             }
-        
+
+        print(f"Rendering inputs: {rendering_inputs}")
         # Start a render sequence, this will async fetch chunks and trigger on_yield function
 
         if "render_sequence" not in globals():
@@ -214,7 +215,7 @@ class _ImageSliceRequest:
             
             @thread_worker
             def render_sequence(rendering_inputs):
-                ndim = rendering_inputs["ndim"]
+                ndim = rendering_inputs["ndim"]                
                 if ndim == 2:
                     corners = rendering_inputs["corners"]
                     full_shape = rendering_inputs["full_shape"]
@@ -222,7 +223,7 @@ class _ImageSliceRequest:
                     arrays = rendering_inputs["arrays"]
                     yield from render_sequence_2D(corners, full_shape, cache_manager=cache_manager, arrays=rendering_inputs["arrays"], dataset=rendering_inputs["zarr_dataset"], container=rendering_inputs["zarr_container"])
                 elif ndim == 3:
-                    view_slice = rendering_inputs["indices"]
+                    view_slice = [slice(rendering_inputs["corners"][0, idx], rendering_inputs["corners"][1, idx]) for idx in range(rendering_inputs["corners"].shape[1])]
                     scale = rendering_inputs["scale"]
                     camera = rendering_inputs["camera"]
                     cache_manager = rendering_inputs["cache_manager"]
@@ -233,7 +234,8 @@ class _ImageSliceRequest:
                     dtype = rendering_inputs["dtype"]
                     chunk_maps = rendering_inputs["chunk_maps"]
                     arrays = rendering_inputs["arrays"]
-                    dims = rendering_inputs["dims"]
+                    dims = viewer.dims.copy()
+
                     yield from render_sequence_3D_caller(
                         view_slice,
                         scale,
