@@ -249,7 +249,6 @@ def dims_update_handler(invar, data=None):
         # worker.await_workers(msecs=30000)
 
     # Find the corners of visible data in the highest resolution
-    # todo what is this here for??
     corner_pixels = viewer.layers[get_layer_name_for_scale(0)].corner_pixels
 
     top_left = np.max((corner_pixels,), axis=0)[0, :]
@@ -394,9 +393,6 @@ def add_progressive_loading_image(img, viewer=None):
     # take the currently visible canvas extents and apply them to the 
     # individual data scales
     multiscale_data.set_interval(top_left, bottom_right)
-    # expected_corner_pixels = np.asarray([[0, 0], [img.shape[0], img.shape[1]]])
-    # top_left = self._map_canvas2world([0, 0])
-    # bottom_right = self._map_canvas2world(self.canvas.size)
 
     # TODO sketchy Disable _update_thumbnail
     def temp_update_thumbnail(self):
@@ -433,8 +429,6 @@ def add_progressive_loading_image(img, viewer=None):
     # viewer.camera.zoom = 0.001
     # viewer.camera.zoom = 0.00001
 
-    # multiscale_data.set_interval(top_left, bottom_right)
-
     # Connect to camera and dims
     for listener in [viewer.camera.events, viewer.dims.events]:
         listener.connect(
@@ -469,8 +463,6 @@ if __name__ == "__main__":
     non_visible_center = (0.0, -3242614, -9247091)
     non_visible_zoom = 0.00005
 
-    LOGGER.debug('============================ initial load')
-
     if rendering_mode == "progressive_loading":
         # Make an object that creates/manages all scale nodes
         add_progressive_loading_image(multiscale_img, viewer=viewer)
@@ -482,17 +474,6 @@ if __name__ == "__main__":
 
         yappi.get_func_stats().print_all()
         yappi.get_thread_stats().print_all()
-
-    viewer.camera.zoom = non_visible_zoom
-    viewer.camera.center = non_visible_center
-    LOGGER.debug('=========================== after recentering')
-
-    canvas_corners = viewer.window.qt_viewer._canvas_corners_in_world.copy()    
-
-    top_left = canvas_corners[0, :]
-    bottom_right = canvas_corners[1, :]
-    LOGGER.debug(f'++++++++++++++++++++ top left: {top_left}, bottom_right: {bottom_right}')
-
 
     napari.run()
 
