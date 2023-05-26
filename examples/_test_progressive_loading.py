@@ -14,9 +14,26 @@ from napari.experimental import _progressive_loading
 from _mandelbrot_vizarr import add_progressive_loading_image, get_and_process_chunk_2D
 
 
-@pytest.fixture
-def max_level():
-    return 14
+@pytest.fixture(
+        params=[
+            8, 
+            14,
+        ]
+)
+def max_level(request):
+    """Parameterized fixture that supplies a max_level for testing.
+
+    Parameters
+    ----------
+    request : _pytest.fixtures.SubRequest
+        The pytest request object
+
+    Returns
+    -------
+    int
+        max_level for mandelbrot datasets
+    """
+    return request.param
 
 @pytest.fixture
 def mandelbrot_arrays(max_level):
@@ -33,14 +50,62 @@ def test_add_progressive_loading_image_zoom_in(mandelbrot_arrays):
     viewer = napari.Viewer()
     viewer.camera.zoom = 0.0001
     add_progressive_loading_image(mandelbrot_arrays, viewer=viewer)
-    viewer.camera.zoom = 0.001  # only fails if we change visible scales
-
+    viewer.camera.zoom = 0.001
+    
 
 def test_add_progressive_loading_image_zoom_out(mandelbrot_arrays):
     viewer = napari.Viewer()
     viewer.camera.zoom = 0.001
     add_progressive_loading_image(mandelbrot_arrays, viewer=viewer)
-    viewer.camera.zoom = 0.0001  # only fails if we change visible scales
+    viewer.camera.zoom = 0.0001
+
+# TODO test for nothing visible on initial load and for nothing visible after camera movement
+def test_add_progressive_loading_image_no_visible(mandelbrot_arrays):
+    viewer = napari.Viewer()
+    non_visible_center = (0.0, -3242614, -9247091)
+    start_zoom = 0.00005
+
+    add_progressive_loading_image(mandelbrot_arrays, viewer=viewer)
+    viewer.camera.zoom = start_zoom
+    viewer.camera.center = non_visible_center
+
+
+def test_add_progressive_loading_image_zoom_before_load(mandelbrot_arrays):
+    # TODO fails for max_levels=8
+    viewer = napari.Viewer()
+    start_center = (0.0, 4194303.5, 4194303.5)
+    non_visible_center = (0.0, -3242614, -9247091)
+    start_zoom = 0.00005
+    viewer.camera.zoom = start_zoom
+    viewer.camera.center = non_visible_center
+    add_progressive_loading_image(mandelbrot_arrays, viewer=viewer)
+    
+def test_MultiScaleVirtualData_set_interval(mandelbrot_arrays):
+    # viewer = napari.Viewer()
+    # multi_data = _progressive_loading.MultiScaleVirtualData(mandelbrot_arrays)
+    # # add_progressive_loading_image(mandelbrot_arrays, viewer=viewer)
+    
+    # # prev_max_coord = multi_data._max_coord
+    # # prev_min_coord = multi_data._min_coord
+
+    # # pan to reset coords
+    # coords = tuple([
+    #     slice(0, 1024, None),
+    #     slice(0, 1024, None)
+    # ])
+    # # coords = tuple([
+    # #     slice(0, 673, None),
+    # #     slice(0, 0, None)
+    # # ])
+    # # coords = tuple([
+    # #     slice(0, 1346, None),
+    # #     slice(0, 0, None)
+    # # ])
+    # min_coord = [0]
+    # max_coord = [1]
+    # multi_data.set_interval(min_coord, max_coord)
+    # TODO still working on this
+    pass
 
 
 def test_chunk_slices_0_1024(mandelbrot_arrays, max_level):
@@ -136,7 +201,9 @@ def test_MandlebrotStore(max_level):
         levels=max_level, tilesize=512, compressor=None, maxiter=255  
     ) 
 
-def test_get_and_process_chunk_2D(mandelbrot_arrays):
+def test_get_and_process_chunk_2D():
+    large_image = mandelbrot_dataset(max_levels=14)
+    mandelbrot_arrays = large_image["arrays"]
     scale = 12
     virtual_data = _progressive_loading.VirtualData(mandelbrot_arrays[scale], scale=scale)
     chunk_slice = tuple([slice(1024, 1536, None), slice(512, 1024, None)])
@@ -153,5 +220,12 @@ if __name__ == "__main__":
     large_image = mandelbrot_dataset(max_levels=14)
     mandelbrot_arrays = large_image["arrays"]
 
-    scale = 7
-    vdata = _progressive_loading.VirtualData(mandelbrot_arrays[scale], scale=scale)
+    # scale = 7
+    # vdata = _progressive_loading.VirtualData(mandelbrot_arrays[scale], scale=scale)
+
+    start_center = (0.0, 4194303.5, 4194303.5)
+    non_visible_center = (0.0, -3242614, -9247091)
+    start_zoom = 0.00005
+    viewer.camera.zoom = start_zoom
+    viewer.camera.center = non_visible_center
+    add_progressive_loading_image(mandelbrot_arrays, viewer=viewer)

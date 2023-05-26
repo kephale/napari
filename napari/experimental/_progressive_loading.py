@@ -825,6 +825,11 @@ class VirtualData:
         coords: tuple(slice(ndim))
             tuple of slices in the same coordinate system as the parent array.
         """
+        LOGGER.debug(f'VirtualData: coords: {coords}')
+        if coords[0].stop - coords[0].start == 0 or coords[1].stop - coords[1].start == 0:
+            # one of the slices is empty
+            # TODO this is true for some cases where max_where is empty
+            pass
         # store the last interval
         prev_max_coord = self._max_coord
         prev_min_coord = self._min_coord
@@ -859,6 +864,9 @@ class VirtualData:
 
             
             max_where = np.where(cumuchunks >= self._max_coord[dim])
+            # LOGGER.debug(f'max_where: {max_where}')
+            if not max_where[0].any():
+                pass
             lessthan_max_idx = max_where[0][0] if max_where[0] is not None else 0
             self._max_coord[dim] = (
                 cumuchunks[lessthan_max_idx]
@@ -1017,6 +1025,7 @@ class VirtualData:
     ) -> LayerDataProtocol:
         """Returns self[key]."""
         data_plane_key = self._data_plane_key(key)
+        LOGGER.debug(f'data plane key in get_offset: {key}')
         try:
             return self.data_plane.__getitem__(data_plane_key)
         except Exception:
@@ -1213,6 +1222,7 @@ class MultiScaleVirtualData:
         for scale in range(len(self.arrays)):
             if not visible_scales or visible_scales[scale]:
                 # Update translate
+                # convert min/max_coord from data coord to chunked slicing coords
                 # TODO expect rounding errors here
                 scaled_min = [
                     int(min_coord[idx] / self._scale_factors[scale][idx])
@@ -1225,13 +1235,14 @@ class MultiScaleVirtualData:
 
                 self._translate[scale] = scaled_min
                 LOGGER.info(
-                    f"MultiscaleVirtualData: update_with_minmax: scale {scale} min {min_coord} : {scaled_min} max {max_coord} : scaled max {scaled_max}"
+                    f"MultiscaleVirtualData: update_with_minmax: scale {scale} : min_coord {min_coord} : max_coord {max_coord} : scaled min {scaled_min} : scaled max {scaled_max}"
                 )
 
                 # Ask VirtualData to update its interval
                 coords = tuple(
                     [slice(mn, mx) for mn, mx in zip(scaled_min, scaled_max)]
                 )
+                LOGGER.debug(f'MultiScaleVirtualData: coords: {coords}')
                 self._data[scale].set_interval(coords)
             else:
                 LOGGER.debug('visible scales are provided, do nothing')
