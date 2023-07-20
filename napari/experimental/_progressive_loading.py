@@ -509,7 +509,7 @@ def dims_update_handler(invar, data=None, viewer=None, ndisplay=None):
 
 
 def add_progressive_loading_image(
-    img, viewer=None, contrast_limits=[0, 255], colormap='PiYG', ndisplay=2
+        img, viewer=None, contrast_limits=[0, 255], colormap='PiYG', ndisplay=2, rendering_method="attenuated_mip"
 ):
     """Add tiled multiscale image."""
     # initialize multiscale virtual data (generate scale factors, translations,
@@ -574,7 +574,8 @@ def add_progressive_loading_image(
             name=get_layer_name_for_scale(scale),
             colormap=colormap,
             scale=multiscale_data._scale_factors[scale],
-            rendering="attenuated_mip",
+            rendering=rendering_method,
+            contrast_limits=contrast_limits
         )
         layers[scale] = layer
         layer.metadata["translated"] = False
