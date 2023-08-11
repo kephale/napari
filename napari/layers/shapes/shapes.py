@@ -2,13 +2,14 @@ import warnings
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from itertools import cycle
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Callable, ClassVar, Dict, List, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from vispy.color import get_color_names
 
 from napari.layers.base import Layer, no_op
+from napari.layers.base._base_constants import ActionType
 from napari.layers.base._base_mouse_bindings import (
     highlight_box_handles,
     transform_with_box,
@@ -25,10 +26,11 @@ from napari.layers.shapes._shapes_mouse_bindings import (
     add_ellipse,
     add_line,
     add_path_polygon,
-    add_path_polygon_creating,
+    add_path_polygon_lasso,
     add_rectangle,
     finish_drawing_shape,
     highlight,
+    polygon_creating,
     select,
     vertex_insert,
     vertex_remove,
@@ -39,6 +41,7 @@ from napari.layers.shapes._shapes_utils import (
     get_default_shape_type,
     get_shape_ndim,
     number_of_shapes,
+    rdp,
     validate_num_vertices,
 )
 from napari.layers.utils.color_manager_utils import (
@@ -55,6 +58,7 @@ from napari.layers.utils.interactivity_utils import (
 )
 from napari.layers.utils.layer_utils import _FeatureTable, _unique_element
 from napari.layers.utils.text_manager import TextManager
+from napari.settings import get_settings
 from napari.utils.colormaps import Colormap, ValidColormapArg, ensure_colormap
 from napari.utils.colormaps.colormap_utils import ColorType
 from napari.utils.colormaps.standardize_color import (
@@ -324,7 +328,7 @@ class Shapes(Layer):
     # in the thumbnail
     _max_shapes_thumbnail = 100
 
-    _drag_modes = {
+    _drag_modes: ClassVar[Dict[Mode, Callable[["Shapes", Event], Any]]] = {
         Mode.PAN_ZOOM: no_op,
         Mode.TRANSFORM: transform_with_box,
         Mode.SELECT: select,
@@ -336,9 +340,10 @@ class Shapes(Layer):
         Mode.ADD_LINE: add_line,
         Mode.ADD_PATH: add_path_polygon,
         Mode.ADD_POLYGON: add_path_polygon,
+        Mode.ADD_POLYGON_LASSO: add_path_polygon_lasso,
     }
 
-    _move_modes = {
+    _move_modes: ClassVar[Dict[Mode, Callable[["Shapes", Event], Any]]] = {
         Mode.PAN_ZOOM: no_op,
         Mode.TRANSFORM: highlight_box_handles,
         Mode.SELECT: highlight,
@@ -348,11 +353,14 @@ class Shapes(Layer):
         Mode.ADD_RECTANGLE: no_op,
         Mode.ADD_ELLIPSE: no_op,
         Mode.ADD_LINE: no_op,
-        Mode.ADD_PATH: add_path_polygon_creating,
-        Mode.ADD_POLYGON: add_path_polygon_creating,
+        Mode.ADD_PATH: polygon_creating,
+        Mode.ADD_POLYGON: polygon_creating,
+        Mode.ADD_POLYGON_LASSO: polygon_creating,
     }
 
-    _double_click_modes = {
+    _double_click_modes: ClassVar[
+        Dict[Mode, Callable[["Shapes", Event], Any]]
+    ] = {
         Mode.PAN_ZOOM: no_op,
         Mode.TRANSFORM: no_op,
         Mode.SELECT: no_op,
@@ -364,9 +372,10 @@ class Shapes(Layer):
         Mode.ADD_LINE: no_op,
         Mode.ADD_PATH: finish_drawing_shape,
         Mode.ADD_POLYGON: finish_drawing_shape,
+        Mode.ADD_POLYGON_LASSO: no_op,
     }
 
-    _cursor_modes = {
+    _cursor_modes: ClassVar[Dict[Mode, str]] = {
         Mode.PAN_ZOOM: 'standard',
         Mode.TRANSFORM: 'standard',
         Mode.SELECT: 'pointing',
@@ -378,9 +387,10 @@ class Shapes(Layer):
         Mode.ADD_LINE: 'cross',
         Mode.ADD_PATH: 'cross',
         Mode.ADD_POLYGON: 'cross',
+        Mode.ADD_POLYGON_LASSO: 'cross',
     }
 
-    _interactive_modes = {
+    _interactive_modes: ClassVar[Set[Mode]] = {
         Mode.PAN_ZOOM,
     }
 
@@ -418,7 +428,7 @@ class Shapes(Layer):
         cache=True,
         experimental_clipping_planes=None,
     ) -> None:
-        if data is None:
+        if data is None or len(data) == 0:
             if ndim is None:
                 ndim = 2
             data = np.empty((0, 0, ndim))
@@ -498,6 +508,7 @@ class Shapes(Layer):
         self._selected_data_stored = set()
         self._selected_data_history = set()
         self._selected_box = None
+        self._last_cursor_position = None
 
         self._drag_start = None
         self._fixed_vertex = None
@@ -1497,6 +1508,12 @@ class Shapes(Layer):
             Dictionary of layer state.
         """
         state = self._get_base_state()
+        face_color = self.face_color
+        edge_color = self.edge_color
+        if not face_color.size:
+            face_color = self._current_face_color
+        if not edge_color.size:
+            edge_color = self._current_edge_color
         state.update(
             {
                 'ndim': self.ndim,
@@ -1507,13 +1524,13 @@ class Shapes(Layer):
                 'opacity': self.opacity,
                 'z_index': self.z_index,
                 'edge_width': self.edge_width,
-                'face_color': self.face_color,
+                'face_color': face_color,
                 'face_color_cycle': self.face_color_cycle,
-                'face_colormap': self.face_colormap.name,
+                'face_colormap': self.face_colormap.dict(),
                 'face_contrast_limits': self.face_contrast_limits,
-                'edge_color': self.edge_color,
+                'edge_color': edge_color,
                 'edge_color_cycle': self.edge_color_cycle,
-                'edge_colormap': self.edge_colormap.name,
+                'edge_colormap': self.edge_colormap.dict(),
                 'edge_contrast_limits': self.edge_contrast_limits,
                 'data': self.data,
                 'features': self.features,
@@ -1992,7 +2009,12 @@ class Shapes(Layer):
                 face_color=face_color,
                 z_index=z_index,
             )
-            self.events.data(value=self.data)
+            self.events.data(
+                value=self.data,
+                action=ActionType.ADD.value,
+                data_indices=(-1,),
+                vertex_indices=((),),
+            )
 
     def _init_shapes(
         self,
@@ -2249,6 +2271,20 @@ class Shapes(Layer):
         """
         self.text.refresh(self.features)
 
+    @property
+    def _normalized_scale_factor(self):
+        """Scale factor accounting for layer scale.
+
+        This is often needed when calculating screen-space sizes and distances
+        of vertices for interactivity (rescaling, adding vertices, etc).
+        """
+        return self.scale_factor / self.scale[-1]
+
+    @property
+    def _normalized_vertex_radius(self):
+        """Vertex radius normalized to screen space."""
+        return self._vertex_size * self._normalized_scale_factor / 2
+
     def _set_view_slice(self):
         """Set the view given the slicing indices."""
         ndisplay = self._slice_input.ndisplay
@@ -2297,7 +2333,7 @@ class Shapes(Layer):
             if len(index) == 0:
                 box = None
             elif len(index) == 1:
-                box = copy(self._data_view.shapes[list(index)[0]]._box)
+                box = copy(self._data_view.shapes[next(iter(index))]._box)
             else:
                 indices = np.isin(self._data_view.displayed_index, list(index))
                 box = create_box(self._data_view.displayed_vertices[indices])
@@ -2310,7 +2346,10 @@ class Shapes(Layer):
                 box[Box.BOTTOM_LEFT] - box[Box.TOP_LEFT]
             )
             if length_box > 0:
-                r = self._rotation_handle_length * self.scale_factor
+                r = (
+                    self._rotation_handle_length
+                    * self._normalized_scale_factor
+                )
                 rot = (
                     rot
                     - r
@@ -2348,7 +2387,7 @@ class Shapes(Layer):
 
             centers, offsets, triangles = self._data_view.outline(index)
             vertices = centers + (
-                self.scale_factor * self._highlight_width * offsets
+                self._normalized_scale_factor * self._highlight_width * offsets
             )
             vertices = vertices[:, ::-1]
         else:
@@ -2394,6 +2433,7 @@ class Shapes(Layer):
                     Mode.DIRECT,
                     Mode.ADD_PATH,
                     Mode.ADD_POLYGON,
+                    Mode.ADD_POLYGON_LASSO,
                     Mode.ADD_RECTANGLE,
                     Mode.ADD_ELLIPSE,
                     Mode.ADD_LINE,
@@ -2485,12 +2525,27 @@ class Shapes(Layer):
                 self._data_view.remove(index)
             else:
                 self._data_view.edit(index, vertices[:-1])
-        if self._is_creating is True and self._mode == Mode.ADD_POLYGON:
+        if self._is_creating is True and (
+            self._mode
+            in {
+                Mode.ADD_POLYGON,
+                Mode.ADD_POLYGON_LASSO,
+            }
+        ):
             vertices = self._data_view.shapes[index].data
             if len(vertices) <= 3:
                 self._data_view.remove(index)
-            else:
+            elif self._mode == Mode.ADD_POLYGON:
                 self._data_view.edit(index, vertices[:-1])
+            else:
+                vertices = rdp(
+                    vertices, epsilon=get_settings().experimental.rdp_epsilon
+                )
+                self._data_view.edit(
+                    index,
+                    vertices[:-1],
+                    new_type=shape_classes[ShapeType.POLYGON],
+                )
         self._is_creating = False
         self._update_dims()
 
@@ -2558,7 +2613,14 @@ class Shapes(Layer):
             )
         self.selected_data = set()
         self._finish_drawing()
-        self.events.data(value=self.data)
+        self.events.data(
+            value=self.data,
+            action=ActionType.REMOVE.value,
+            data_indices=tuple(
+                index,
+            ),
+            vertex_indices=((),),
+        )
 
     def _rotate_box(self, angle, center=(0, 0)):
         """Perform a rotation on the selected box.
@@ -2592,7 +2654,7 @@ class Shapes(Layer):
         box = self._selected_box - center
         box = np.array(box * scale)
         if not np.all(box[Box.TOP_CENTER] == box[Box.HANDLE]):
-            r = self._rotation_handle_length * self.scale_factor
+            r = self._rotation_handle_length * self._normalized_scale_factor
             handle_vec = box[Box.HANDLE] - box[Box.TOP_CENTER]
             cur_len = np.linalg.norm(handle_vec)
             box[Box.HANDLE] = box[Box.TOP_CENTER] + r * handle_vec / cur_len
@@ -2611,11 +2673,19 @@ class Shapes(Layer):
         box = self._selected_box - center
         box = box @ transform.T
         if not np.all(box[Box.TOP_CENTER] == box[Box.HANDLE]):
-            r = self._rotation_handle_length * self.scale_factor
+            r = self._rotation_handle_length * self._normalized_scale_factor
             handle_vec = box[Box.HANDLE] - box[Box.TOP_CENTER]
             cur_len = np.linalg.norm(handle_vec)
             box[Box.HANDLE] = box[Box.TOP_CENTER] + r * handle_vec / cur_len
         self._selected_box = box + center
+
+    def _update_draw(
+        self, scale_factor, corner_pixels_displayed, shape_threshold
+    ):
+        super()._update_draw(
+            scale_factor, corner_pixels_displayed, shape_threshold
+        )
+        self._set_highlight(force=True)
 
     def _get_value(self, position):
         """Value of the data at a position in data coordinates.
@@ -2645,17 +2715,23 @@ class Shapes(Layer):
         # Check selected shapes
         value = None
         selected_index = list(self.selected_data)
+
         if len(selected_index) > 0:
+            self.scale[self._slice_input.displayed]
+            # Get the vertex sizes. They need to be rescaled by a few parameters:
+            # - scale_factor, because vertex sizes are zoom-invariant
+            # - scale, because vertex sizes are not affected by scale (unlike in Points)
+            # - 2, because the radius is what we need
+
             if self._mode == Mode.SELECT:
                 # Check if inside vertex of interaction box or rotation handle
                 box = self._selected_box[Box.WITH_HANDLE]
                 distances = abs(box - coord)
 
-                # Get the vertex sizes
-                sizes = self._vertex_size * self.scale_factor / 2
-
                 # Check if any matching vertices
-                matches = np.all(distances <= sizes, axis=1).nonzero()
+                matches = np.all(
+                    distances <= self._normalized_vertex_radius, axis=1
+                ).nonzero()
                 if len(matches[0]) > 0:
                     value = (selected_index[0], matches[0][-1])
             elif self._mode in (
@@ -2666,11 +2742,10 @@ class Shapes(Layer):
                 vertices = self._data_view.displayed_vertices[inds]
                 distances = abs(vertices - coord)
 
-                # Get the vertex sizes
-                sizes = self._vertex_size * self.scale_factor / 2
-
                 # Check if any matching vertices
-                matches = np.all(distances <= sizes, axis=1).nonzero()[0]
+                matches = np.all(
+                    distances <= self._normalized_vertex_radius, axis=1
+                ).nonzero()[0]
                 if len(matches) > 0:
                     index = inds.nonzero()[0][matches[-1]]
                     shape = self._data_view.displayed_index[index]

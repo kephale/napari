@@ -1,17 +1,14 @@
-import sys
 import logging
-import time
+import sys
+
 import dask.array as da
 import numpy as np
 import zarr
 from fibsem_tools import read_xarray
-from numba import njit
 from numcodecs import Blosc
 from ome_zarr.io import parse_url
-from ome_zarr.reader import Reader
-from zarr.storage import init_array, init_group
-from zarr.util import json_dumps
-import xarray
+
+from napari.experimental._generative_zarr import MandelbrotStore
 
 LOGGER = logging.getLogger("napari.experimental._progressive_loading_datasets")
 LOGGER.setLevel(logging.DEBUG)
@@ -22,7 +19,6 @@ formatter = logging.Formatter(
 )
 streamHandler.setFormatter(formatter)
 LOGGER.addHandler(streamHandler)
-
 
 
 # TODO capture some sort of metadata about scale factors
@@ -147,11 +143,10 @@ def luethi_zenodo_7144919():
     )
     local_container = os.path.split(dest_dir[0])[0]
     print(local_container)
+
     store = parse_url(local_container, mode="r").store
-    reader = Reader(parse_url(local_container))
-    nodes = list(reader())
-    image_node = nodes[0]
-    dask_data = image_node.data
+    store = zarr.LRUStoreCache(store, max_size=8e9)
+    z_grp = zarr.open(store, mode="r")
 
     large_image = {
         "container": local_container,
@@ -166,28 +161,28 @@ def luethi_zenodo_7144919():
         ],
         "chunk_size": (1, 10, 256, 256),
     }
-    large_image["arrays"] = []
-    for scale in range(large_image["scale_levels"]):
-        array = dask_data[scale]
 
-        # TODO extract scale_factors now
+    multiscale_data = z_grp[large_image["dataset"]]
 
-        # large_image["arrays"].append(result.data.rechunk((3, 10, 256, 256)))
-        large_image["arrays"].append(
-            array.rechunk((1, 10, 256, 256)).squeeze()
-            # result.data[2, :, :, :].rechunk((10, 256, 256)).squeeze()
-        )
+    large_image["arrays"] = [
+        multiscale_data[str(scale)]
+        for scale in range(large_image["scale_levels"])
+    ]
+
     return large_image
 
+
 # ----- zarr extension -----
+
 
 def zarr_get_chunk(self: "zarr.Array", coords):
     """Accept a tuple of integers as coordinates.
     Return a numpy array with the corresponding loaded chunk data."""
     out = np.zeros(self.chunks)
     selection = [slice(0, mx, 1) for mx in self._chunks]
-    self._chunk_getitems([coords], [selection], out, [selection])
+    self._chunk_getitems([coords], tuple(selection), out, tuple(selection))
     return out
+
 
 zarr.Array.get_chunk = zarr_get_chunk
 
@@ -196,188 +191,60 @@ zarr.Array.get_chunk = zarr_get_chunk
 # derived from the mandelbrot example from vizarr: https://colab.research.google.com/github/hms-dbmi/vizarr/blob/main/example/mandelbrot.ipynb
 
 
-def create_meta_store(levels, tilesize, compressor, dtype):
-    store = dict()
-    init_group(store)
+# def create_meta_store(levels, tilesize, compressor, dtype):
+#     store = dict()
+#     init_group(store)
 
-    datasets = [{"path": str(i)} for i in range(levels)]
-    root_attrs = {"multiscales": [{"datasets": datasets, "version": "0.1"}]}
-    store[".zattrs"] = json_dumps(root_attrs)
+#     datasets = [{"path": str(i)} for i in range(levels)]
+#     root_attrs = {"multiscales": [{"datasets": datasets, "version": "0.1"}]}
+#     store[".zattrs"] = json_dumps(root_attrs)
 
-    base_width = tilesize * 2**levels
-    for level in range(levels):
-        width = int(base_width / 2**level)
-        init_array(
-            store,
-            path=str(level),
-            shape=(width, width),
-            chunks=(tilesize, tilesize),
-            dtype=dtype,
-            compressor=compressor,
-        )
-    return store
-
-
-# TODO make this function more generic
-@njit(nogil=True)
-def mandelbrot(out, from_x, from_y, to_x, to_y, grid_size, maxiter):
-    step_x = (to_x - from_x) / grid_size
-    step_y = (to_y - from_y) / grid_size
-    creal = from_x
-    cimag = from_y
-    for i in range(grid_size):
-        cimag = from_y
-        for j in range(grid_size):
-            nreal = real = imag = n = 0
-            # Use Cardioid / bulb checking for early termination
-            q = (i - 0.25) ** 2 + j**2
-            if q * (q + (i - 0.25)) > 0.25 * j**2:
-                for _ in range(maxiter):
-                    nreal = real * real - imag * imag + creal
-                    imag = 2 * real * imag + cimag
-                    real = nreal
-                    if real * real + imag * imag > 4.0:
-                        break
-                    n += 1            
-            out[j * grid_size + i] = n
-            cimag += step_y
-        creal += step_x
-
-    return out
+#     base_width = tilesize * 2**levels
+#     for level in range(levels):
+#         width = int(base_width / 2**level)
+#         init_array(
+#             store,
+#             path=str(level),
+#             shape=(width, width),
+#             chunks=(tilesize, tilesize),
+#             dtype=dtype,
+#             compressor=compressor,
+#         )
+#     return store
 
 
-@njit(nogil=True)
-def xcoord_image(out, from_x, from_y, to_x, to_y, grid_size, maxiter):
-    step_x = (to_x - from_x) / grid_size
-    step_y = (to_y - from_y) / grid_size
-    creal = from_x
-    cimag = from_y
-    for i in range(grid_size):
-        cimag = from_y
-        for j in range(grid_size):
-            out[j * grid_size + i] = i
-            cimag += step_y
-        creal += step_x
-    return out
-    
-@njit()
-def tile_bounds(level, x, y, max_level, min_coord=-2.5, max_coord=2.5):
-    max_width = max_coord - min_coord
-    tile_width = max_width / 2 ** (max_level - level)
-    from_x = min_coord + x * tile_width
-    to_x = min_coord + (x + 1) * tile_width
-
-    from_y = min_coord + y * tile_width
-    to_y = min_coord + (y + 1) * tile_width
-
-    return from_x, from_y, to_x, to_y
+# @njit(nogil=True)
+# def xcoord_image(out, from_x, from_y, to_x, to_y, grid_size, maxiter):
+#     step_x = (to_x - from_x) / grid_size
+#     step_y = (to_y - from_y) / grid_size
+#     creal = from_x
+#     cimag = from_y
+#     for i in range(grid_size):
+#         cimag = from_y
+#         for j in range(grid_size):
+#             out[j * grid_size + i] = i
+#             cimag += step_y
+#         creal += step_x
+#     return out
 
 
-def speed_test(level, x, y, max_levels=8):
-    tilesize = 512
-    dtype = np.uint8
-    maxiter = 255
+# @njit()
+# def tile_bounds(level, x, y, max_level, min_coord=-2.5, max_coord=2.5):
+#     max_width = max_coord - min_coord
+#     tile_width = max_width / 2 ** (max_level - level)
+#     from_x = min_coord + x * tile_width
+#     to_x = min_coord + (x + 1) * tile_width
 
-    from_x, from_y, to_x, to_y = tile_bounds(level, x, y, max_levels)
+#     from_y = min_coord + y * tile_width
+#     to_y = min_coord + (y + 1) * tile_width
 
-    out = np.zeros(tilesize * tilesize, dtype=dtype)
-    tile = mandelbrot(
-    # tile = xcoord_image(
-        out,
-        from_x,
-        from_y,
-        to_x,
-        to_y,
-        tilesize,
-        maxiter,
-    )
-    tile = tile.reshape(tilesize, tilesize).transpose()
-    
-    # TODO directly call xcoord_image at equivalent scale levels
-
-# For speed testing numba functions across scales
-# import time
-# x = y = 10
-# num_repeats = 1000
-# max_levels = 25
-# for level in range(max_levels):
-#     start = time.time()
-#     for _ in range(num_repeats):
-#         speed_test(level, x, y, max_levels=max_levels)
-#     end = time.time()
-#     print(f"Time for level {level} at {(x, y)} is {(end - start)}")
-
-
-# TODO make this Store more generic
-class MandlebrotStore(zarr.storage.Store):
-    def __init__(self, levels, tilesize, maxiter=255, compressor=None):
-        self.levels = levels
-        self.tilesize = tilesize
-        self.compressor = compressor
-        self.dtype = np.dtype(np.uint8 if maxiter < 256 else np.uint16)
-        self.maxiter = maxiter
-        self._store = create_meta_store(
-            levels, tilesize, compressor, self.dtype
-        )
-
-    def __getitem__(self, key):
-        
-        if key in self._store:
-            return self._store[key]
-
-        try:
-            # Try parsing pyramidal coords
-            level, chunk_key = key.split("/")
-            level = int(level)
-            y, x = map(int, chunk_key.split("."))
-        except:
-            raise KeyError
-
-
-        return self.get_chunk(level, y, x).tobytes()
-    
-
-    def get_chunk(self, level, y, x):
-        from_x, from_y, to_x, to_y = tile_bounds(level, x, y, self.levels)
-        out = np.zeros(self.tilesize * self.tilesize, dtype=self.dtype)
-        tile = mandelbrot(
-        # tile = xcoord_image(
-            out,
-            from_x,
-            from_y,
-            to_x,
-            to_y,
-            self.tilesize,
-            self.maxiter,
-        )
-        tile = tile.reshape(self.tilesize, self.tilesize).transpose()
-
-        if self.compressor:
-            return self.compressor.encode(tile)
-        
-        return tile
-
-    def keys(self):
-        return self._store.keys()
-
-    def __iter__(self):
-        return iter(self._store)
-
-    def __delitem__(self, key):
-        if key in self._store:
-            del self._store[key]
-
-    def __len__(self):
-        return len(self._store)  # TODO not correct
-
-    def __setitem__(self, key, val):
-        self._store[key] = val
+#     return from_x, from_y, to_x, to_y
 
 
 # https://dask.discourse.group/t/using-da-delayed-for-zarr-processing-memory-overhead-how-to-do-it-better/1007/10
 def mandelbrot_dataset(max_levels=14):
     """Generate a multiscale image of the mandelbrot set for a given number
-    of levels/scales. Scale 0 will be the highest resolution. 
+    of levels/scales. Scale 0 will be the highest resolution.
 
     This is intended to be used with progressive loading. As such, it returns
     a dictionary will all the metadata required to load as multiple scaled
@@ -392,10 +259,10 @@ def mandelbrot_dataset(max_levels=14):
     ----------
     max_levels: int
         Maximum number of levels (scales) to generate
-    
+
     Returns
     -------
-    Dictionary of multiscale data with keys ['container', 'dataset', 
+    Dictionary of multiscale data with keys ['container', 'dataset',
         'scale levels', 'scale_factors', 'chunk_size', 'arrays']
     """
 
@@ -410,13 +277,18 @@ def mandelbrot_dataset(max_levels=14):
     }
 
     # Initialize the store
-    store = MandlebrotStore(
-        levels=max_levels, tilesize=512, compressor=None, maxiter=255        
-#        levels=max_levels, tilesize=512, compressor=Blosc(), maxiter=255
+    store = zarr.storage.KVStore(
+        MandelbrotStore(
+            levels=max_levels,
+            tilesize=512,
+            compressor=None,
+            maxiter=255
+            #        levels=max_levels, tilesize=512, compressor=Blosc(), maxiter=255
+        )
     )
     # Wrap in a cache so that tiles don't need to be computed as often
     # store = zarr.LRUStoreCache(store, max_size=8e9)
-    
+
     # This store implements the 'multiscales' zarr specfiication which is recognized by vizarr
     z_grp = zarr.open(store, mode="r")
 
@@ -424,7 +296,7 @@ def mandelbrot_dataset(max_levels=14):
 
     arrays = []
     for scale, a in enumerate(multiscale_img):
-        chunks = da.core.normalize_chunks(
+        da.core.normalize_chunks(
             large_image["chunk_size"],
             a.shape,
             dtype=np.uint8,
@@ -433,8 +305,8 @@ def mandelbrot_dataset(max_levels=14):
 
         # arrays += [da.from_zarr(a, chunks=chunks)]
 
-        # setattr(a, "get_zarr_chunk", lambda scale, y, x: store.get_chunk(scale, y, x))
-        setattr(a, "get_zarr_chunk", lambda chunk_slice: a[tuple(chunk_slice)].transpose())
+        a.get_zarr_chunk = lambda scale, y, x: store.get_chunk(scale, y, x)
+        # setattr(a, "get_zarr_chunk", lambda chunk_slice: a[tuple(chunk_slice)].transpose())
         arrays += [a]
 
     large_image["arrays"] = arrays
@@ -443,8 +315,11 @@ def mandelbrot_dataset(max_levels=14):
 
     return large_image
 
+
 if __name__ == "__main__":
     max_levels = 16
+
+    luethi_zenodo_7144919()
 
     large_image = {
         "container": "mandelbrot.zarr/",
@@ -457,12 +332,14 @@ if __name__ == "__main__":
     }
 
     # Initialize the store
-    store = MandlebrotStore(
-        levels=max_levels, tilesize=512, compressor=Blosc(), maxiter=255
+    store = zarr.storage.KVStore(
+        MandelbrotStore(
+            levels=max_levels, tilesize=512, compressor=Blosc(), maxiter=255
+        )
     )
     # Wrap in a cache so that tiles don't need to be computed as often
     store = zarr.LRUStoreCache(store, max_size=8e9)
-    
+
     # This store implements the 'multiscales' zarr specfiication which is recognized by vizarr
     z_grp = zarr.open(store, mode="r")
 
@@ -478,5 +355,3 @@ if __name__ == "__main__":
         )
 
         arrays += [a]
-
-    

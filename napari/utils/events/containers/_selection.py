@@ -70,7 +70,7 @@ class Selection(EventedSet[_T]):
         return super()._emit_change(added=added, removed=removed)
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}({repr(self._set)})"
+        return f"{type(self).__name__}({self._set!r})"
 
     def __hash__(self) -> int:
         """Make selection hashable."""
@@ -113,7 +113,7 @@ class Selection(EventedSet[_T]):
         (An active item is a single selected item).
         """
         if len(self) == 1:
-            self.active = list(self)[0]
+            self.active = next(iter(self))
         elif self._active is not None:
             self._active = None
             self.events.active(value=None)

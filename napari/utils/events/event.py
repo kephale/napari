@@ -100,7 +100,12 @@ class Event:
         All extra keyword arguments become attributes of the event object.
     """
 
-    @rename_argument("type", "type_name", "0.6.0")
+    @rename_argument(
+        from_name="type",
+        to_name="type_name",
+        version="0.6.0",
+        since_version="0.4.18",
+    )
     def __init__(
         self, type_name: str, native: Any = None, **kwargs: Any
     ) -> None:
@@ -272,13 +277,13 @@ class EventEmitter:
     source : object
         The object that the generated events apply to. All emitted Events will
         have their .source property set to this value.
-    type : str or None
+    type_name: str or None
         String indicating the event type (e.g. mouse_press, key_release)
     event_class : subclass of Event
         The class of events that this emitter will generate.
     """
 
-    @rename_argument("type", "type_name", "0.6.0")
+    @rename_argument("type", "type_name", "0.6.0", "0.4.18")
     def __init__(
         self,
         source: Any = None,
@@ -338,12 +343,7 @@ class EventEmitter:
     @print_callback_errors.setter
     def print_callback_errors(
         self,
-        val: Union[
-            Literal['first'],
-            Literal['reminders'],
-            Literal['always'],
-            Literal['never'],
-        ],
+        val: Literal['first', 'reminders', 'always', 'never'],
     ):
         if val not in ('first', 'reminders', 'always', 'never'):
             raise ValueError(
@@ -409,7 +409,7 @@ class EventEmitter:
         self,
         callback: Union[Callback, CallbackRef, CallbackStr, 'EventEmitter'],
         ref: Union[bool, str] = False,
-        position: Union[Literal['first'], Literal['last']] = 'first',
+        position: Literal['first', 'last'] = 'first',
         before: Union[str, Callback, List[Union[str, Callback]], None] = None,
         after: Union[str, Callback, List[Union[str, Callback]], None] = None,
         until: Optional['EventEmitter'] = None,
@@ -1105,7 +1105,7 @@ class EmitterGroup(EventEmitter):
         self,
         callback: Union[Callback, CallbackRef, 'EmitterGroup'],
         ref: Union[bool, str] = False,
-        position: Union[Literal['first'], Literal['last']] = 'first',
+        position: Literal['first', 'last'] = 'first',
         before: Union[str, Callback, List[Union[str, Callback]], None] = None,
         after: Union[str, Callback, List[Union[str, Callback]], None] = None,
     ):

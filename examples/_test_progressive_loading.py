@@ -1,17 +1,15 @@
-import logging
-import sys
-import pytest 
 import numpy as np
+import pytest
+from _mandelbrot_vizarr import add_progressive_loading_image
 from numpy.testing import assert_array_equal, assert_raises
 
 import napari
-
-from napari.experimental._progressive_loading_datasets import (
-    mandelbrot_dataset, MandlebrotStore
-)
 from napari.experimental import _progressive_loading
-
-from _mandelbrot_vizarr import add_progressive_loading_image, get_and_process_chunk_2D
+from napari.experimental._progressive_loading import get_chunk
+from napari.experimental._progressive_loading_datasets import (
+    MandlebrotStore,
+    mandelbrot_dataset,
+)
 
 
 @pytest.fixture(
@@ -144,8 +142,8 @@ def test_chunk_slices_600_1024(mandelbrot_arrays, max_level):
     dims = len(vdata.array.shape)
 
     result = [
-        [slice(512, 1024, None)], 
-        [slice(512, 1024, None)], 
+        [slice(512, 1024, None)],
+        [slice(512, 1024, None)],
     ]
     assert len(chunk_keys) == dims
     assert chunk_keys == result
@@ -153,13 +151,13 @@ def test_chunk_slices_600_1024(mandelbrot_arrays, max_level):
 
 def test_virtualdata_init(mandelbrot_arrays, max_level):
     scale = max_level - 1
-    vdata = _progressive_loading.VirtualData(mandelbrot_arrays[scale], scale=scale)
-    
+    _progressive_loading.VirtualData(mandelbrot_arrays[scale], scale=scale)
+
 
 def test_virtualdata_set_interval(mandelbrot_arrays, max_level):
     scale = max_level - 1
     vdata = _progressive_loading.VirtualData(mandelbrot_arrays[scale], scale=scale)
-    coords = tuple([slice(512, 1024, None), slice(512, 1024, None)])
+    coords = (slice(512, 1024, None), slice(512, 1024, None))
     vdata.set_interval(coords)
 
     min_coord = [st.start for st in coords]
@@ -167,27 +165,27 @@ def test_virtualdata_set_interval(mandelbrot_arrays, max_level):
     assert vdata._min_coord == min_coord
     assert vdata._max_coord == max_coord
 
-def test_virtualdata_data_plane_reuse(mandelbrot_arrays, max_level):
+def test_virtualdata_hyperslice_reuse(mandelbrot_arrays, max_level):
     scale = max_level - 1
     vdata = _progressive_loading.VirtualData(mandelbrot_arrays[scale], scale=scale)
-    coords = tuple([slice(0, 1024, None), slice(0, 1024, None)])
+    coords = (slice(0, 1024, None), slice(0, 1024, None))
     vdata.set_interval(coords)
-    first_data_plane = vdata.data_plane
+    first_hyperslice = vdata.hyperslice
     vdata.set_interval(coords)
-    second_data_plane = vdata.data_plane
-    assert_array_equal(first_data_plane, second_data_plane)
+    second_hyperslice = vdata.hyperslice
+    assert_array_equal(first_hyperslice, second_hyperslice)
 
 
-def test_virtualdata_data_plane(mandelbrot_arrays, max_level):
+def test_virtualdata_hyperslice(mandelbrot_arrays, max_level):
     scale = max_level - 1
     vdata = _progressive_loading.VirtualData(mandelbrot_arrays[scale], scale=scale)
-    coords = tuple([slice(0, 1024, None), slice(0, 1024, None)])
+    coords = (slice(0, 1024, None), slice(0, 1024, None))
     vdata.set_interval(coords)
-    first_data_plane = vdata.data_plane
-    coords = tuple([slice(512, 1024, None), slice(512, 1024, None)])
+    first_hyperslice = vdata.hyperslice
+    coords = (slice(512, 1024, None), slice(512, 1024, None))
     vdata.set_interval(coords)
-    second_data_plane = vdata.data_plane
-    assert_raises(AssertionError, assert_array_equal, first_data_plane, second_data_plane)
+    second_hyperslice = vdata.hyperslice
+    assert_raises(AssertionError, assert_array_equal, first_hyperslice, second_hyperslice)
 
 
 def test_multiscalevirtualdata_init(mandelbrot_arrays):
@@ -197,23 +195,20 @@ def test_multiscalevirtualdata_init(mandelbrot_arrays):
 
 @pytest.mark.parametrize('max_level', [8, 14])
 def test_MandlebrotStore(max_level):
-    store = MandlebrotStore(
-        levels=max_level, tilesize=512, compressor=None, maxiter=255  
-    ) 
+    MandlebrotStore(
+        levels=max_level, tilesize=512, compressor=None, maxiter=255
+    )
 
-def test_get_and_process_chunk_2D():
-    large_image = mandelbrot_dataset(max_levels=14)
-    mandelbrot_arrays = large_image["arrays"]
+def test_get_chunk(mandelbrot_arrays):
     scale = 12
     virtual_data = _progressive_loading.VirtualData(mandelbrot_arrays[scale], scale=scale)
-    chunk_slice = tuple([slice(1024, 1536, None), slice(512, 1024, None)])
-    full_shape = None
+    chunk_slice = (slice(1024, 1536, None), slice(512, 1024, None))
 
-    chunk_widths = tuple([chunk_slice[0].stop - chunk_slice[0].start, chunk_slice[1].stop - chunk_slice[1].start])
-    chunk_slices, scale, real_array = get_and_process_chunk_2D(chunk_slice, scale, virtual_data, full_shape)
+    chunk_widths = (chunk_slice[0].stop - chunk_slice[0].start, chunk_slice[1].stop - chunk_slice[1].start)
+    real_array = get_chunk(chunk_slice, array=virtual_data)
 
     assert chunk_widths == real_array.shape
-    
+
 
 if __name__ == "__main__":
     viewer = napari.Viewer()

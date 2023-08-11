@@ -1,15 +1,16 @@
-import time
 import heapq
 import itertools
 import logging
 import sys
+import time
 from collections import defaultdict
-from typing import Tuple, Union
+from typing import Dict, List, Tuple, Union
 
-import zarr
-import dask
 import dask.array as da
 import numpy as np
+import toolz as tz
+from psygnal import debounced
+from superqt import ensure_main_thread
 
 from napari.layers._data_protocols import Index, LayerDataProtocol
 from napari.qt.threading import thread_worker
@@ -23,10 +24,6 @@ formatter = logging.Formatter(
 )
 streamHandler.setFormatter(formatter)
 LOGGER.addHandler(streamHandler)
-
-
-class ChunkFailed(Exception):
-    pass
 
 
 def get_chunk(
@@ -55,40 +52,18 @@ def get_chunk(
     real_array : ndarray
         an ndarray of data sliced with chunk_slice
     """
-
     real_array = None
     retry = 0
 
     start_time = time.time()
 
     while real_array is None and retry < num_retry:
-        # try:
-        if True:
-            if isinstance(array, zarr.Array):
-                coords = tuple([int(sl.start / array._chunks[dim]) for dim, sl in enumerate(chunk_slice)])
-                real_array = array.get_chunk(coords)
-            else:
-                # For Dask fetching
-                chunk = array[chunk_slice]
-                LOGGER.info(f"get_chunk (sliced) : {(time.time() - start_time)}")
+        real_array = np.asarray(array[chunk_slice]).transpose()
 
-                if isinstance(chunk, da.Array) or isinstance(chunk, VirtualData):
-                    real_array = chunk.compute()
-                    LOGGER.info(f"get_chunk (compute) : {(time.time() - start_time)} type {type(chunk)}")
-                else:
-                    # real_array = np.asarray(chunk, dtype=dtype)
-                    real_array = chunk
-
-            # TODO check for a race condition that is causing this exception
-            #      some dask backends are not thread-safe
-        # except ChunkFailed(
-        #     f"get_chunk failed to fetch data: retry {retry} of {num_retry}"
-        # ):
-        #     pass
         retry += 1
 
     LOGGER.info(f"get_chunk (end) : {(time.time() - start_time)}")
-        
+
     return real_array
 
 
@@ -115,7 +90,7 @@ def visual_depth(points, camera):
     return projected_length
 
 
-def distance_from_camera_centre_line(points, camera):
+def distance_from_camera_center_line(points, camera):
     """Compute distance from a point or array of points to camera center line.
 
     This is the line aligned to the camera view direction and passing through
@@ -146,9 +121,9 @@ def distance_from_camera_centre_line(points, camera):
 
 def chunk_centers(array: da.Array, ndim=3):
     """Make a dictionary mapping chunk centers to chunk slices.
+
     Note: if array is >3D, then the last 3 dimensions are assumed as ZYX
     and will be used for calculating centers
-
 
     Parameters
     ----------
@@ -183,12 +158,12 @@ def chunk_centers(array: da.Array, ndim=3):
     return mapping
 
 
-def chunk_slices(array: da.Array, ndim=3, interval=None):
-    """Create a list of slice objects for each chunk for each dimension. 
+def chunk_slices(array: da.Array, ndim=3, interval=None) -> list:
+    """Create a list of slice objects for each chunk for each dimension.
 
     Make a dictionary mapping chunk centers to chunk slices.
     Note: if array is >3D, then the last 3 dimensions are assumed as ZYX
-    and will be used for calculating centers. If array is <3D, the third 
+    and will be used for calculating centers. If array is <3D, the third
     dimension is assumed to be None.
 
 
@@ -202,33 +177,40 @@ def chunk_slices(array: da.Array, ndim=3, interval=None):
     chunk_slices: list of slice objects
         List of slice objects for each chunk for each dimension
     """
-
-    if isinstance(array, da.Array):        
-        start_pos = [np.cumsum(sizes) - sizes for sizes in array.chunks]        
+    if isinstance(array, da.Array):
+        start_pos = [np.cumsum(sizes) - sizes for sizes in array.chunks]
         end_pos = [np.cumsum(sizes) for sizes in array.chunks]
     else:
-        # For zarr     
+        # For zarr
         start_pos = []
         end_pos = []
         for dim in range(len(array.chunks)):
             # TODO: the +1 used on stop_idx is related to searchsorted usage
             start_idx, stop_idx = 0, (array.shape[dim] + 1)
             if interval is not None:
-                start_idx = np.floor(interval[0,dim] / array.chunks[dim]) * array.chunks[dim]
-                stop_idx = np.ceil(interval[1,dim] / array.chunks[dim]) * array.chunks[dim] + 1
+                start_idx = (
+                    np.floor(interval[0, dim] / array.chunks[dim])
+                    * array.chunks[dim]
+                )
+                stop_idx = (
+                    np.ceil(interval[1, dim] / array.chunks[dim])
+                    * array.chunks[dim]
+                    + 1
+                )
             # Inclusive on the end point
-            cumuchunks = [val for val in range(int(start_idx), int(stop_idx), array.chunks[dim])]
+            cumuchunks = list(
+                range(int(start_idx), int(stop_idx), array.chunks[dim])
+            )
             cumuchunks = np.array(cumuchunks)
             start_pos += [cumuchunks[:-1]]
             end_pos += [cumuchunks[1:]]
-        
+
     if interval is not None:
-        # array([[7709.88671875, 5007.1953125 ],[9323.7578125 , 6824.38867188]])
-        #
         for dim in range(len(start_pos)):
             # Find first index in end_pos that is greater than corner_pixels
             first_idx = np.searchsorted(end_pos[dim], interval[0, dim])
-            # Find the last index in start_pos that is less than corner_pixels[1,dim]
+            # Find the last index in start_pos that is less than
+            # corner_pixels[1,dim]
             last_idx = np.searchsorted(
                 start_pos[dim], interval[1, dim], side='right'
             )
@@ -236,12 +218,7 @@ def chunk_slices(array: da.Array, ndim=3, interval=None):
             start_pos[dim] = start_pos[dim][first_idx:last_idx]
             end_pos[dim] = end_pos[dim][first_idx:last_idx]
 
-    all_start_pos = list(itertools.product(*start_pos))
-    # TODO We impose dimensional ordering for ND
-    all_end_pos = list(itertools.product(*end_pos))
-    chunk_slices = []
-
-    chunk_slices = [[]] * len(array.chunks)
+    chunk_slices: List[List] = [[]] * len(array.chunks)
     for dim in range(len(array.chunks)):
         chunk_slices[dim] = [
             slice(st, end) for st, end in zip(start_pos[dim], end_pos[dim])
@@ -250,30 +227,110 @@ def chunk_slices(array: da.Array, ndim=3, interval=None):
     return chunk_slices
 
 
-# ---------- 2D specific ----------
-
-
-def chunk_priority_2D(chunk_keys, corner_pixels, scale):
-    """Return the keys for all chunks at this scale within the corner_pixels
+@thread_worker
+def render_sequence(
+    corner_pixels, visible_scales=[], data=None, ndisplay=2, camera=None
+):
+    """Generate multiscale chunk tuples from low to high resolution.
 
     Parameters
     ----------
     corner_pixels : tuple
-        ND top left and bottom right coordinates for the current view
-    scale : int
-        the scale level, assuming powers of 2
-
+        ND coordinates of the topleft bottomright coordinates of the
+        current view
+    full_shape : tuple
+        shape of highest resolution array
+    num_threads : int
+        number of threads for multithreaded fetching
+    visible_scales : list
+        this is used to constrain the number of scales that are rendered
     """
+    # NOTE this corner_pixels means something else and should be renamed
+    # it is further limited to the visible data on the vispy canvas
 
-    # NOTE chunk_keys is a list of lists of slices for each dimension
+    LOGGER.info(
+        f"render_sequence: inside with corner pixels {corner_pixels} with \
+        visible_scales {visible_scales}"
+    )
 
-    # TODO all of this needs to be generalized to ND or replaced/merged with volume rendering code
+    # TODO 3D needs to change the view interval (e.g. zoom more at each scale)
+    for scale in reversed(range(len(data.arrays))):
+        if visible_scales[scale]:
+            vdata = data._data[scale]
 
-    mins = corner_pixels[0, :] / (2**scale)
-    maxs = corner_pixels[1, :] / (2**scale)
+            data_interval = corner_pixels / data._scale_factors[scale]
+            LOGGER.info(
+                f"render_sequence: computing chunk slices for {data_interval}"
+            )
+            chunk_keys = chunk_slices(
+                vdata, ndim=ndisplay, interval=data_interval
+            )
 
-    # contained_keys is an array with list of slices contained along each dimension
-    contained_keys = defaultdict(list)
+            LOGGER.info("render_sequence: computing priority")
+            chunk_queue = []
+            if ndisplay == 2:
+                chunk_queue = chunk_priority_2D(
+                    chunk_keys, corner_pixels, data._scale_factors[scale]
+                )
+            elif ndisplay == 3:
+                chunk_queue = chunk_priority_3D(
+                    chunk_keys,
+                    corner_pixels,
+                    data._scale_factors[scale],
+                    camera=camera,
+                )
+            else:
+                LOGGER.info(
+                    f"render_sequence: {ndisplay} dimensions not supported"
+                )
+                return
+
+            LOGGER.info(
+                f"render_sequence: {scale}, {vdata.shape} fetching \
+                {len(chunk_queue)} chunks"
+            )
+
+            # Fetch all chunks in priority order
+            while chunk_queue:
+                priority, chunk_slice = heapq.heappop(chunk_queue)
+
+                # TODO consider 1-2 yields per chunk:
+                # - first for the target chunk
+                # - second for blanking out the lower resolution
+                #   (is this too wasteful?)
+
+                # TODO Transpose needed in 2D mandelbrot
+                # real_array = np.asarray(vdata.array[chunk_slice]).transpose()
+
+                real_array = np.asarray(vdata.array[chunk_slice]).transpose()
+
+                chunk_result = (
+                    tuple(chunk_slice),
+                    scale,
+                    data._scale_factors,
+                    real_array,
+                )
+
+                LOGGER.info(
+                    f"render_sequence: yielding chunk {chunk_slice} at scale {scale} which has priority\t{priority}"
+                )
+
+                yield tuple(list(chunk_result) + [len(chunk_queue) == 0])
+
+                # TODO blank out lower resolution
+                # if lower resolution is visible, send zeros
+
+            LOGGER.info(f"render_sequence: done fetching {scale}")
+
+
+def chunk_keys_within_interval(chunk_keys, mins, maxs):
+    """Return chunk_keys that are within interval.
+
+    Returns a dictionary with a list of slices for each dimension
+    """
+    # contained_keys is an array with list of slices contained along each
+    # dimension
+    contained_keys: Dict = defaultdict(list)
     for dim, chunk_slices in enumerate(chunk_keys):
         for sl in chunk_slices:
             below_min = sl.start < mins[dim]
@@ -283,13 +340,309 @@ def chunk_priority_2D(chunk_keys, corner_pixels, scale):
             if (below_min and sl.stop < mins[dim]) or (
                 above_max and sl.start > maxs[dim]
             ):
-                pass
+                return []
             else:
                 contained_keys[dim] += [sl]
 
-    priority_map = []
+    return contained_keys
 
-    for idx, chunk_key in enumerate(
+
+def get_layer_name_for_scale(scale):
+    """Return the layer name for a given scale."""
+    return f"scale_{scale}"
+
+
+@tz.curry
+def dims_update_handler(invar, data=None, viewer=None, ndisplay=None):
+    """Start a new render sequence with the current viewer state.
+
+    Parameters
+    ----------
+    invar : Event or viewer
+        either an event or a viewer
+    full_shape : tuple
+        a tuple representing the shape of the highest resolution array
+    """
+    # The root layer corresponds to the highest resolution
+    root_layer = viewer.layers[get_layer_name_for_scale(0)]
+
+    worker = None
+    if "worker" in root_layer.metadata:
+        worker = root_layer.metadata["worker"]
+
+    # TODO global worker usage is not viable for real implementation
+    # Terminate existing multiscale render pass
+    if worker:
+        # TODO this might not terminate threads properly
+        worker.await_workers()
+        # worker.await_workers(msecs=30000)
+
+    # Find the corners of visible data in the highest resolution
+    corner_pixels = root_layer.corner_pixels
+
+    top_left = np.max((corner_pixels,), axis=0)[0, :]
+    bottom_right = np.min((corner_pixels,), axis=0)[1, :]
+
+    camera = viewer.camera.copy()
+
+    # TODO Added to skip situations when 3D isnt setup on layer yet??
+    if np.any((bottom_right - top_left) == 0):
+        return
+
+    # TODO we could add padding around top_left and bottom_right to account
+    #      for future camera movement
+
+    # Interval must be nonnegative
+    if not np.all(top_left <= bottom_right):
+        import pdb
+
+        pdb.set_trace()
+
+    LOGGER.info(
+        f"dims_update_handler: start render_sequence {corner_pixels} on {root_layer}"
+    )
+
+    # Find the visible scales
+    visible_scales = [False] * len(data.arrays)
+    min_scale = 0
+    max_scale = len(data.arrays) - 1
+
+    ndisplay = ndisplay if ndisplay else viewer.dims.ndisplay
+
+    # Get the scale visibility predicate for the correct ndisplay
+    should_render_scale = (
+        should_render_scale_2D if ndisplay == 2 else should_render_scale_3D
+    )
+
+    for scale in range(len(data.arrays)):
+        layer_name = get_layer_name_for_scale(scale)
+        layer = viewer.layers[layer_name]
+
+        layer.metadata["translated"] = False
+
+        # Reenable visibility of layer
+        visible_scales[scale] = should_render_scale(
+            scale, viewer, min_scale, max_scale
+        )
+        layer.visible = visible_scales[scale]
+        layer.opacity = 0.9
+
+        LOGGER.info(
+            f"scale {scale} name {layer_name}\twith translate \
+            {layer.data.translate}"
+        )
+
+    # Update the MultiScaleVirtualData memory backing
+    data.set_interval(top_left, bottom_right, visible_scales=visible_scales)
+
+    # Start a new multiscale render
+    worker = render_sequence(
+        corner_pixels,
+        data=data,
+        visible_scales=visible_scales,
+        ndisplay=ndisplay,
+        camera=camera,
+    )
+
+    LOGGER.info(
+        f"dims_update_handler: started render_sequence with corners {corner_pixels}"
+    )
+
+    # This will consume our chunks and update the numpy "canvas" and refresh
+    def on_yield(coord):
+        # TODO bad layer access
+        chunk_slice, scale, scale_factors, chunk, is_last_chunk = coord
+
+        layer_name = get_layer_name_for_scale(scale)
+        layer = viewer.layers[layer_name]
+
+        # TODO this relies on the coincidence that node indices are 2 or 3 for
+        #      the image and volume members of an Image layer
+        node = viewer.window.qt_viewer.layer_to_visual[
+            layer
+        ]._layer_node.get_node(viewer.dims.ndisplay)
+
+        texture = node._texture
+
+        LOGGER.info(
+            f"Writing chunk with size {chunk.shape} to: \
+            {(scale, [(sl.start, sl.stop) for sl in chunk_slice])} in layer \
+            {scale} with shape {layer.data.shape} and dataplane shape \
+            {layer.data.hyperslice.shape} sum {chunk.sum()}"
+        )
+
+        if not layer.metadata["translated"]:
+            layer.translate = (
+                np.array(layer.data.translate) * scale_factors[scale]
+            )
+
+            # Toggle visibility of lower res layer
+            if layer.metadata["prev_layer"]:
+                # We want to keep prev_layer visible because current layer is
+                # loading, but hide others
+                if layer.metadata["prev_layer"].metadata["prev_layer"]:
+                    layer.metadata["prev_layer"].metadata[
+                        "prev_layer"
+                    ].visible = False
+            layer.metadata["translated"] = True
+
+        # If this is the last chunk of the layer, turn off the previous layer
+        # TODO if chunks are zero-ed when replaced by higher res data,
+        #      then delete this
+        if is_last_chunk and layer.metadata["prev_layer"]:
+            layer.metadata["prev_layer"].visible = False
+
+        layer.data.set_offset(chunk_slice, chunk)
+
+        texture.set_data(layer.data.hyperslice)
+
+        node.update()
+
+    worker.yielded.connect(on_yield)
+
+    root_layer.metadata["worker"] = worker
+
+    worker.start()
+
+
+def add_progressive_loading_image(
+    img,
+    viewer=None,
+    contrast_limits=[0, 255],
+    colormap='PiYG',
+    ndisplay=2,
+    rendering="attenuated_mip",
+):
+    """Add tiled multiscale image."""
+    # initialize multiscale virtual data (generate scale factors, translations,
+    # and chunk slices)
+    multiscale_data = MultiScaleVirtualData(img, ndisplay=ndisplay)
+
+    if not viewer:
+        from napari import Viewer
+
+        viewer = Viewer()
+
+    # The scale bar will help this be more dramatic
+    viewer.scale_bar.visible = True
+    viewer.scale_bar.unit = "pixel"
+
+    viewer.dims.ndim = ndisplay
+    # Ensure async slicing is enabled
+    viewer._layer_slicer._force_sync = False
+
+    LOGGER.info(f"Adding MultiscaleData with shape: {multiscale_data.shape}")
+
+    # Get initial extent for rendering
+    canvas_corners = (
+        viewer.window.qt_viewer.canvas._canvas_corners_in_world.copy()
+    )
+    canvas_corners[
+        canvas_corners < 0
+    ] = 0  # required to cast from float64 to int64
+    canvas_corners = canvas_corners.astype(np.int64)
+
+    top_left = canvas_corners[0, :]
+    bottom_right = canvas_corners[1, :]
+
+    # TODO This is required when ndisplay does not match the ndim of the data
+    if ndisplay != len(img[0].shape):
+        top_left = [viewer.dims.point[-ndisplay]] + top_left.tolist()
+        bottom_right = [viewer.dims.point[-ndisplay]] + bottom_right.tolist()
+
+    LOGGER.debug(f'>>> top left: {top_left}, bottom_right: {bottom_right}')
+    # set the extents for each scale in data coordinates
+    # take the currently visible canvas extents and apply them to the
+    # individual data scales
+    multiscale_data.set_interval(top_left, bottom_right)
+
+    # TODO yikes!
+    import napari
+
+    # TODO sketchy Disable _update_thumbnail
+    def temp_update_thumbnail(self):
+        self.thumbnail = np.ones((32, 32, 4))
+
+    napari.layers.image.Image._update_thumbnail = temp_update_thumbnail
+
+    # We need to initialize the extent of each VirtualData
+    layers = {}
+    # Start from back to start because we build a linked list
+
+    viewer.dims.ndim = ndisplay
+
+    for scale, vdata in list(enumerate(multiscale_data._data)):
+        layer = viewer.add_image(
+            vdata,
+            name=get_layer_name_for_scale(scale),
+            colormap=colormap,
+            scale=multiscale_data._scale_factors[scale],
+            rendering=rendering,
+            contrast_limits=contrast_limits,
+        )
+        layers[scale] = layer
+        layer.metadata["translated"] = False
+
+    # Linked list of layers for visibility control
+    for scale in reversed(range(len(layers))):
+        layers[scale].metadata["prev_layer"] = (
+            layers[scale + 1]
+            if scale < len(multiscale_data._data) - 1
+            else None
+        )
+
+    top_left = canvas_corners[0, :]
+    bottom_right = canvas_corners[1, :]
+    LOGGER.debug(f'>>> top left: {top_left}, bottom_right: {bottom_right}')
+    LOGGER.info(f"viewer canvas corners {canvas_corners}")
+
+    # Connect to camera and dims
+    for listener in [viewer.camera.events, viewer.dims.events]:
+        listener.connect(
+            debounced(
+                ensure_main_thread(
+                    dims_update_handler(
+                        data=multiscale_data,
+                        viewer=viewer,
+                        ndisplay=ndisplay,
+                    )
+                ),
+                timeout=2000,
+            )
+        )
+
+    # Trigger first render
+    dims_update_handler(
+        None, data=multiscale_data, viewer=viewer, ndisplay=ndisplay
+    )
+
+    return viewer
+
+
+# ---------- 2D specific ----------
+
+
+def chunk_priority_2D(chunk_keys, corner_pixels, scale_factor):
+    """Return the keys for all chunks at this scale within the corner_pixels.
+
+    Parameters
+    ----------
+    chunk_keys : list of list of slices for each dimension
+        a list of list of slices for each dimension
+    corner_pixels : tuple
+        ND top left and bottom right coordinates for the current view
+    scale_factor : float
+        the scale factor for this scale level
+
+    """
+    mins = corner_pixels[0, :] / scale_factor
+    maxs = corner_pixels[1, :] / scale_factor
+
+    contained_keys = chunk_keys_within_interval(chunk_keys, mins, maxs)
+
+    priority_map: List = []
+
+    for _idx, chunk_key in enumerate(
         list(
             itertools.product(
                 *[contained_keys[k] for k in sorted(contained_keys.keys())]
@@ -298,23 +651,149 @@ def chunk_priority_2D(chunk_keys, corner_pixels, scale):
     ):
         priority = 0
         # TODO filter priority here
-        if True:
-            priority = 0
-        else:
-            priority = np.inf
+        priority = 0 if True else np.inf
         if priority < np.inf:
             heapq.heappush(priority_map, (priority, chunk_key))
 
     return priority_map
 
 
+def should_render_scale_2D(scale, viewer, min_scale, max_scale):
+    """Test if a scale should be rendered.
+
+    Parameters
+    ----------
+    scale : int
+        a scale level
+    viewer : napari.viewer.Viewer
+        a napari viewer
+    min_scale : int
+        the minimum scale level to show
+    max_scale : int
+        the maximum scale level to show
+    """
+    layer_name = get_layer_name_for_scale(scale)
+    layer = viewer.layers[layer_name]
+    layer_scale = layer.scale
+
+    pixel_size = viewer.camera.zoom * max(layer_scale)
+
+    # Define bounds of expected pixel size
+    max_pixel = 4
+    min_pixel = 0.25
+
+    render = min_pixel < pixel_size < max_pixel
+
+    if not render:
+        if scale == min_scale and pixel_size > max_pixel:
+            render = True
+        elif scale == max_scale and pixel_size < min_pixel:
+            render = True
+
+    return render
+
+
 # ---------- 3D specific ----------
 
 
-def prioritised_chunk_loading_3D(
+def get_chunk_center(chunk_slice):
+    """
+    Return the center of chunk_slice.
+
+
+    chunk_slices is a tuple of slices
+    """
+    return np.array([(sl.start + sl.stop) * 0.5 for sl in chunk_slice])
+
+
+def chunk_priority_3D(chunk_keys, corner_pixels, scale_factor, camera=None):
+    """Return the keys for all chunks at this scale within the corner_pixels.
+
+    Parameters
+    ----------
+    chunk_keys : list of list of slices for each dimension
+        a list of list of slices for each dimension
+    corner_pixels : tuple
+        ND top left and bottom right coordinates for the current view
+    scale_factor : float
+        the scale factor for this scale level
+
+    """
+    mins = corner_pixels[0, :] / scale_factor
+    maxs = corner_pixels[1, :] / scale_factor
+
+    contained_keys = chunk_keys_within_interval(chunk_keys, mins, maxs)
+
+    priority_map: List = []
+
+    for _idx, chunk_key in enumerate(
+        list(
+            itertools.product(
+                *[contained_keys[k] for k in sorted(contained_keys.keys())]
+            )
+        )
+    ):
+        priority = 0
+
+        chunk_center = get_chunk_center(chunk_key)
+        depth = visual_depth(chunk_center, camera)
+        center_line_dist = distance_from_camera_center_line(
+            chunk_center, camera
+        )
+
+        priority = depth + camera.zoom * center_line_dist
+
+        if priority < np.inf:
+            heapq.heappush(priority_map, (priority, chunk_key))
+
+    return priority_map
+
+
+def should_render_scale_3D(scale, viewer, min_scale, max_scale):
+    """Test if a scale should be rendered.
+
+    Parameters
+    ----------
+    scale : int
+        a scale level
+    viewer : napari.viewer.Viewer
+        a napari viewer
+    min_scale : int
+        the minimum scale level to show
+    max_scale : int
+        the maximum scale level to show
+    """
+    layer_name = get_layer_name_for_scale(scale)
+    layer = viewer.layers[layer_name]
+    layer_scale = layer.scale
+
+    pixel_size = viewer.camera.zoom * max(layer_scale)
+
+    if max_scale == 7:
+        max_pixel = 5
+        min_pixel = 0.25
+    else:
+        max_pixel = 10
+        min_pixel = 5
+    greater_than_min_pixel = pixel_size > min_pixel
+    less_than_max_pixel = pixel_size < max_pixel
+    render = greater_than_min_pixel and less_than_max_pixel
+
+    if not render:
+        if scale == min_scale and pixel_size > max_pixel:
+            render = True
+        elif scale == max_scale and pixel_size < min_pixel:
+            render = True
+
+    return render
+
+
+# TODO to be deprecated
+def prioritized_chunk_loading_3D(
     depth, distance, zoom, alpha=1.0, visible=None
 ):
     """Compute a chunk priority based on chunk location relative to camera.
+
     Lower priority is preferred.
 
     Parameters
@@ -386,7 +865,7 @@ def render_sequence_3D(
     dtype=np.uint16,
     dims=None,
 ):
-    """Recursively add multiscale chunks to a napari viewer for some multiscale arrays
+    """Add multiscale chunks to a napari viewer for a 3D image layer.
 
     Note: scale levels are assumed to be 2x factors of each other
 
@@ -414,15 +893,12 @@ def render_sequence_3D(
         cache
     alpha : float
         a parameter that tunes the behavior of chunk prioritization
-        see prioritised_chunk_loading for more info
+        see prioritized_chunk_loading for more info
     scale_factors : list of tuples
         a list of tuples of scale factors for each array
     dtype : dtype
         dtype of data
     """
-
-    layer_name = f"{container}/{dataset}/s{scale}"
-
     # Get some variables specific to this scale level
     min_coord = [st.start for st in view_slice]
     max_coord = [st.stop for st in view_slice]
@@ -430,19 +906,11 @@ def render_sequence_3D(
     chunk_map = chunk_maps[scale]
     scale_factor = scale_factors[scale]
 
-    highres_min = str([el.start * 2**scale for el in view_slice])
-    highres_max = str([el.stop * 2**scale for el in view_slice])
-
-    # LOGGER.info(
-    #     f"add_subnodes {scale} {str(view_slice)}",
-    #     f"highres interval: {highres_min},  {highres_max}",
-    #     f"chunksize: {array.chunksize} arraysize: {array.shape}",
-    # )
-
     # Points for each chunk, for example, centers
     points = np.array(list(chunk_map.keys()))
 
-    # Mask of whether points are within our interval, this is in array coordinates
+    # Mask of whether points are within our interval, this is in array
+    # coordinates
     point_mask = np.array(
         [
             np.all(point >= min_coord) and np.all(point <= max_coord)
@@ -454,16 +922,16 @@ def render_sequence_3D(
     points_world = points * np.array(scale_factor)
 
     # Prioritize chunks using world coordinates
-    distances = distance_from_camera_centre_line(points_world, camera)
+    distances = distance_from_camera_center_line(points_world, camera)
     depth = visual_depth(points_world, camera)
-    priorities = prioritised_chunk_loading_3D(
+    priorities = prioritized_chunk_loading_3D(
         depth, distances, camera.zoom, alpha=alpha, visible=point_mask
     )
 
     # Select the number of chunks
     # TODO consider using threshold on priorities
     """
-    Note: 
+    Note:
     switching from recursing on 1 top chunk to N-best introduces extra
     complexity, because the shape of texture allocation needs to
     accommodate projections from all viewpoints around the volume.
@@ -471,15 +939,12 @@ def render_sequence_3D(
     n = 1
     best_priorities = np.argsort(priorities)[:n]
 
-    # This node's offset in world space
-    world_offset = np.array(min_coord) * np.array(scale_factor)
-
     # Iterate over points/chunks and add corresponding nodes when appropriate
     for idx, point in enumerate(points):
         # TODO: There are 2 strategies here:
         # 1. Render *visible* chunks, or all if we're on the last scale level
-        #    Skip the chunk at this resolution because it will be shown in higher res
-        #    This fetches less data.
+        #    Skip the chunk at this resolution because it will be shown in
+        #    higher res. This fetches less data.
         # if point_mask[idx] and (idx not in best_priorities or scale == 0):
         # 2. Render all chunks because we know we will zero out this data when
         #    it is loaded at the next resolution level.
@@ -487,20 +952,9 @@ def render_sequence_3D(
             coord = tuple(point)
             chunk_slice = chunk_map[coord]
             offset = [sl.start for sl in chunk_slice]
-            min_interval = offset
 
-            # find position and scale
-            node_offset = (
-                min_interval[0] * scale_factor[0],
-                min_interval[1] * scale_factor[1],
-                min_interval[2] * scale_factor[2],
-            )
-
-            # LOGGER.debug(
-            #     f"Fetching: {(scale, chunk_slice)} World offset: {node_offset}"
-            # )
-
-            # When we get_chunk chunk_slice needs to be in data space, but chunk slices are 3D
+            # When we get_chunk chunk_slice needs to be in data space, but
+            # chunk slices are 3D
             data_slice = tuple(
                 [slice(el, el + 1) for el in dims.current_step[:-3]]
                 + [slice(sl.start, sl.stop) for sl in chunk_slice]
@@ -531,7 +985,6 @@ def render_sequence_3D(
                 np.asarray(data),
                 scale,
                 offset,
-                # world_offset,
                 None,
                 chunk_slice,
                 texture_slice,
@@ -542,7 +995,8 @@ def render_sequence_3D(
 
     # recurse on best priorities
     if scale > 0:
-        # The next priorities for loading in higher resolution are the best ones
+        # The next priorities for loading in higher resolution are the best
+        # ones
         for priority_idx in best_priorities:
             # Get the coordinates of the chunk for next scale
             priority_coord = tuple(points[priority_idx])
@@ -584,8 +1038,10 @@ def render_sequence_3D(
                 scale_factors[scale - 1]
             )
 
-            # TODO Note that we need to be blanking out lower res data at the same time
-            # TODO this is when we should move the node from the next resolution.
+            # TODO Note that we need to be blanking out lower res data at the
+            #      same time
+            # TODO this is when we should move the node from the next
+            #      resolution.
             yield (
                 np.asarray(zdata),
                 scale,
@@ -595,11 +1051,7 @@ def render_sequence_3D(
                 texture_slice,
             )
 
-            # LOGGER.info(
-            #     f"Recursive add on\t{str(next_chunk_slice)} idx {priority_idx}",
-            #     f"visible {point_mask[priority_idx]} for scale {scale} to {scale-1}\n",
-            #     f"Relative scale factor {relative_scale_factor}",
-            # )
+            # Start the next scale level
             yield from render_sequence_3D(
                 next_chunk_slice,
                 scale=scale - 1,
@@ -612,60 +1064,9 @@ def render_sequence_3D(
             )
 
 
-# Code from an earlier stage to support visual debugging
-# @tz.curry
-# def update_point_colors(event, viewer, alpha=1.0):
-#     """Update the points based on their distance to current camera.
-
-#     Parameters:
-#     -----------
-#     viewer : napari.Viewer
-#         Current viewer
-#     event : camera.events.angles event
-#         The event triggered by changing the camera angles
-#     """
-#     # TODO we need a grid for each scale, or the grid needs to include all scales
-#     points_layer = viewer.layers['grid']
-#     points = points_layer.data
-#     distances = distance_from_camera_centre_line(points, viewer.camera)
-#     depth = visual_depth(points, viewer.camera)
-#     priorities = prioritised_chunk_loading(
-#         depth, distances, viewer.camera.zoom, alpha=alpha
-#     )
-#     points_layer.features = pd.DataFrame(
-#         {'distance': distances, 'depth': depth, 'priority': priorities}
-#     )
-#     # TODO want widget to change color
-#     points_layer.face_color = 'priority'
-#     points_layer.refresh()
-
-
-# @tz.curry
-# def update_shown_chunk(event, viewer, chunk_map, array, alpha=1.0):
-#     """
-#     chunk map is a dictionary mapping chunk centers to chunk slices
-#     array is the array containing the chunks
-#     """
-#     # TODO hack here to insert the recursive drawing
-#     points = np.array(list(chunk_map.keys()))
-#     distances = distance_from_camera_centre_line(points, viewer.camera)
-#     depth = visual_depth(points, viewer.camera)
-#     priorities = prioritised_chunk_loading(
-#         depth, distances, viewer.camera.zoom, alpha=alpha
-#     )
-#     first_priority_idx = np.argmin(priorities)
-#     first_priority_coord = tuple(points[first_priority_idx])
-#     chunk_slice = chunk_map[first_priority_coord]
-#     offset = [sl.start for sl in chunk_slice]
-#     # TODO note that this only updates the highest resolution
-#     hi_res_layer = viewer.layers['high-res']
-#     hi_res_layer.data = array[chunk_slice]
-#     hi_res_layer.translate = offset
-#     hi_res_layer.refresh()
-
-
 def interpolated_get_chunk_2D(chunk_slice, array=None):
     """Get a specified slice from an array, with interpolation when necessary.
+
     Interpolation is linear.
     Out of bounds behavior is zeros outside the shape.
 
@@ -690,11 +1091,11 @@ def interpolated_get_chunk_2D(chunk_slice, array=None):
     real_array = None
 
     start_time = time.time()
-    
+
     if real_array is None:
         # If we do not need to interpolate
         # TODO this isn't safe enough
-        if all([(sl.start % 1 == 0) for sl in chunk_slice]):
+        if all((sl.start % 1 == 0) for sl in chunk_slice):
             real_array = get_chunk(
                 chunk_slice,
                 array=array,
@@ -725,100 +1126,97 @@ def interpolated_get_chunk_2D(chunk_slice, array=None):
                     lchunk_slice,
                     array=array,
                 )
-            except:
+            except Exception:
                 lvalue = np.zeros([1] + list(array.chunksize[-2:]))
             try:
                 rvalue = get_chunk(
                     rchunk_slice,
                     array=array,
                 )
-            except:
+            except Exception:
                 rvalue = np.zeros([1] + list(array.chunksize[-2:]))
 
             # Linear weight between left/right, assumes parallel
             w = chunk_slice[0].start - lchunk_slice[0].start
 
-            # TODO hardcoded dtype
             # TODO squeeze is a bad sign
-            real_array = (
-                ((1 - w) * lvalue + w * rvalue).squeeze()
-#                ((1 - w) * lvalue + w * rvalue).astype(np.uint16).squeeze()
-            )
+            real_array = ((1 - w) * lvalue + w * rvalue).squeeze()
 
     LOGGER.info(f"interpolated_get_chunk_2D : {(time.time() - start_time)}")
 
     return real_array
 
 
-# TODO a VirtualData should only address 1 coordinate system
 class VirtualData:
-    """`VirtualData` wraps a particular scale level's array. It acts like an 
-    array of that size, but only works within the interval setup by 
-    `set_interval`. Each `VirtualData` uses the scale level's coordinates.
+    """`VirtualData` wraps a particular scale level's array.
 
-    -- `VirtualData` uses a (poorly named) "data_plane" to store the currently 
-    active interval.
-    -- `VirtualData.translate` specifies the offset of the 
-    `VirtualData.data_plane`'s origin from `VirtualData.array`'s origin, in 
+    It acts like an array of that size, but only works within the interval
+    setup by `set_interval`. Each `VirtualData` uses the scale level's
+    coordinates.
+
+    -- `VirtualData` uses a hyperslice to store the currently active interval.
+    -- `VirtualData.translate` specifies the offset of the
+    `VirtualData.hyperslice`'s origin from `VirtualData.array`'s origin, in
     `VirtualData`'s coordinate system
-    
-    VirtualData is used to use a 2D array to represent
-    a larger shape. The purpose of this function is to provide
-    a 2D slice that acts like a canvas for rendering a large ND image.
 
-    When you try to fetch a ND coordinate, only the last 2 dimensions
+    VirtualData is used to use a ND array to represent
+    a larger shape. The purpose of this function is to provide
+    a ND slice that acts like a canvas for rendering a large ND image.
+
+    When you try to fetch a ND coordinate, only the last `ndisplay` dimensions
     will be used as the (y, x) values.
 
     NEW: use a translate to define subregion of image
 
     Attributes
     ----------
-    array: dask.array
-        Dask array of image data for this scale
+    array: ndarray-like
+        nd-array like probably a Dask array or a zarr Array
     dtype: dtype
         dtype of the array
     shape: tuple
-        shape of the true data (not the data_plane)
+        shape of the true data (not the hyperslice)
     ndim: int
         Number of dimensions for this scale
     translate: list[tuple(int)]
         tuple for the translation
     d: int
         Dimension of the chunked slices ??? Hard coded to 2.
-    data_plane: dask.array
+    hyperslice: dask.array
         Array of currently visible data for this layer
-    _min_coord: list 
+    _min_coord: list
         List of the minimum coordinates in each dimension
     _max_coord: list
         List of the maximum coordinates in each dimension
 
     """
 
-    def __init__(self, array, scale):
+    def __init__(self, array, scale, ndisplay=2):
         self.array = array
         self.dtype = array.dtype
-        # This shape is the shape of the true data, but not our data_plane
+        # This shape is the shape of the true data, but not our hyperslice
         self.shape = array.shape
         self.ndim = len(self.shape)
 
         # translate is in the same units as the highest resolution scale
         self.translate = tuple([0] * len(self.shape))
 
-        self.data_plane = da.zeros(1)
+        self.hyperslice = da.zeros(1)
+        self.ndisplay = ndisplay
 
-        self.d = 2
         self._max_coord = None
         self._min_coord = None
         self.scale = scale  # for debugging
 
     def set_interval(self, coords):
-        """The interval is the range of the data for this scale that is 
-        currently visible. It is stored in `_min_coord` and `_max_coord` in
-        the coordinates of the original array. 
+        """Interval is the data for this scale that is currently visible.
 
-        This function takes a slice, converts it to a range (stored as 
-        `_min_coord` and `_max_coord`), and extracts a subset of the orginal 
-        data array (stored as `data_plane`)
+        It is stored in `_min_coord` and `_max_coord` in the coordinates of
+        the original array.
+
+        This function takes a slice, converts it to a range (stored as
+        `_min_coord` and `_max_coord`), and extracts a subset of the orginal
+        data array (stored as `hyperslice`)
 
         Parameters
         ----------
@@ -833,41 +1231,56 @@ class VirtualData:
         # store the last interval
         prev_max_coord = self._max_coord
         prev_min_coord = self._min_coord
-        
+
         # extract the coordinates as a range
         self._max_coord = [sl.stop for sl in coords]
         self._min_coord = [sl.start for sl in coords]
 
         # Round max and min coord according to self.array.chunks
-        # for each dimension, reset the min/max coords, aka interval to be 
+        # for each dimension, reset the min/max coords, aka interval to be
         # the range of chunk coordinates since we can't partially load a chunk
         for dim in range(len(self._max_coord)):
             if isinstance(self.array, da.Array):
                 chunks = self.array.chunks[dim]
                 cumuchunks = np.array(chunks).cumsum()
             else:
-                # For zarr     
-                cumuchunks = [val for val in range(self.chunks[dim], self.array.shape[dim], self.chunks[dim])]
+                # For zarr
+                cumuchunks = list(
+                    range(
+                        self.chunks[dim],
+                        self.array.shape[dim],
+                        self.chunks[dim],
+                    )
+                )
                 # Add last element
                 cumuchunks += [self.array.shape[dim]]
                 cumuchunks = np.array(cumuchunks)
-                
 
             # First value greater or equal to
-            min_where = np.where(cumuchunks > self._min_coord[dim])
-            greaterthan_min_idx = min_where[0][0] if min_where[0] is not None else 0
+            min_where = np.where(cumuchunks >= self._min_coord[dim])
+            if min_where[0].size == 0:
+                import pdb
+
+                pdb.set_trace()
+            greaterthan_min_idx = (
+                min_where[0][0] if min_where[0] is not None else 0
+            )
             self._min_coord[dim] = (
                 cumuchunks[greaterthan_min_idx - 1]
                 if greaterthan_min_idx > 0
                 else 0
             )
 
-            
             max_where = np.where(cumuchunks >= self._max_coord[dim])
+
             # LOGGER.debug(f'max_where: {max_where}')
-            if not max_where[0].any():
-                pass
-            lessthan_max_idx = max_where[0][0] if max_where[0] is not None else 0
+            if max_where[0].size == 0:
+                import pdb
+
+                pdb.set_trace()
+            lessthan_max_idx = (
+                max_where[0][0] if max_where[0] is not None else 0
+            )
             self._max_coord[dim] = (
                 cumuchunks[lessthan_max_idx]
                 if lessthan_max_idx < cumuchunks[-1]
@@ -875,25 +1288,26 @@ class VirtualData:
             )
 
         # Update translate
-        # TODO there is a bug here, _min_coord goes to 0 when it shouldnt as the user zooms into the highest resolution
-        # if self.array.shape[0] > 100000 and self._min_coord[0] == 0:
-        #     import pdb; pdb.set_trace()
         self.translate = self._min_coord
 
         # interval size may be one or more chunks
-        interval_size = [mx - mn for mx, mn in zip(self._max_coord, self._min_coord)]
-        
-        LOGGER.debug(f"VirtualData: update_with_minmax: {self.translate} max {self._max_coord} interval size {interval_size}")
+        interval_size = [
+            mx - mn for mx, mn in zip(self._max_coord, self._min_coord)
+        ]
 
-        # Update data_plane
+        LOGGER.debug(
+            f"VirtualData: update_with_minmax: {self.translate} max \
+            {self._max_coord} interval size {interval_size}"
+        )
 
+        # Update hyperslice
         new_shape = [
             int(mx - mn) for (mx, mn) in zip(self._max_coord, self._min_coord)
         ]
 
-        # Try to reuse the previous data_plane if possible (otherwise we get flashing)
-        # shape of the chunks
-        next_data_plane = np.zeros(new_shape, dtype=self.dtype)
+        # Try to reuse the previous hyperslice if possible (otherwise we get
+        # flashing) shape of the chunks
+        next_hyperslice = np.zeros(new_shape, dtype=self.dtype)
 
         if prev_max_coord:
             # Get the matching slice from both data planes
@@ -901,7 +1315,8 @@ class VirtualData:
             prev_slices = []
             for dim in range(len(self._max_coord)):
                 # to ensure that start is non-negative
-                # prev_start is the start of the overlapping region in the previous one
+                # prev_start is the start of the overlapping region in the
+                # previous one
                 if self._min_coord[dim] < prev_min_coord[dim]:
                     prev_start = 0
                     next_start = prev_min_coord[dim] - self._min_coord[dim]
@@ -909,74 +1324,80 @@ class VirtualData:
                     prev_start = self._min_coord[dim] - prev_min_coord[dim]
                     next_start = 0
 
-                # Get smallest width, this is overlap
-                # width = min(self._max_coord[dim] - next_start, prev_max_coord[dim] - prev_start)
-                # width = min(self._max_coord[dim], prev_max_coord[dim]) - max(next_start, prev_start)
                 width = min(
-                    self.data_plane.shape[dim], next_data_plane.shape[dim]
+                    self.hyperslice.shape[dim], next_hyperslice.shape[dim]
                 )
                 # to make sure its not overflowing the shape
                 width = min(
                     width,
                     width
-                    - ((next_start + width) - next_data_plane.shape[dim]),
+                    - ((next_start + width) - next_hyperslice.shape[dim]),
                     width
-                    - ((prev_start + width) - self.data_plane.shape[dim]),
+                    - ((prev_start + width) - self.hyperslice.shape[dim]),
                 )
 
                 prev_stop = prev_start + width
                 next_stop = next_start + width
 
-                # if self._max_coord[dim] < prev_max_coord[dim]:
-                #     next_stop = self._max_coord[dim]
-                #     prev_stop = prev_start + (next_stop - next_start)
-                # else:
-                #     prev_stop = prev_max_coord[dim]
-                #     next_stop = next_start + (prev_stop - prev_start)
-
-                # prev_start = max(prev_next_offset, self._min_coord[dim] - prev_min_coord[dim])
-                # prev_stop = min(prev_start + new_shape[dim], self.data_plane.shape[dim])
-
-                # next_start = 0
-                # next_stop = min(next_start + new_shape[dim], self.data_plane.shape[dim])
-
                 prev_slices += [slice(int(prev_start), int(prev_stop))]
                 next_slices += [slice(int(next_start), int(next_stop))]
 
             if (
-                next_data_plane[tuple(next_slices)].size > 0
-                and self.data_plane[tuple(prev_slices)].size > 0
+                next_hyperslice[tuple(next_slices)].size > 0
+                and self.hyperslice[tuple(prev_slices)].size > 0
             ):
                 LOGGER.info(
-                    f"reusing data plane: prev {prev_slices} next {next_slices}"
+                    f"reusing data plane: prev {prev_slices} next \
+                    {next_slices}"
                 )
                 if (
-                    next_data_plane[tuple(next_slices)].size
-                    != self.data_plane[tuple(prev_slices)].size
+                    next_hyperslice[tuple(next_slices)].size
+                    != self.hyperslice[tuple(prev_slices)].size
                 ):
                     import pdb
 
                     pdb.set_trace()
-                next_data_plane[tuple(next_slices)] = self.data_plane[
+                next_hyperslice[tuple(next_slices)] = self.hyperslice[
                     tuple(prev_slices)
                 ]
             else:
                 LOGGER.info(
-                    f"could not data plane: prev {prev_slices} next {next_slices}"
+                    f"could not reuse data plane: prev {prev_slices} next \
+                    {next_slices}"
                 )
 
-        self.data_plane = next_data_plane
+        self.hyperslice = next_hyperslice
 
-    def _data_plane_key(
+    def _hyperslice_key(
         self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol]
     ):
-        """The _data_plane_key is the corresponding value of key
-        within plane. The difference between key and data_plane_key is
-        key - translate / scale"""
-        if type(key) is tuple and type(key[0]) is slice:
+        """Convert a key into a key for the hyperslice.
+
+        The _hyperslice_key is the corresponding value of key
+        within plane. The difference between key and hyperslice_key is
+        key - translate / scale
+        """
+        # TODO maybe fine, but a little lazy
+        if type(key) is not tuple:
+            key = (key,)
+
+        indices = [None] * len(key)
+        for i, index in enumerate(indices):
+            if type(index) == slice:
+                indices[i] = slice(
+                    index.start - self.translate[i],
+                    index.stop - self.translate[i],
+                )
+            elif np.issubdtype(int, type(index)):
+                indices[i] = index - self.translate[i]
+            # else:
+            #     LOGGER.info(f"_hyperslice_key: unexpected type {type(index)}\
+            #     with value {index}")
+
+        if type(key) is tuple and type(key[0]) == slice:
             if key[0].start is None:
                 return key
-            data_plane_key = tuple(
+            hyperslice_key = tuple(
                 [
                     slice(
                         int(
@@ -993,131 +1414,113 @@ class VirtualData:
                         ),
                         sl.step,
                     )
-                    for (idx, sl) in enumerate(key[-1 * self.d :])
-                    # TODO check out the self.d stuff here and elsewhere
+                    for (idx, sl) in enumerate(key[(-self.ndisplay) :])
                 ]
             )
-            # Removed a breakpoint for catching empty slices
         elif type(key) is tuple and type(key[0]) is int:
-            data_plane_key = tuple(
+            hyperslice_key = tuple(
                 [
                     int(v - self.translate[idx])
-                    for idx, v in enumerate(key[-1 * self.d :])
+                    for idx, v in enumerate(key[(-self.ndisplay) :])
                 ]
             )
+        else:
+            LOGGER.info(f"_hyperslice_key: funky key {key}")
+            hyperslice_key = key
 
-        return data_plane_key
+        return hyperslice_key
 
     def __getitem__(
         self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol]
     ) -> LayerDataProtocol:
-        # return self.data_plane.__getitem__(key)
+        """Return item from array.
+
+        key is in data coordinates
+        """
         return self.get_offset(key)
 
     def __setitem__(
         self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol], value
     ) -> LayerDataProtocol:
-        self.data_plane[key] = value
-        return self.data_plane[key]
+        """Set an item in the array.
+
+        key is in data coordinates
+        """
+        self.hyperslice[key] = value
+        return self.hyperslice[key]
 
     def get_offset(
         self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol]
     ) -> LayerDataProtocol:
-        """Returns self[key]."""
-        data_plane_key = self._data_plane_key(key)
-        LOGGER.debug(f'data plane key in get_offset: {key}')
-        try:
-            return self.data_plane.__getitem__(data_plane_key)
-        except Exception:
-            shape = tuple([sl.stop - sl.start for sl in key])
-            LOGGER.info(f"get_offset failed {key}")
-            import pdb
+        """Return item from array.
 
-            pdb.set_trace()
+        key is in data coordinates.
+        """
+        hyperslice_key = self._hyperslice_key(key)
+        
+        try:
+            return self.hyperslice.__getitem__(hyperslice_key)
+        except Exception:
+            # if it isnt a slice it is an int so width=1
+            shape = tuple(
+                [
+                    (1 if sl.start is None else sl.stop - sl.start)
+                    if type(sl) is slice
+                    else 1
+                    for sl in key
+                ]
+            )
+            LOGGER.info(f"get_offset failed {key}")
             return np.zeros(shape)
-        # if type(key) is tuple:
-        #     return self.data_plane.__getitem__(tuple(key[-1 * self.d :]))
-        # else:
-        #     return self.data_plane.__getitem__(key)
 
     def set_offset(
         self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol], value
     ) -> LayerDataProtocol:
-        """Returns self[key]."""
-        data_plane_key = self._data_plane_key(key)
+        """Return self[key]."""
+        hyperslice_key = self._hyperslice_key(key)
         LOGGER.info(
-            f"set_offset: {data_plane_key} shape in plane: {self.data_plane[data_plane_key].shape} value shape: {value.shape}"
+            f"set_offset: {hyperslice_key} shape in plane: \
+            {self.hyperslice[hyperslice_key].shape} value shape: {value.shape}"
         )
-        # if np.any(np.array(self.data_plane[data_plane_key].shape) == 0):
-        #     import pdb; pdb.set_trace()
-        # TODO this is evil
-        if self.data_plane[data_plane_key].size > 0:
-            self.data_plane[data_plane_key] = value
-        return self.data_plane[data_plane_key]
-        # if type(key) is tuple:
-        #     return self.data_plane.__setitem__(
-        #         tuple(key[-1 * self.d :]), value
-        #     )
-        # else:
-        #     return self.data_plane.__setitem__(key, value)
+
+        if self.hyperslice[hyperslice_key].size > 0:
+            try:
+                self.hyperslice[hyperslice_key] = value
+            except Exception:
+                import pdb
+
+                pdb.set_trace()
+        return self.hyperslice[hyperslice_key]
 
     @property
     def chunksize(self):
-        return self.array.info
+        """Return the size of a chunk."""
+        import pdb
+
+        pdb.set_trace()
+        if isinstance(self.array, da.Array):
+            return self.chunksize
+        else:
+            return self.array.info
 
     @property
     def chunks(self):
+        """Return the chunks of the array."""
+        # TODO this isn't safe because array can be dask or zarr
         return self.array.chunks
 
 
-def test_virtualdata():
-    shape = (100, 100)
-
-    data = da.from_delayed(
-        dask.delayed(lambda: None), shape=shape, dtype=np.int16
-    ).rechunk(chunks=(10, 10))
-
-    virtual_data = VirtualData(data, scale=0)
-
-    interval = (slice(10, 20), slice(10, 20))
-
-    virtual_data.set_interval(interval)
-    dim = 1
-
-    # Put column indices along rows
-    with np.nditer(
-        virtual_data[interval], flags=['multi_index'], op_flags=['writeonly']
-    ) as it:
-        for x in it:
-            x[...] = it.multi_index[dim] + virtual_data.translate[dim]
-
-    # Check if the right value is in the offset region
-    assert virtual_data[15, 15] == 15
-
-    # Check that data_plane is aligned to the input array's chunks
-    interval = (slice(15, 25), slice(15, 25))
-    virtual_data.set_interval(interval)
-
-    assert np.all(np.array(virtual_data.translate) == np.array((10, 10)))
-    assert np.all(
-        np.array(virtual_data.data_plane.shape) == np.array((20, 20))
-    )
-
-    print(virtual_data[interval])
-
-    import pdb
-
-    pdb.set_trace()
-
-
-# TODO MultiScaleVirtualData describes a multiscale relationship between
-# multiple VirtualData, including tracking coordinate systems
 class MultiScaleVirtualData:
-    """MultiScaleVirtualData is a parent that tracks the transformation 
-    between each VirtualData child relative to the highest resolution 
-    VirtualData (which is just a re-scaling transform). It accepts inputs in 
+    """MultiScaleVirtualData encapsulates multiscale arrays.
+
+    The added value is that MultiScaleVirtualData has a small memory
+    footprint.
+
+    MultiScaleVirtualData is a parent that tracks the transformation
+    between each VirtualData child relative to the highest resolution
+    VirtualData (which is just a re-scaling transform). It accepts inputs in
     the coordinate system of the highest resolution VirtualData.
-    
+
     VirtualData is used to use a 2D array to represent
     a larger shape. The purpose of this function is to provide
     a 2D slice that acts like a canvas for rendering a large ND image.
@@ -1140,39 +1543,49 @@ class MultiScaleVirtualData:
     _data: list[VirtualData]
         List of VirtualData objects for each scale
     _translate: list[tuple(int)]
-        List of tuples, e.g. [(0, 0), (0, 0)] of translations for each scale 
+        List of tuples, e.g. [(0, 0), (0, 0)] of translations for each scale
         array
     _scale_factors: list[list[float]]
-        List of lists, e.g. [[1.0, 1.0], [2.0, 2.0]], of scale factors between 
+        List of lists, e.g. [[1.0, 1.0], [2.0, 2.0]], of scale factors between
         the highest resolution scale and each subsequent scale, [x, y]
-    d: int
-        Dimension of the chunked slices ???
+    ndisplay: int
+        number of dimensions to display (equivalent to ndisplay in
+        napari.viewer.Viewer)
     _chunk_slices: list of list of chunk slices
-        List of list of chunk slices. A slice object for each scale, for each 
-        dimension, 
+        List of list of chunk slices. A slice object for each scale, for each
+        dimension,
         e.g. [list of scales[list of slice objects[(x, y, z)]]]
     """
 
-    def __init__(self, arrays):
+    def __init__(self, arrays, ndisplay=2):
         # TODO arrays should be typed as MultiScaleData
         # each array represents a scale
         self.arrays = arrays
-        # first array is considered the highest resolution # TODO [kcp] - is that always true?
+        # first array is considered the highest resolution
+        # TODO [kcp] - is that always true?
         highest_res = arrays[0]
 
         self.dtype = highest_res.dtype
-        # This shape is the shape of the true data, but not our data_plane
+        # This shape is the shape of the true data, but not our hyperslice
         self.shape = highest_res.shape
+
         self.ndim = len(arrays)
+
+        self.ndisplay = ndisplay
 
         # Keep a VirtualData for each array
         self._data = []
         self._translate = []
         self._scale_factors = []
         for scale in range(len(self.arrays)):
-            virtual_data = VirtualData(self.arrays[scale], scale=scale)
-            self._translate += [tuple([0] * len(self.shape))] # Factors to shift the layer by in units of world coordinates.
-            # TODO [kcp] there are assumptions here, expect rounding errors here, or should we force ints?
+            virtual_data = VirtualData(
+                self.arrays[scale], scale=scale, ndisplay=self.ndisplay
+            )
+            self._translate += [
+                tuple([0] * len(self.shape))
+            ]  # Factors to shift the layer by in units of world coordinates.
+            # TODO [kcp] there are assumptions here, expect rounding errors
+            #      here, or should we force ints?
             self._scale_factors += [
                 [
                     hr_val / this_val
@@ -1183,21 +1596,12 @@ class MultiScaleVirtualData:
             ]
             self._data += [virtual_data]
 
-        # TODO hard coded 2D for now [kcp] what is this?
-        self.d = 2
-
-        # This is expensive to precompute for large arrays
-        # self._chunk_slices = []
-        # for scale, array in enumerate(self.arrays):
-        #     print(f"init of {scale}")
-        #     these_slices = chunk_slices(array, ndim=self.d)
-        #     self._chunk_slices += [these_slices]
-
     def set_interval(self, min_coord, max_coord, visible_scales=[]):
-        """Set the extents for each of the scales in the coordinates of each
-        individual scale array
+        """Set the extents for each of the scales.
 
-        visible_scales must be an empty list of a list equal to the number of 
+        Extents are set in the coordinates of each individual scale array
+
+        visible_scales must be an empty list of a list equal to the number of
         scales
 
         Sets the _min_coord and _max_coord on each individual VirtualData
@@ -1208,16 +1612,21 @@ class MultiScaleVirtualData:
         Parameters
         ----------
         min_coord: np.array
-            top left corner of the visible canvas
+            min coordinate in data space, should correspond to top left corner
+            of the visible canvas
         max_coord: np.array
-            bottom right corner of the visible canvas
+            max coordinate in data space, should correspond to bottom right
+            corner of the visible canvas
         visible_scales: list
             Optional. ???
         """
+        # Bound min_coord and max_coord
+        max_coord = np.min((max_coord, self._data[0].shape), axis=0)
+        min_coord = np.max((min_coord, np.zeros_like(min_coord)), axis=0)
 
         # for each scale, set the interval for the VirtualData
         # e.g. a high resolution scale may cover [0,1,2,3,4] but a scale
-        # with half of that resolution will cover the same region with 
+        # with half of that resolution will cover the same region with
         # coords/indices of [0,1,2]
         for scale in range(len(self.arrays)):
             if not visible_scales or visible_scales[scale]:
@@ -1235,7 +1644,9 @@ class MultiScaleVirtualData:
 
                 self._translate[scale] = scaled_min
                 LOGGER.info(
-                    f"MultiscaleVirtualData: update_with_minmax: scale {scale} : min_coord {min_coord} : max_coord {max_coord} : scaled min {scaled_min} : scaled max {scaled_max}"
+                    f"MultiscaleVirtualData: update_with_minmax: scale {scale}\
+                    min {min_coord} : {scaled_min} max {max_coord} : \
+                    scaled max {scaled_max}"
                 )
 
                 # Ask VirtualData to update its interval
@@ -1246,7 +1657,3 @@ class MultiScaleVirtualData:
                 self._data[scale].set_interval(coords)
             else:
                 LOGGER.debug('visible scales are provided, do nothing')
-
-
-if __name__ == "__main__":
-    test_virtualdata()
