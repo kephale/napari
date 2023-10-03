@@ -1,3 +1,4 @@
+import toolz as tz
 import dask.array as da
 from ome_zarr.io import parse_url
 from ome_zarr.reader import Reader
@@ -28,9 +29,6 @@ def open_zebrahub():
     return dask_data
 
 
-import toolz as tz
-
-
 @tz.curry
 def update_timepoint(timepoint: int, timeseries_img=None, viewer=None):
     # TODO reconnect the new data to the event listeners
@@ -42,14 +40,20 @@ def update_timepoint(timepoint: int, timeseries_img=None, viewer=None):
         return
 
     # Extract the image data for the given timepoint and adjust the dimensions
-    multiscale_img = [da.transpose(da.squeeze(img[timepoint, 0, :, :, :]), (2, 1, 0)) for img in timeseries_img]
-    print(f"multiscale img: {multiscale_img} shapes {[img.shape for img in timeseries_img]}")
+    multiscale_img = [
+        da.transpose(da.squeeze(img[timepoint, 0, :, :, :]), (2, 1, 0))
+        for img in timeseries_img
+    ]
+    print(
+        f"multiscale img: {multiscale_img} shapes {[img.shape for img in timeseries_img]}"
+    )
 
     # Initialize multiscale virtual data for the new timepoint
-    multiscale_vdata = initialize_multiscale_virtual_data(multiscale_img, viewer, ndisplay=3)
+    multiscale_vdata = initialize_multiscale_virtual_data(
+        multiscale_img, viewer, ndisplay=3
+    )
 
     if multiscale_vdata is not None:
-
         # Update the image layer with the new timepoint data
         for scale, img in enumerate(multiscale_vdata._data):
             scale_name = get_layer_name_for_scale(scale)
@@ -57,6 +61,7 @@ def update_timepoint(timepoint: int, timeseries_img=None, viewer=None):
                 viewer.layers[scale_name].data = img
             else:
                 print(f"Layer {scale_name} not found in viewer.")
+
 
 if __name__ == "__main__":
     import napari
@@ -81,8 +86,17 @@ if __name__ == "__main__":
 
     print(multiscale_img[0])
 
+    # Work with a 3D slice from the 4D image
+    # add_progressive_loading_image(
+    #     multiscale_img,
+    #     viewer=viewer,
+    #     contrast_limits=[0, 255],
+    #     colormap='twilight_shifted',
+    #     ndisplay=3,
+    # )
+
     add_progressive_loading_image(
-        multiscale_img,
+        timeseries_img,
         viewer=viewer,
         contrast_limits=[0, 255],
         colormap='twilight_shifted',
@@ -102,4 +116,4 @@ if __name__ == "__main__":
 
     viewer.axes.visible = True
 
-    napari.run()
+    # napari.run()

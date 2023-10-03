@@ -120,45 +120,6 @@ def distance_from_camera_center_line(points, camera):
     return distances
 
 
-def chunk_centers(array: da.Array, ndim=3):
-    """Make a dictionary mapping chunk centers to chunk slices.
-
-    Note: if array is >3D, then the last 3 dimensions are assumed as ZYX
-    and will be used for calculating centers
-
-    Parameters
-    ----------
-    array: dask Array
-        The input array.
-    ndim: int
-        Dimensions of the array.
-
-    Returns
-    -------
-    chunk_map : dict {tuple of float: tuple of slices}
-        A dictionary mapping chunk centers to chunk slices.
-    """
-    start_pos = [np.cumsum(sizes) - sizes for sizes in array.chunks]
-    middle_pos = [
-        np.cumsum(sizes) - (np.array(sizes) / 2) for sizes in array.chunks
-    ]
-    end_pos = [np.cumsum(sizes) for sizes in array.chunks]
-    all_start_pos = list(itertools.product(*start_pos))
-    # TODO We impose dimensional ordering for ND
-    all_middle_pos = [
-        el[-ndim:] for el in list(itertools.product(*middle_pos))
-    ]
-    all_end_pos = list(itertools.product(*end_pos))
-    chunk_slices = []
-    for start, end in zip(all_start_pos, all_end_pos):
-        chunk_slice = [
-            slice(start_i, end_i) for start_i, end_i in zip(start, end)
-        ]
-        # TODO We impose dimensional ordering for ND
-        chunk_slices.append(tuple(chunk_slice[-ndim:]))
-
-    mapping = dict(zip(all_middle_pos, chunk_slices))
-    return mapping
 
 
 def chunk_slices(
@@ -375,7 +336,7 @@ def progressively_update_layer(invar, viewer, data=None, ndisplay=None):
     # Find the corners of visible data in the highest resolution
     corner_pixels = root_layer.corner_pixels
 
-    LOGGER.info(f"corner pixels: {corner_pixels}")
+    LOGGER.info(f"Update layer corner pixels: {corner_pixels}")
 
     top_left = corner_pixels[0, :]
     bottom_right = corner_pixels[1, :]
@@ -384,16 +345,14 @@ def progressively_update_layer(invar, viewer, data=None, ndisplay=None):
 
     # TODO Added to skip situations when 3D isnt setup on layer yet??
     if np.any((bottom_right - top_left) == 0):
-        return
+        LOGGER.info(f"NOT GOOD top_left {top_left} and bottom_right {bottom_right}")
 
     # TODO we could add padding around top_left and bottom_right to account
     #      for future camera movement
 
     # Interval must be nonnegative
     if not np.all(top_left <= bottom_right):
-        import pdb
-
-        pdb.set_trace()
+        LOGGER.info(f"Interval is not nonnegative top_left {top_left} and bottom_right {bottom_right}")
 
     LOGGER.info(
         f"progressively_update_layer: start render_sequence {corner_pixels} on {root_layer}"
@@ -429,9 +388,18 @@ def progressively_update_layer(invar, viewer, data=None, ndisplay=None):
             {layer.data.translate}"
         )
 
+    LOGGER.info(f"Setting interval to {top_left} and {bottom_right}")
+
+
+    # TODO fix top_left to use current step
+    top_left[:-3] = viewer.dims.current_step[:-3]
+    bottom_right[:-3] = viewer.dims.current_step[:-3]
+    
     # Update the MultiScaleVirtualData memory backing
     data.set_interval(top_left, bottom_right, visible_scales=visible_scales)
 
+
+    
     # Start a new multiscale render
     worker = render_sequence(
         corner_pixels,
@@ -498,7 +466,9 @@ def progressively_update_layer(invar, viewer, data=None, ndisplay=None):
             )
 
         layer.data.set_offset(chunk_slice, chunk)
-        texture.set_data(layer.data.hyperslice)
+        texture_data = np.squeeze(layer.data.hyperslice)
+        LOGGER.info(f"Texture data shape is {texture_data.shape}")
+        texture.set_data(texture_data)
         node.update()
 
     worker.yielded.connect(on_yield)
@@ -511,8 +481,6 @@ def initialize_multiscale_virtual_data(img, viewer, ndisplay):
 
     This function also enforces GL memory constraints.
     """
-
-    #
 
     multiscale_data = MultiScaleVirtualData(img, ndisplay=ndisplay)
 
@@ -539,9 +507,20 @@ def initialize_multiscale_virtual_data(img, viewer, ndisplay):
         for i in range(len(top_left)):
             bottom_right[i] = min(bottom_right[i], top_left[i] + max_size)
 
+    # TODO check this
     if ndisplay != len(img[0].shape):
         top_left = [viewer.dims.point[-ndisplay]] + top_left.tolist()
         bottom_right = [viewer.dims.point[-ndisplay]] + bottom_right.tolist()
+
+    # TODO go from canvas corners to full data-dimensions
+    # when we initialize we haven't added images so dimension ordering can only
+    # be assumed to be 0,1,2
+    
+    top_left = np.zeros(len(img[0].shape))
+    bottom_right = np.zeros(len(img[0].shape))
+
+    top_left[-3:] = canvas_corners[0,:]
+    bottom_right[-3:] = canvas_corners[1,:]
 
     multiscale_data.set_interval(top_left, bottom_right)
 
@@ -596,12 +575,12 @@ def add_progressive_loading_image(
     viewer.dims.ndim = ndisplay
 
     if scale is None:
-        scale = np.ones(ndisplay)
+        scale = np.ones(len(img[0].shape))
     else:
         LOGGER.error("scale other than 1 is currently not supported")
         return None
         # scale = np.asarray(scale)
-
+        
     for scale_idx, vdata in list(enumerate(multiscale_data._data)):
         layer_scale = scale * multiscale_data._scale_factors[scale_idx]
         layer = viewer.add_image(
@@ -818,18 +797,20 @@ def chunk_priority_3D(
     ):
         priority = 0
 
-        chunk_center = get_chunk_center(chunk_key)
+        chunk_center = get_chunk_center(chunk_key)[-3:]
         depth = visual_depth(chunk_center, camera)
         center_line_dist = distance_from_camera_center_line(
             chunk_center, camera
         )
 
         # New measure: distance from chunk center to the center of the camera's view
-        camera_center = np.mean(corner_pixels, axis=0) / scale_factor
+        camera_center = (np.mean(corner_pixels, axis=0) / scale_factor)[-3:]
+        LOGGER.info(f"chunk_priority_3D: corner_pixels {corner_pixels} camera center {camera_center} and chunk_center {chunk_center}")
         center_view_dist = np.linalg.norm(chunk_center - camera_center)
 
         # Define weights for each factor
         depth_weight = 1
+        # TODO this should be a constant
         center_line_weight = camera.zoom
 
         # Updated priority calculation
@@ -1587,7 +1568,7 @@ class VirtualData:
                     for sl in key
                 ]
             )
-            LOGGER.info(f"get_offset failed {key}")
+            LOGGER.info(f"get_offset failed {key} hyperslice_key {hyperslice_key}")
             return np.zeros(shape)
 
     def set_offset(
@@ -1608,8 +1589,10 @@ class VirtualData:
             np.array(value.shape)
             == np.array(self.hyperslice[hyperslice_key].shape)
         ):
+            # TODO the non 3D coords are problematic
+            LOGGER.info(f"Transposing in set_offset: {value.shape} hyperslice shape {self.hyperslice[hyperslice_key].shape}")
             # Transpose value to match the expected shape
-            value = np.transpose(value, axes=(2, 1, 0))
+            value = np.transpose(value)
 
         if self.hyperslice[hyperslice_key].size > 0:
             self.hyperslice[hyperslice_key] = value
@@ -1748,7 +1731,7 @@ class MultiScaleVirtualData:
         # Bound min_coord and max_coord
         if visible_scales is None:
             visible_scales = [True] * len(self.arrays)
-
+            
         max_coord = np.min((max_coord, self._data[0].shape), axis=0)
         min_coord = np.max((min_coord, np.zeros_like(min_coord)), axis=0)
 
