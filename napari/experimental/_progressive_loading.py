@@ -35,7 +35,7 @@ def get_chunk(
     dtype=np.uint8,
     num_retry=3,
 ):
-    """Get a specified slice from an array with consistent orientation.
+    """Get a specified slice from an array with consistent dimension ordering.
 
     Parameters
     ----------
@@ -51,83 +51,104 @@ def get_chunk(
     Returns
     -------
     real_array : ndarray
-        an ndarray of data sliced with chunk_slice with consistent orientation
+        an ndarray of data sliced with chunk_slice
     """
     real_array = None
     retry = 0
     start_time = time.time()
 
-    # Calculate target shape based on the slices
+    # Get the full array dimensions to use as reference for ordering
+    array_dims = array.shape
+    LOGGER.info(f"Full array dimensions: {array_dims}")
+
+    # Calculate expected chunk dimensions
     target_shape = tuple(
         sl.stop - sl.start for sl in chunk_slice
     )
-
-    LOGGER.info(f"Loading chunk with slices {chunk_slice}, expecting shape {target_shape}")
+    LOGGER.info(f"Target chunk shape: {target_shape}")
 
     while real_array is None and retry < num_retry:
         try:
-            # Load the data - Note: NOT using transpose here
+            # Load data
             real_array = array[chunk_slice]
-            
-            # Convert to numpy array while preserving orientation
             real_array = np.asarray(real_array)
             
-            # Log the loaded shape
-            LOGGER.info(f"Loaded array with shape {real_array.shape}")
-            
-            # If shapes don't match in any dimension, we need to reorient
+            # Log what we got
+            LOGGER.info(f"Loaded chunk with shape: {real_array.shape}")
+
+            # For partial chunks, we need to ensure dimension ordering matches full chunks
             if real_array.shape != target_shape:
-                # Find the permutation needed to match target shape
+                # Create mapping of dimension sizes to their positions in the full array
+                size_to_dim = defaultdict(list)
+                for i, size in enumerate(array_dims):
+                    size_to_dim[size].append(i)
+
+                # For each dimension in our loaded chunk, find where it should go
+                # based on the full array's dimension ordering
                 current_shape = np.array(real_array.shape)
-                target_shape_arr = np.array(target_shape)
-                
-                # For each target dimension, find where that size currently is
                 permutation = []
-                used_dims = set()
-                
-                for target_size in target_shape_arr:
-                    matching_dims = np.where(current_shape == target_size)[0]
-                    available_dims = [d for d in matching_dims if d not in used_dims]
-                    
-                    if not available_dims:
-                        raise ValueError(
-                            f"Cannot match dimension size {target_size} "
-                            f"in current shape {current_shape}"
-                        )
-                    
-                    dim_to_use = available_dims[0]
-                    permutation.append(dim_to_use)
-                    used_dims.add(dim_to_use)
-                
+                used_source_dims = set()
+                used_target_dims = set()
+
+                # First, try to match dimensions exactly
+                for i, target_size in enumerate(target_shape):
+                    source_dims = np.where(current_shape == target_size)[0]
+                    available_dims = [
+                        d for d in source_dims 
+                        if d not in used_source_dims
+                    ]
+                    if available_dims:
+                        perm_idx = available_dims[0]
+                        permutation.append(perm_idx)
+                        used_source_dims.add(perm_idx)
+                        used_target_dims.add(i)
+
+                # For any remaining dimensions, match based on relative sizes
+                # This ensures partial chunks maintain the same orientation as full chunks
+                remaining_target_dims = [
+                    i for i in range(len(target_shape)) 
+                    if i not in used_target_dims
+                ]
+                remaining_source_dims = [
+                    i for i in range(len(current_shape)) 
+                    if i not in used_source_dims
+                ]
+
+                # Sort remaining dimensions by size to maintain relative ordering
+                remaining_target_dims.sort(
+                    key=lambda x: target_shape[x]
+                )
+                remaining_source_dims.sort(
+                    key=lambda x: current_shape[x]
+                )
+
+                # Add remaining dimensions to permutation
+                for target_dim, source_dim in zip(
+                    remaining_target_dims, remaining_source_dims
+                ):
+                    permutation.append(source_dim)
+
                 LOGGER.info(
-                    f"Reorienting array from shape {real_array.shape} "
-                    f"using permutation {permutation}"
+                    f"Reordering chunk from {real_array.shape} using permutation "
+                    f"{permutation} to match target shape {target_shape}"
                 )
-                
+
                 real_array = np.transpose(real_array, permutation)
-            
-            # Verify final shape
-            if real_array.shape != target_shape:
-                raise ValueError(
-                    f"Shape mismatch after loading: got {real_array.shape}, "
-                    f"expected {target_shape}"
-                )
-            
+
+                if real_array.shape != target_shape:
+                    raise ValueError(
+                        f"Shape mismatch after reordering: got {real_array.shape}, "
+                        f"expected {target_shape}"
+                    )
+
         except Exception as e:
             LOGGER.warning(f"Failed to load chunk: {str(e)}")
             retry += 1
+            if retry == num_retry:
+                raise ValueError(f"Failed to load chunk after {num_retry} attempts: {e}")
             continue
 
-        retry += 1
-
-    if real_array is None:
-        raise ValueError("Failed to load chunk")
-
-    LOGGER.info(
-        f"get_chunk complete: loaded shape {real_array.shape} "
-        f"in {(time.time() - start_time):.3f}s"
-    )
-    
+    LOGGER.info(f"get_chunk (end) : {(time.time() - start_time)}")
     return real_array
 
 

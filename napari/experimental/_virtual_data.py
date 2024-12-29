@@ -364,7 +364,7 @@ class VirtualData:
         key: Union[Index, Tuple[Index, ...], LayerDataProtocol], 
         value: np.ndarray
     ) -> LayerDataProtocol:
-        """Set data at the given offset with correct dimension handling.
+        """Set data at the given offset in the hyperslice.
         
         Parameters
         ----------
@@ -390,56 +390,12 @@ class VirtualData:
             LOGGER.warning("Attempted to set data in empty hyperslice region")
             return self.hyperslice[hyperslice_key]
 
-        # If shapes don't match, we need to fix the orientation
+        # Value dimensions should already be correctly ordered from get_chunk
         if value.shape != target_shape:
-            if sorted(value.shape) == sorted(target_shape):
-                # Get the dimensions in order
-                value_dims = np.array(value.shape)
-                target_dims = np.array(target_shape)
-                
-                # Create the permutation by finding where each target dimension
-                # currently is in the value array
-                permutation = []
-                for target_size in target_dims:
-                    matching_dims = np.where(value_dims == target_size)[0]
-                    if len(matching_dims) == 0:
-                        raise ValueError(
-                            f"Cannot find matching dimension for size {target_size}"
-                        )
-                    
-                    # Find first unused matching dimension
-                    dim_to_use = None
-                    for dim in matching_dims:
-                        if dim not in permutation:
-                            dim_to_use = dim
-                            break
-                    
-                    if dim_to_use is None:
-                        raise ValueError(
-                            f"Cannot find unused dimension for size {target_size}"
-                        )
-                    
-                    permutation.append(dim_to_use)
-                
-                LOGGER.info(
-                    f"Transposing value with shape {value.shape} using permutation "
-                    f"{permutation} to match target shape {target_shape}"
-                )
-                
-                # Apply the permutation
-                value = np.transpose(value, axes=permutation)
-                
-                # Verify the transformation worked
-                if value.shape != target_shape:
-                    raise ValueError(
-                        f"Shape mismatch after transposition: got {value.shape}, "
-                        f"expected {target_shape} (permutation {permutation})"
-                    )
-            else:
-                raise ValueError(
-                    f"Incompatible shapes: value shape {value.shape} cannot be "
-                    f"transposed to match target shape {target_shape}"
-                )
+            raise ValueError(
+                f"Shape mismatch: value shape {value.shape} does not match "
+                f"target shape {target_shape}"
+            )
 
         # Set the data
         self.hyperslice[hyperslice_key] = value
