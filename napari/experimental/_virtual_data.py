@@ -363,7 +363,7 @@ class VirtualData:
         key: Union[Index, Tuple[Index, ...], LayerDataProtocol], 
         value: np.ndarray
     ) -> LayerDataProtocol:
-        """Set data at the given offset in the hyperslice.
+        """Set data at the given offset with correct coordinate handling.
         
         Parameters
         ----------
@@ -389,53 +389,65 @@ class VirtualData:
             LOGGER.warning("Attempted to set data in empty hyperslice region")
             return self.hyperslice[hyperslice_key]
 
-        # If shapes don't match, we need to fix the orientation
+        # Handle shape mismatches by padding or cropping
         if value.shape != target_shape:
-            if sorted(value.shape) == sorted(target_shape):
-                # Get shape arrays
-                value_shape = np.array(value.shape)
-                target_shape_arr = np.array(target_shape)
-                
-                # Calculate permutation that will transform value_shape into target_shape
-                permutation = []
-                remaining_dims = set(range(len(value_shape)))
-                
-                # For each target dimension size, find the corresponding source dimension
-                for target_size in target_shape_arr:
-                    source_dims = [
-                        i for i in remaining_dims 
-                        if value_shape[i] == target_size
-                    ]
-                    
-                    if not source_dims:
-                        raise ValueError(
-                            f"Cannot find matching dimension for size {target_size}"
-                        )
-                    
-                    # Use the first matching dimension we find
-                    source_dim = source_dims[0]
-                    permutation.append(source_dim)
-                    remaining_dims.remove(source_dim)
-
-                LOGGER.info(
-                    f"Transposing value with shape {value.shape} using permutation "
-                    f"{permutation} to match target shape {target_shape}"
-                )
-
-                # Apply the permutation
-                value = np.transpose(value, axes=permutation)
-
-                # Verify the transformation worked
-                if value.shape != target_shape:
-                    raise ValueError(
-                        f"Shape mismatch after transposition: got {value.shape}, "
-                        f"expected {target_shape} (using permutation {permutation})"
-                    )
+            if all(v <= t for v, t in zip(value.shape, target_shape)):
+                # Pad if value is smaller
+                padded = np.zeros(target_shape, dtype=value.dtype)
+                slices = tuple(slice(0, s) for s in value.shape)
+                padded[slices] = value
+                value = padded
+            elif all(v >= t for v, t in zip(value.shape, target_shape)):
+                # Crop if value is larger
+                slices = tuple(slice(0, t) for t in target_shape)
+                value = value[slices]
             else:
-                raise ValueError(
-                    f"Incompatible shapes: value shape {value.shape} cannot be "
-                    f"transposed to match target shape {target_shape}"
-                )
+                # Need to transpose
+                if sorted(value.shape) == sorted(target_shape):
+                    # Find permutation by matching dimensions
+                    size_map = defaultdict(list)
+                    for i, s in enumerate(target_shape):
+                        size_map[s].append(i)
+                    
+                    permutation = []
+                    used_target_dims = set()
+                    
+                    for src_dim, size in enumerate(value.shape):
+                        available_dims = [
+                            d for d in size_map[size] 
+                            if d not in used_target_dims
+                        ]
+                        if not available_dims:
+                            raise ValueError(
+                                f"Cannot match dimensions for shapes {value.shape} "
+                                f"and {target_shape}"
+                            )
+                        target_dim = available_dims[0]
+                        used_target_dims.add(target_dim)
+                        permutation.append(src_dim)
+                    
+                    LOGGER.info(
+                        f"Transposing value with shape {value.shape} using permutation "
+                        f"{permutation} to match target shape {target_shape}"
+                    )
+                    
+                    value = np.transpose(value, axes=permutation)
+                    
+                    # Handle any remaining size mismatches
+                    if value.shape != target_shape:
+                        if all(v <= t for v, t in zip(value.shape, target_shape)):
+                            padded = np.zeros(target_shape, dtype=value.dtype)
+                            slices = tuple(slice(0, s) for s in value.shape)
+                            padded[slices] = value
+                            value = padded
+                        elif all(v >= t for v, t in zip(value.shape, target_shape)):
+                            slices = tuple(slice(0, t) for t in target_shape)
+                            value = value[slices]
+                else:
+                    raise ValueError(
+                        f"Incompatible shapes: value shape {value.shape} cannot be "
+                        f"made to match target shape {target_shape}"
+                    )
 
         # Set the data
         self.hyperslice[hyperslice_key] = value

@@ -35,7 +35,7 @@ def get_chunk(
     dtype=np.uint8,
     num_retry=3,
 ):
-    """Get a specified slice from an array with consistent dimension ordering.
+    """Get a specified slice from an array with correct coordinate handling.
 
     Parameters
     ----------
@@ -55,27 +55,43 @@ def get_chunk(
     """
     real_array = None
     retry = 0
-
     start_time = time.time()
 
+    # Ensure slices don't exceed array dimensions
+    bounded_slices = []
+    for sl, dim_size in zip(chunk_slice, array.shape):
+        start = min(sl.start if sl.start is not None else 0, dim_size)
+        stop = min(sl.stop if sl.stop is not None else dim_size, dim_size)
+        bounded_slices.append(slice(start, stop, sl.step))
+
     while real_array is None and retry < num_retry:
-        # Load data with original dimension order
         try:
-            real_array = array[chunk_slice]
+            # Load with bounded slices
+            real_array = array[tuple(bounded_slices)]
             real_array = np.asarray(real_array)
+            
+            # Log the actual vs requested shapes
+            requested_shape = tuple(sl.stop - sl.start for sl in chunk_slice)
+            LOGGER.info(
+                f"Chunk requested shape {requested_shape}, "
+                f"got shape {real_array.shape}"
+            )
+            
+            # If shapes don't match due to bounds, pad with zeros
+            if real_array.shape != requested_shape:
+                padded = np.zeros(requested_shape, dtype=real_array.dtype)
+                slices = tuple(slice(0, s) for s in real_array.shape)
+                padded[slices] = real_array
+                real_array = padded
+                
         except Exception as e:
             LOGGER.warning(f"Failed to load chunk: {str(e)}")
             retry += 1
             continue
 
-        LOGGER.info(
-            f"get_chunk loaded array with shape {real_array.shape} "
-            f"from slices {chunk_slice}"
-        )
         retry += 1
 
     if real_array is None:
-        LOGGER.error(f"Failed to load chunk after {num_retry} attempts")
         raise ValueError("Failed to load chunk")
 
     LOGGER.info(f"get_chunk (end) : {(time.time() - start_time)}")
@@ -179,7 +195,7 @@ def chunk_slices(
     array: Union[da.Array, np.ndarray], 
     interval: Optional[Iterable] = None
 ) -> List[List[slice]]:
-    """Create chunk slices with consistent dimension ordering.
+    """Create chunk slices with correct coordinate handling.
     
     Parameters
     ----------
@@ -196,48 +212,39 @@ def chunk_slices(
     if hasattr(array, 'array'):
         array = array.array
 
+    # Get chunk sizes
     if isinstance(array, da.Array):
-        # For Dask Arrays - maintain dimension order
-        start_pos = [np.cumsum(sizes) - sizes for sizes in array.chunks]
-        end_pos = [np.cumsum(sizes) for sizes in array.chunks]
+        chunks = array.chunks
     else:
-        # For Zarr Arrays - maintain dimension order
-        start_pos = []
-        end_pos = []
-        for dim in range(len(array.chunks)):
-            start_idx, stop_idx = 0, (array.shape[dim] + 1)
-            if interval is not None:
-                start_idx = (
-                    np.floor(interval[0, dim] / array.chunks[dim])
-                    * array.chunks[dim]
-                )
-                stop_idx = (
-                    np.ceil(interval[1, dim] / array.chunks[dim])
-                    * array.chunks[dim]
-                    + 1
-                )
-            cumuchunks = list(
-                range(int(start_idx), int(stop_idx), array.chunks[dim])
-            )
-            cumuchunks = np.array(cumuchunks)
-            start_pos += [cumuchunks[:-1]]
-            end_pos += [cumuchunks[1:]]
+        chunks = array.chunks
 
+    # Calculate intervals
     if interval is not None:
-        for dim in range(len(start_pos)):
-            first_idx = np.searchsorted(end_pos[dim], interval[0, dim])
-            last_idx = np.searchsorted(
-                start_pos[dim], interval[1, dim], side='right'
-            )
-            start_pos[dim] = start_pos[dim][first_idx:last_idx]
-            end_pos[dim] = end_pos[dim][first_idx:last_idx]
+        mins = interval[0]
+        maxs = interval[1]
+    else:
+        mins = np.zeros(len(array.shape), dtype=int)
+        maxs = np.array(array.shape)
 
-    # Generate slices maintaining dimension order
-    chunk_slices = [[] for _ in range(len(array.chunks))]
-    for dim in range(len(array.chunks)):
-        chunk_slices[dim] = [
-            slice(st, end) for st, end in zip(start_pos[dim], end_pos[dim])
-        ]
+    # Generate slices that align with chunk boundaries
+    chunk_slices = []
+    for dim, (chunk_size, min_val, max_val) in enumerate(zip(chunks, mins, maxs)):
+        if isinstance(chunk_size, tuple):
+            chunk_size = chunk_size[0]  # Take first chunk size if variable
+            
+        # Find chunk-aligned boundaries
+        start_chunk = min_val // chunk_size
+        end_chunk = (max_val + chunk_size - 1) // chunk_size
+        
+        # Generate slices
+        dim_slices = []
+        for i in range(int(start_chunk), int(end_chunk)):
+            slice_start = i * chunk_size
+            slice_end = min((i + 1) * chunk_size, array.shape[dim])
+            if slice_start < array.shape[dim]:
+                dim_slices.append(slice(slice_start, slice_end))
+                
+        chunk_slices.append(dim_slices)
 
     return chunk_slices
 
