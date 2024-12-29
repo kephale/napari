@@ -318,25 +318,23 @@ def render_sequence(
     corner_pixels : tuple
         ND coordinates of the topleft bottomright coordinates of the
         current view
-    full_shape : tuple
-        shape of highest resolution array
-    num_threads : int
-        number of threads for multithreaded fetching
+    camera : napari.components.Camera
+        Camera object for 3D view calculations
     visible_scales : list
         this is used to constrain the number of scales that are rendered
+    data : MultiScaleVirtualData
+        The multiscale data object
+    ndisplay : int
+        Number of displayed dimensions (2 or 3)
     """
-    # NOTE this corner_pixels means something else and should be renamed
-    # it is further limited to the visible data on the vispy canvas
-
     LOGGER.info(
-        f"render_sequence: inside with corner pixels {corner_pixels} with \
-        visible_scales {visible_scales}"
+        f"render_sequence: inside with corner pixels {corner_pixels} with "
+        f"visible_scales {visible_scales}"
     )
 
     if not visible_scales:
         visible_scales = []
 
-    # TODO 3D needs to change the view interval (e.g. zoom more at each scale)
     for scale in reversed(range(len(data.arrays))):
         if visible_scales[scale]:
             vdata = data._data[scale]
@@ -367,23 +365,19 @@ def render_sequence(
                 return
 
             LOGGER.info(
-                f"render_sequence: {scale}, {vdata.shape} fetching \
-                {len(chunk_queue)} chunks"
+                f"render_sequence: {scale}, {vdata.shape} fetching "
+                f"{len(chunk_queue)} chunks"
             )
 
-            # Fetch all chunks in priority order
             while chunk_queue:
                 priority, chunk_slice = heapq.heappop(chunk_queue)
 
-                # TODO consider 1-2 yields per chunk:
-                # - first for the target chunk
-                # - second for blanking out the lower resolution
-                #   (is this too wasteful?)
-
-                # TODO Transpose needed in 2D mandelbrot
-                # real_array = np.asarray(vdata.array[chunk_slice]).transpose()
-
-                real_array = np.asarray(vdata.array[chunk_slice]).transpose()
+                # Use get_chunk to ensure consistent dimension ordering
+                real_array = get_chunk(
+                    chunk_slice=chunk_slice,
+                    array=vdata.array,
+                    dtype=vdata.dtype
+                )
 
                 chunk_result = (
                     tuple(chunk_slice),
@@ -393,13 +387,11 @@ def render_sequence(
                 )
 
                 LOGGER.info(
-                    f"render_sequence: yielding chunk {chunk_slice} at scale {scale} which has priority\t{priority}"
+                    f"render_sequence: yielding chunk {chunk_slice} at scale "
+                    f"{scale} which has priority\t{priority}"
                 )
 
                 yield tuple(list(chunk_result) + [len(chunk_queue) == 0])
-
-                # TODO blank out lower resolution
-                # if lower resolution is visible, send zeros
 
             LOGGER.info(f"render_sequence: done fetching {scale}")
 
