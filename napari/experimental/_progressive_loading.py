@@ -35,7 +35,7 @@ def get_chunk(
     dtype=np.uint8,
     num_retry=3,
 ):
-    """Get a specified slice from an array with correct coordinate handling.
+    """Get a specified slice from an array with consistent orientation.
 
     Parameters
     ----------
@@ -51,39 +51,68 @@ def get_chunk(
     Returns
     -------
     real_array : ndarray
-        an ndarray of data sliced with chunk_slice
+        an ndarray of data sliced with chunk_slice with consistent orientation
     """
     real_array = None
     retry = 0
     start_time = time.time()
 
-    # Ensure slices don't exceed array dimensions
-    bounded_slices = []
-    for sl, dim_size in zip(chunk_slice, array.shape):
-        start = min(sl.start if sl.start is not None else 0, dim_size)
-        stop = min(sl.stop if sl.stop is not None else dim_size, dim_size)
-        bounded_slices.append(slice(start, stop, sl.step))
+    # Calculate target shape based on the slices
+    target_shape = tuple(
+        sl.stop - sl.start for sl in chunk_slice
+    )
+
+    LOGGER.info(f"Loading chunk with slices {chunk_slice}, expecting shape {target_shape}")
 
     while real_array is None and retry < num_retry:
         try:
-            # Load with bounded slices
-            real_array = array[tuple(bounded_slices)]
+            # Load the data - Note: NOT using transpose here
+            real_array = array[chunk_slice]
+            
+            # Convert to numpy array while preserving orientation
             real_array = np.asarray(real_array)
             
-            # Log the actual vs requested shapes
-            requested_shape = tuple(sl.stop - sl.start for sl in chunk_slice)
-            LOGGER.info(
-                f"Chunk requested shape {requested_shape}, "
-                f"got shape {real_array.shape}"
-            )
+            # Log the loaded shape
+            LOGGER.info(f"Loaded array with shape {real_array.shape}")
             
-            # If shapes don't match due to bounds, pad with zeros
-            if real_array.shape != requested_shape:
-                padded = np.zeros(requested_shape, dtype=real_array.dtype)
-                slices = tuple(slice(0, s) for s in real_array.shape)
-                padded[slices] = real_array
-                real_array = padded
+            # If shapes don't match in any dimension, we need to reorient
+            if real_array.shape != target_shape:
+                # Find the permutation needed to match target shape
+                current_shape = np.array(real_array.shape)
+                target_shape_arr = np.array(target_shape)
                 
+                # For each target dimension, find where that size currently is
+                permutation = []
+                used_dims = set()
+                
+                for target_size in target_shape_arr:
+                    matching_dims = np.where(current_shape == target_size)[0]
+                    available_dims = [d for d in matching_dims if d not in used_dims]
+                    
+                    if not available_dims:
+                        raise ValueError(
+                            f"Cannot match dimension size {target_size} "
+                            f"in current shape {current_shape}"
+                        )
+                    
+                    dim_to_use = available_dims[0]
+                    permutation.append(dim_to_use)
+                    used_dims.add(dim_to_use)
+                
+                LOGGER.info(
+                    f"Reorienting array from shape {real_array.shape} "
+                    f"using permutation {permutation}"
+                )
+                
+                real_array = np.transpose(real_array, permutation)
+            
+            # Verify final shape
+            if real_array.shape != target_shape:
+                raise ValueError(
+                    f"Shape mismatch after loading: got {real_array.shape}, "
+                    f"expected {target_shape}"
+                )
+            
         except Exception as e:
             LOGGER.warning(f"Failed to load chunk: {str(e)}")
             retry += 1
@@ -94,7 +123,11 @@ def get_chunk(
     if real_array is None:
         raise ValueError("Failed to load chunk")
 
-    LOGGER.info(f"get_chunk (end) : {(time.time() - start_time)}")
+    LOGGER.info(
+        f"get_chunk complete: loaded shape {real_array.shape} "
+        f"in {(time.time() - start_time):.3f}s"
+    )
+    
     return real_array
 
 
