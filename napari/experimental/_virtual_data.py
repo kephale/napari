@@ -4,6 +4,7 @@ from typing import Tuple, Union
 
 import dask.array as da
 import numpy as np
+from collections import defaultdict
 
 from napari.layers._data_protocols import Index, LayerDataProtocol
 
