@@ -60,16 +60,25 @@ def get_chunk(
 
     while real_array is None and retry < num_retry:
         # Load data with original dimension order
-        real_array = array[chunk_slice]
-        
-        # Convert to numpy array but maintain dimension order
-        real_array = np.asarray(real_array)
-        
+        try:
+            real_array = array[chunk_slice]
+            real_array = np.asarray(real_array)
+        except Exception as e:
+            LOGGER.warning(f"Failed to load chunk: {str(e)}")
+            retry += 1
+            continue
+
+        LOGGER.info(
+            f"get_chunk loaded array with shape {real_array.shape} "
+            f"from slices {chunk_slice}"
+        )
         retry += 1
 
-    LOGGER.info(f"get_chunk (end) : {(time.time() - start_time)}")
-    LOGGER.info(f"get_chunk shape: {real_array.shape}")
+    if real_array is None:
+        LOGGER.error(f"Failed to load chunk after {num_retry} attempts")
+        raise ValueError("Failed to load chunk")
 
+    LOGGER.info(f"get_chunk (end) : {(time.time() - start_time)}")
     return real_array
 
 
