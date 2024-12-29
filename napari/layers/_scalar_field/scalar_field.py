@@ -615,10 +615,11 @@ class ScalarFieldBase(Layer, ABC):
         """
         if start_point is None or end_point is None:
             return None
+
         if len(dims_displayed) == 3:
             # only use get_value_ray on 3D for now
             # we use dims_displayed because the image slice
-            # has its dimensions  in th same order as the vispy
+            # has its dimensions in th same order as the vispy
             # Volume
             # Account for downsampling in the case of multiscale
             # -1 means lowest resolution here.
@@ -632,26 +633,37 @@ class ScalarFieldBase(Layer, ABC):
             )
             start_point = cast(np.ndarray, start_point)
             end_point = cast(np.ndarray, end_point)
+
             sample_ray = end_point - start_point
             length_sample_vector = np.linalg.norm(sample_ray)
             n_points = int(2 * length_sample_vector)
             sample_points = np.linspace(
                 start_point, end_point, n_points, endpoint=True
             )
+
             im_slice = self._slice.image.raw
+            
             # ensure the bounding box is for the proper multiscale level
             bounding_box = self._display_bounding_box_at_level(
                 dims_displayed, self.data_level
             )
-            # the display bounding box is returned as a closed interval
-            # (i.e. the endpoint is included) by the method, but we need
-            # open intervals in the code that follows, so we add 1.
-            bounding_box[:, 1] += 1
+            
+            # Subtract 1 from the upper bounds to account for _calculate_value_from_ray
+            # extending by 1, and to prevent out-of-bounds access
+            bounding_box[:, 1] = np.minimum(
+                bounding_box[:, 1],
+                np.array(im_slice.shape) - 1
+            )
 
             clamped = clamp_point_to_bounding_box(
                 sample_points,
                 bounding_box,
             ).astype(int)
+            
+            # Additional safety check to ensure we don't access out of bounds
+            for dim in range(clamped.shape[1]):
+                np.clip(clamped[:, dim], 0, im_slice.shape[dim] - 1, out=clamped[:, dim])
+                
             values = im_slice[tuple(clamped.T)]
             return self._calculate_value_from_ray(values)
 
