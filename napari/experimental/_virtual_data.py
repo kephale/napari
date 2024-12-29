@@ -391,37 +391,45 @@ class VirtualData:
 
         # If shapes don't match, we need to fix the orientation
         if value.shape != target_shape:
-            # First check if it's just a dimension ordering issue
             if sorted(value.shape) == sorted(target_shape):
-                # Find the correct permutation to match target shape
-                current_order = np.array(value.shape)
-                target_order = np.array(target_shape)
+                # Find corresponding dimensions by size
+                value_sizes = np.array(value.shape)
+                target_sizes = np.array(target_shape)
                 
-                # For each target dimension, find where that size exists in current shape
+                # Create size-to-dimension mappings
+                size_to_dim = {}
+                for dim, size in enumerate(target_sizes):
+                    if size not in size_to_dim:
+                        size_to_dim[size] = []
+                    size_to_dim[size].append(dim)
+                
+                # Build permutation by matching dimensions of same size in order
                 permutation = []
-                for target_size in target_order:
-                    # Find all axes with this size
-                    possible_axes = np.where(current_order == target_size)[0]
-                    
-                    # If we've already used some axes, exclude them
-                    available_axes = [ax for ax in possible_axes if ax not in permutation]
-                    
-                    if not available_axes:
+                used_target_dims = set()
+                
+                for src_dim, size in enumerate(value_sizes):
+                    available_dims = [
+                        d for d in size_to_dim[size] 
+                        if d not in used_target_dims
+                    ]
+                    if not available_dims:
                         raise ValueError(
-                            f"Cannot determine correct dimension ordering: "
-                            f"value shape {value.shape}, target shape {target_shape}"
+                            f"Cannot match dimensions for shapes {value.shape} "
+                            f"and {target_shape}"
                         )
-                        
-                    # Take the first available axis with matching size
-                    permutation.append(available_axes[0])
+                    target_dim = min(available_dims)
+                    used_target_dims.add(target_dim)
+                    permutation.append(src_dim)
 
                 LOGGER.info(
                     f"Transposing value with shape {value.shape} using permutation "
                     f"{permutation} to match target shape {target_shape}"
                 )
+
+                # Apply the permutation
                 value = np.transpose(value, axes=permutation)
-                
-                # Validate the transformation worked
+
+                # Verify the result
                 if value.shape != target_shape:
                     raise ValueError(
                         f"Shape mismatch after transposition: got {value.shape}, "

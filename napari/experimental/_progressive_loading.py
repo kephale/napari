@@ -35,7 +35,7 @@ def get_chunk(
     dtype=np.uint8,
     num_retry=3,
 ):
-    """Get a specified slice from an array (uses a cache).
+    """Get a specified slice from an array with consistent dimension ordering.
 
     Parameters
     ----------
@@ -43,12 +43,10 @@ def get_chunk(
         a slice in array space
     array : ndarray
         one of the scales from the multiscale image
-    container: str
-        the zarr container name (this is used to disambiguate the cache)
-    dataset: str
-        the group in the zarr (this is used to disambiguate the cache)
-    chunk_size: tuple
-        the size of chunk that you want to fetch
+    dtype : numpy.dtype
+        The data type of the array
+    num_retry : int
+        Number of retries if chunk loading fails
 
     Returns
     -------
@@ -61,11 +59,16 @@ def get_chunk(
     start_time = time.time()
 
     while real_array is None and retry < num_retry:
-        real_array = np.asarray(array[chunk_slice]).transpose()
-
+        # Load data with original dimension order
+        real_array = array[chunk_slice]
+        
+        # Convert to numpy array but maintain dimension order
+        real_array = np.asarray(real_array)
+        
         retry += 1
 
     LOGGER.info(f"get_chunk (end) : {(time.time() - start_time)}")
+    LOGGER.info(f"get_chunk shape: {real_array.shape}")
 
     return real_array
 
@@ -164,17 +167,32 @@ def chunk_centers(array: da.Array, ndim=3):
 
 
 def chunk_slices(
-    array: Union[da.Array, np.ndarray], interval: Optional[Iterable] = None
+    array: Union[da.Array, np.ndarray], 
+    interval: Optional[Iterable] = None
 ) -> List[List[slice]]:
-    array = array.array
-    """Create a list of slice objects for each chunk for each dimension."""
+    """Create chunk slices with consistent dimension ordering.
+    
+    Parameters
+    ----------
+    array : Union[da.Array, np.ndarray]
+        The input array
+    interval : Optional[Iterable]
+        Optional interval to constrain chunk generation
+        
+    Returns
+    -------
+    List[List[slice]]
+        List of chunk slices for each dimension
+    """
+    if hasattr(array, 'array'):
+        array = array.array
+
     if isinstance(array, da.Array):
-        # For Dask Arrays
+        # For Dask Arrays - maintain dimension order
         start_pos = [np.cumsum(sizes) - sizes for sizes in array.chunks]
         end_pos = [np.cumsum(sizes) for sizes in array.chunks]
-
     else:
-        # For Zarr Arrays
+        # For Zarr Arrays - maintain dimension order
         start_pos = []
         end_pos = []
         for dim in range(len(array.chunks)):
@@ -205,6 +223,7 @@ def chunk_slices(
             start_pos[dim] = start_pos[dim][first_idx:last_idx]
             end_pos[dim] = end_pos[dim][first_idx:last_idx]
 
+    # Generate slices maintaining dimension order
     chunk_slices = [[] for _ in range(len(array.chunks))]
     for dim in range(len(array.chunks)):
         chunk_slices[dim] = [
