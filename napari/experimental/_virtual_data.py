@@ -327,53 +327,114 @@ class VirtualData:
         return self.hyperslice[key]
 
     def get_offset(
-        self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol]
+        self,
+        key: Union[Index, Tuple[Index, ...], LayerDataProtocol]
     ) -> LayerDataProtocol:
-        """Return item from array.
-
-        key is in data coordinates.
+        """Return item from array in data coordinates.
+        
+        Parameters
+        ----------
+        key : Union[Index, Tuple[Index, ...], LayerDataProtocol]
+            The key to retrieve data from, in data coordinates
+            
+        Returns
+        -------
+        LayerDataProtocol
+            The retrieved data
         """
         hyperslice_key = self._hyperslice_key(key)
         try:
-            return self.hyperslice[
-                hyperslice_key
-            ]  # Using square bracket notation
+            return self.hyperslice[hyperslice_key]
         except Exception:
-            # if it isn't a slice it is an int so width=1
+            # If it isn't a slice it is an int so width=1
             shape = tuple(
                 [
                     (1 if sl.start is None else sl.stop - sl.start)
-                    if type(sl) is slice
+                    if isinstance(sl, slice)
                     else 1
                     for sl in key
                 ]
             )
-            LOGGER.info(f"get_offset failed {key}")
-            return np.zeros(shape)
+            LOGGER.info(f"get_offset failed for key {key}, returning zeros")
+            return np.zeros(shape, dtype=self.dtype)
 
     def set_offset(
-        self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol], value
+        self, 
+        key: Union[Index, Tuple[Index, ...], LayerDataProtocol], 
+        value: np.ndarray
     ) -> LayerDataProtocol:
-        """Return self[key]."""
+        """Set data at the given offset in the hyperslice.
+        
+        Parameters
+        ----------
+        key : Union[Index, Tuple[Index, ...], LayerDataProtocol]
+            The key/index where to set the data, in data coordinates
+        value : np.ndarray
+            The data to set at the given location
+            
+        Returns
+        -------
+        LayerDataProtocol
+            The data that was set
+        """
         hyperslice_key = self._hyperslice_key(key)
+        target_shape = self.hyperslice[hyperslice_key].shape
+        
         LOGGER.info(
-            f"hyperslice_key {hyperslice_key} hyperslice shape {self.hyperslice.shape}"
-        )
-        LOGGER.info(
-            f"set_offset: {hyperslice_key} hyperslice shape: \
-            {self.hyperslice[hyperslice_key].shape} value shape: {value.shape} "
+            f"set_offset: {hyperslice_key} hyperslice shape: {target_shape} "
+            f"value shape: {value.shape}"
         )
 
-        # TODO hack for malformed data
-        if not np.all(
-            np.array(value.shape)
-            == np.array(self.hyperslice[hyperslice_key].shape)
-        ):
-            # Transpose value to match the expected shape
-            value = np.transpose(value, axes=(2, 1, 0))
+        if self.hyperslice[hyperslice_key].size == 0:
+            LOGGER.warning("Attempted to set data in empty hyperslice region")
+            return self.hyperslice[hyperslice_key]
 
-        if self.hyperslice[hyperslice_key].size > 0:
-            self.hyperslice[hyperslice_key] = value
+        # If shapes don't match, we need to fix the orientation
+        if value.shape != target_shape:
+            # First check if it's just a dimension ordering issue
+            if sorted(value.shape) == sorted(target_shape):
+                # Find the correct permutation to match target shape
+                current_order = np.array(value.shape)
+                target_order = np.array(target_shape)
+                
+                # For each target dimension, find where that size exists in current shape
+                permutation = []
+                for target_size in target_order:
+                    # Find all axes with this size
+                    possible_axes = np.where(current_order == target_size)[0]
+                    
+                    # If we've already used some axes, exclude them
+                    available_axes = [ax for ax in possible_axes if ax not in permutation]
+                    
+                    if not available_axes:
+                        raise ValueError(
+                            f"Cannot determine correct dimension ordering: "
+                            f"value shape {value.shape}, target shape {target_shape}"
+                        )
+                        
+                    # Take the first available axis with matching size
+                    permutation.append(available_axes[0])
+
+                LOGGER.info(
+                    f"Transposing value with shape {value.shape} using permutation "
+                    f"{permutation} to match target shape {target_shape}"
+                )
+                value = np.transpose(value, axes=permutation)
+                
+                # Validate the transformation worked
+                if value.shape != target_shape:
+                    raise ValueError(
+                        f"Shape mismatch after transposition: got {value.shape}, "
+                        f"expected {target_shape}"
+                    )
+            else:
+                raise ValueError(
+                    f"Incompatible shapes: value shape {value.shape} cannot be "
+                    f"transposed to match target shape {target_shape}"
+                )
+
+        # Set the data
+        self.hyperslice[hyperslice_key] = value
         return self.hyperslice[hyperslice_key]
 
     @property
