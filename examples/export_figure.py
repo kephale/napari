@@ -5,7 +5,7 @@ Export Figure
 Display a variety of layer types in the napari viewer and export the figure with `viewer.export_figure()`.
 The exported figure is then added back as an image layer.
 
-Exported figures include the extent of all data in 2D view, and does not presently work for 3D views.
+Exported figures include the extent of all data in 2D or 3D view.
 To capture the extent of the canvas, instead of the layers, see `viewer.screenshot()`: :ref:`sphx_glr_gallery_to_screenshot.py` and :ref:`sphx_glr_gallery_screenshot_and_export_figure.py`.
 
 .. tags:: visualization-advanced
@@ -101,16 +101,13 @@ viewer.scale_bar.length = 250
 # are not in the exported figure.
 viewer.theme = "light"
 # Optionally for saving the exported figure: viewer.export_figure(path="export_figure.png")
-export_figure = viewer.export_figure(flash=False) # bug: default flash=True causes the canvas to be grayscale in docs
-scaled_export_figure = viewer.export_figure(scale_factor=5, flash=False)
+export_figure = viewer.export_figure()
+scaled_export_figure = viewer.export_figure(scale_factor=5)
 viewer.theme = "dark"
 
 viewer.add_image(export_figure, rgb=True, name='exported_figure')
 viewer.add_image(scaled_export_figure, rgb=True, name='scaled_exported_figure')
 viewer.reset_view()
-
-# from skimage.io import imsave
-# imsave('screenshot.png', screenshot)
 
 if __name__ == '__main__':
     napari.run()
