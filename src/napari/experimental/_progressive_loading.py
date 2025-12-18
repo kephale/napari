@@ -679,7 +679,7 @@ def initialize_multiscale_virtual_data(img, viewer, ndisplay):
 
     # Get initial extent for rendering
     canvas_corners = (
-        viewer.window._qt_viewer.canvas._canvas_corners_in_world.copy()
+        viewer.window._qt_viewer.canvas._viewbox_corners_in_world.copy()
     )
     canvas_corners[canvas_corners < 0] = 0
     canvas_corners = canvas_corners.astype(np.int64)
