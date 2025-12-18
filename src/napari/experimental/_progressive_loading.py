@@ -678,20 +678,29 @@ def initialize_multiscale_virtual_data(img, viewer, ndisplay):
     max_size = get_max_texture_sizes()[ndisplay - 2]
 
     # Get initial extent for rendering
-    canvas_corners = (
-        viewer.window._qt_viewer.canvas._viewbox_corners_in_world.copy()
-    )
-    canvas_corners[canvas_corners < 0] = 0
-    canvas_corners = canvas_corners.astype(np.int64)
-
-    top_left = canvas_corners[0, :]
-    bottom_right = canvas_corners[1, :]
-
-    if np.any(bottom_right < top_left):
-        LOGGER.warning(
-            f"Issue with bottom_right values detected, returning early. top_left {top_left} and bottom_right {bottom_right}"
+    try:
+        canvas_corners = (
+            viewer.window._qt_viewer.canvas._viewbox_corners_in_world.copy()
         )
-        return None
+        canvas_corners[canvas_corners < 0] = 0
+        canvas_corners = canvas_corners.astype(np.int64)
+
+        top_left = canvas_corners[0, :]
+        bottom_right = canvas_corners[1, :]
+    except (AttributeError, IndexError) as e:
+        LOGGER.warning(f"Could not get canvas corners, using data shape: {e}")
+        # Fallback to using the data shape
+        top_left = np.zeros(ndisplay, dtype=np.int64)
+        bottom_right = np.array(img[0].shape[-ndisplay:], dtype=np.int64)
+
+    if np.any(bottom_right <= top_left):
+        LOGGER.error(
+            f"Invalid viewbox dimensions detected. top_left={top_left}, bottom_right={bottom_right}. "
+            f"This may indicate the viewer is not yet fully initialized. Using data shape as fallback."
+        )
+        # Use data shape as ultimate fallback
+        top_left = np.zeros(ndisplay, dtype=np.int64)
+        bottom_right = np.array(img[0].shape[-ndisplay:], dtype=np.int64)
 
     if max_size is not None:
         # Bound the interval with the maximum texture size
@@ -737,6 +746,11 @@ def add_progressive_loading_image(
 
     # Call the helper function to initialize MultiScaleVirtualData
     multiscale_data = initialize_multiscale_virtual_data(img, viewer, ndisplay)
+    
+    if multiscale_data is None:
+        LOGGER.error("Failed to initialize MultiScaleVirtualData")
+        return None
+    
     LOGGER.info(f"Adding MultiscaleData with shape: {multiscale_data.shape}")
 
     # TODO yikes!
