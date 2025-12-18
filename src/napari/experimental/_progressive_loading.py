@@ -562,7 +562,7 @@ def progressively_update_layer(invar, viewer, data=None, ndisplay=None):
         visible_scales[scale] = should_render_scale(
             scale, viewer, min_scale, max_scale
         )
-        layer.visible = visible_scales[scale]
+        layer.visible = bool(visible_scales[scale])
         layer.opacity = 0.9
 
         LOGGER.info(
