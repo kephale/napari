@@ -476,8 +476,10 @@ class ProgressiveLoader:
         # make progress updates reentrancy-safe (see _advance_progress)
         self._pbar_pending = 0
         self._pbar_flushing = False
+        self._pbar_last_flush = 0.0
         self._resident_pbar_pending = 0
         self._resident_pbar_flushing = False
+        self._resident_pbar_last_flush = 0.0
         self._backdrop_pending = False
 
         self._resident_worker = None
@@ -1048,10 +1050,17 @@ class ProgressiveLoader:
         level per pending chunk until ``RecursionError``. Nested calls
         here only increment a counter; the outermost call flushes it.
         """
+        # each Qt progress update repaints the UI (processEvents), so
+        # flush at most ~5x per second
+        now = time.monotonic()
         if resident:
             self._resident_pbar_pending += 1
-            if self._resident_pbar_flushing:
+            if (
+                self._resident_pbar_flushing
+                or now - self._resident_pbar_last_flush < 0.2
+            ):
                 return
+            self._resident_pbar_last_flush = now
             self._resident_pbar_flushing = True
             try:
                 while self._resident_pbar_pending:
@@ -1064,8 +1073,9 @@ class ProgressiveLoader:
                 self._resident_pbar_flushing = False
         else:
             self._pbar_pending += 1
-            if self._pbar_flushing:
+            if self._pbar_flushing or now - self._pbar_last_flush < 0.2:
                 return
+            self._pbar_last_flush = now
             self._pbar_flushing = True
             try:
                 while self._pbar_pending:
@@ -1385,6 +1395,10 @@ def add_progressive_loading_image(
         data.dtype, interval_max_bytes
     )
     viewer.layers.append(layer)
+    # Slice off the main thread: each chunk-driven refresh materializes
+    # the visible tile, which would otherwise block the UI. VirtualData
+    # access is lock-guarded, so concurrent slicing is safe.
+    viewer._layer_slicer._force_sync = False
     loader = ProgressiveLoader(
         viewer,
         layer,
