@@ -493,6 +493,13 @@ class ProgressiveLoader:
         tile GPU upload at its boundaries, which blocks the GUI roughly
         in proportion to this size; raise it on fast GPUs for larger
         high-resolution tiles.
+    gpu_upload_interval_s : float
+        Texture updates queued by vispy execute inside whatever draw
+        happens next — including interaction draws — so uploads are
+        accumulated and pushed to the GPU in beats at this interval.
+        Frames between beats carry no pending GL transfers. Raise this
+        on slow GL drivers (e.g. macOS) for smoother interaction at the
+        cost of chunkier visual updates.
     """
 
     def __init__(
@@ -511,6 +518,7 @@ class ProgressiveLoader:
         max_chunks_per_pass: int = DEFAULT_MAX_CHUNKS_PER_PASS,
         texture_patching: bool = True,
         tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
+        gpu_upload_interval_s: float = 0.25,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -524,6 +532,9 @@ class ProgressiveLoader:
         self._texture_patches = 0
         self._pass_all_patched = False
         self._needs_final_reconcile = False
+        self._gpu_upload_interval_s = float(gpu_upload_interval_s)
+        self._pending_blocks: list = []
+        self._last_upload = 0.0
         self._last_node_update = 0.0
         if fetch_workers is None:
             # leave cores for the GUI event loop: saturating every core
@@ -1221,6 +1232,7 @@ class ProgressiveLoader:
             self._worker.quit()
             self._worker = None
         self._active = None
+        self._pending_blocks = []
         self._close_progress(self._pbar)
         self._pbar = None
         self._pbar_pending = 0
@@ -1240,11 +1252,32 @@ class ProgressiveLoader:
             self._close_progress(self._pbar)
             self._pbar = None
         # While the pass is streaming, patched chunks keep the GPU texture
-        # identical to what a pipeline refresh would produce: each batch
-        # is one coalesced partial upload, and the only full re-slice +
+        # identical to what a pipeline refresh would produce. Uploads are
+        # paced: blocks accumulate and are pushed to the GPU in beats
+        # (gpu_upload_interval_s), so interaction frames between beats
+        # execute no pending GL transfers. The only full re-slice +
         # re-upload runs once per pass — at its start (backdrop) and,
-        # deferred to idle, after its end. Mid-pass full uploads were the
-        # main remaining UI stalls on slow GL drivers.
+        # deferred to idle, after its end.
+        now = time.monotonic()
+        if self._texture_patching and block is not None:
+            self._pending_blocks.append(block)
+            if final or now - self._last_upload >= self._gpu_upload_interval_s:
+                if not self._flush_pending_blocks(vdata):
+                    self._pass_all_patched = False
+                    self._refresh(final=final)
+                    return
+            if final:
+                if self._pass_all_patched:
+                    # The texture already shows every chunk. Defer the
+                    # full consistency refresh (thumbnail, slice state)
+                    # to the next interaction, where it folds into the
+                    # pass-start refresh instead of stalling the moment
+                    # loading ends.
+                    self._needs_final_reconcile = True
+                else:
+                    self._refresh(final=True)
+            return
+        # unpacked path (2D, or patching disabled/failed earlier)
         patched = self._texture_patching and self._patch_texture_batch(
             vdata, batch, block=block
         )
@@ -1252,14 +1285,9 @@ class ProgressiveLoader:
             self._pass_all_patched = False
             self._refresh(final=final)
             return
-        now = time.monotonic()
         if final:
             self._update_node()
             if self._pass_all_patched:
-                # The texture already shows every chunk. Defer the full
-                # consistency refresh (thumbnail, slice state) to the
-                # next interaction, where it folds into the pass-start
-                # refresh instead of stalling the moment loading ends.
                 self._needs_final_reconcile = True
             else:
                 self._refresh(final=True)
@@ -1268,6 +1296,17 @@ class ProgressiveLoader:
         ):
             self._last_node_update = now
             self._update_node()
+
+    def _flush_pending_blocks(self, vdata: VirtualData) -> bool:
+        """Push accumulated upload blocks to the GPU and redraw once."""
+        self._last_upload = time.monotonic()
+        blocks, self._pending_blocks = self._pending_blocks, []
+        for low, high, data in blocks:
+            if not self._patch_texture_region(vdata, low, high, block=data):
+                return False
+        if blocks:
+            self._update_node()
+        return True
 
     def _on_fetch_finished(self, generation: int) -> None:
         if generation != self._generation or self._closed:
@@ -1609,6 +1648,7 @@ def add_progressive_loading_image(
     max_pixel_size_3d: float = 2.0,
     interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
     tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
+    gpu_upload_interval_s: float = 0.25,
     **layer_kwargs,
 ):
     """Add a progressively loading multiscale image to a viewer.
@@ -1650,6 +1690,10 @@ def add_progressive_loading_image(
         Upper bound for a 3D sub-volume tile; bounds the cost of the
         full-tile GPU uploads at pass boundaries (roughly
         size / 125 MB/s of GUI blocking on slow GL drivers).
+    gpu_upload_interval_s : float
+        Interval between GPU upload beats while streaming; interaction
+        frames between beats carry no pending GL transfers. Raise on
+        slow GL drivers (macOS) for smoother interaction.
     **layer_kwargs
         Additional keyword arguments passed to ``viewer.add_image``.
 
@@ -1725,6 +1769,7 @@ def add_progressive_loading_image(
         max_pixel_size_3d=max_pixel_size_3d,
         interval_max_bytes=interval_max_bytes,
         tile_max_bytes_3d=tile_max_bytes_3d,
+        gpu_upload_interval_s=gpu_upload_interval_s,
     )
     layer.metadata['progressive_loader'] = loader
     with contextlib.suppress(AttributeError):
