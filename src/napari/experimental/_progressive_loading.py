@@ -1717,6 +1717,13 @@ def add_progressive_loading_image(
 
     get_settings().experimental.async_ = True
     viewer._layer_slicer._force_sync = False
+    # Meter GLIR 3D texture uploads: without this, vispy drains every
+    # queued glTexSubImage3D inside the next draw — including interaction
+    # frames — which stalls the GUI for seconds on slow GL drivers
+    # (macOS GL-over-Metal). Disable with NAPARI_GLIR_METERING=0.
+    from napari.experimental import _glir_metering
+
+    _glir_metering.install()
     loader = ProgressiveLoader(
         viewer,
         layer,
