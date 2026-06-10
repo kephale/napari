@@ -454,7 +454,6 @@ class ProgressiveLoader:
         self._texture_patching = texture_patching
         self._texture_patches = 0
         self._last_node_update = 0.0
-        self._last_reconcile = 0.0
         if fetch_workers is None:
             # leave cores for the GUI event loop: saturating every core
             # with chunk fetches makes the UI unresponsive on CPU-bound
@@ -1122,9 +1121,13 @@ class ProgressiveLoader:
             self._close_progress(self._pbar)
             self._pbar = None
         now = time.monotonic()
-        reconcile = final or now - self._last_reconcile > 2.0
+        # While the pass is streaming, patched chunks keep the GPU texture
+        # identical to what a pipeline refresh would produce, so the only
+        # full re-slice + re-upload happens once at the end of the pass
+        # (and at its start, for the backdrop). Mid-pass full uploads were
+        # the main remaining UI stalls on slow GL drivers.
         if (
-            not reconcile
+            not final
             and self._texture_patching
             and self._patch_texture(vdata, chunk_key)
         ):
@@ -1135,7 +1138,6 @@ class ProgressiveLoader:
                 self._last_node_update = now
                 self._update_node()
             return
-        self._last_reconcile = now
         self._refresh(final=final)
 
     def _on_fetch_finished(self, generation: int) -> None:
@@ -1208,9 +1210,7 @@ class ProgressiveLoader:
             with vdata.lock:
                 sub = np.ascontiguousarray(vdata.hyperslice[source])
             texture.set_data(sub, offset=offset)
-        except (
-            Exception
-        ):  # pragma: no cover - dtype/driver mismatch  # noqa: BLE001
+        except Exception:  # noqa: BLE001 # pragma: no cover - GL mismatch
             return False
         self._texture_patches += 1
         return True
