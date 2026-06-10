@@ -1,263 +1,212 @@
 import dask.array as da
 import numpy as np
 import pytest
-from numpy.testing import (
-    assert_array_almost_equal,
-)
 
-import napari
-from napari.experimental import _progressive_loading
 from napari.experimental._progressive_loading import (
+    ProgressiveLoader,
     add_progressive_loading_image,
-    chunk_centers,
+    chunk_priority_2D,
+    chunk_priority_3D,
     chunk_slices,
-    distance_from_camera_center_line,
-    get_chunk,
-    visual_depth,
 )
-from napari.experimental._progressive_loading_datasets import (
-    mandelbrot_dataset,
-)
+from napari.experimental._virtual_data import VirtualData
 
 
 @pytest.fixture
-def max_level():
-    return 8
-
-
-@pytest.fixture
-def chunked_array():
-    return da.random.rand(20, 20, chunks=(10, 10))
-
-
-@pytest.fixture
-def mandelbrot_arrays(max_level):
-    large_image = mandelbrot_dataset(max_levels=max_level)
-    multiscale_img = large_image['arrays']
-    return multiscale_img
-
-
-@pytest.mark.filterwarnings('ignore::FutureWarning')
-def test_add_progressive_loading_image(mandelbrot_arrays):
-    viewer = napari.Viewer()
-    # pytest.warns()
-    add_progressive_loading_image(mandelbrot_arrays, viewer=viewer)
-
-
-@pytest.mark.filterwarnings('ignore::FutureWarning')
-def test_add_progressive_loading_image_zoom_in(mandelbrot_arrays):
-    viewer = napari.Viewer()
-    viewer.camera.zoom = 0.0001
-    add_progressive_loading_image(mandelbrot_arrays, viewer=viewer)
-    viewer.camera.zoom = 0.001  # only fails if we change visible scales
-
-
-@pytest.mark.filterwarnings('ignore::FutureWarning')
-def test_add_progressive_loading_image_zoom_out(mandelbrot_arrays):
-    viewer = napari.Viewer()
-    viewer.camera.zoom = 0.001
-    add_progressive_loading_image(mandelbrot_arrays, viewer=viewer)
-    viewer.camera.zoom = 0.0001  # only fails if we change visible scales
-
-
-def test_chunk_slices_0_1024(mandelbrot_arrays, max_level):
-    scale = max_level - 1
-    vdata = _progressive_loading.VirtualData(
-        mandelbrot_arrays[scale], scale=scale
+def multiscale_arrays():
+    """A small in-memory multiscale pyramid backed by dask."""
+    base = np.random.default_rng(0).integers(
+        1, 255, size=(256, 256), dtype=np.uint8
     )
-    data_interval = np.array([[0, 0], [1024, 1024]])
-    chunk_keys = _progressive_loading.chunk_slices(
-        vdata, interval=data_interval
+    levels = [base, base[::2, ::2].copy(), base[::4, ::4].copy()]
+    return [da.from_array(level, chunks=(32, 32)) for level in levels]
+
+
+# ---------- chunk geometry ----------
+
+
+def test_chunk_slices_full(multiscale_arrays):
+    vdata = VirtualData(multiscale_arrays[0])
+    slices = chunk_slices(vdata)
+    assert len(slices) == 2
+    assert len(slices[0]) == 256 // 32
+    assert slices[0][0] == slice(0, 32)
+    assert slices[0][-1] == slice(224, 256)
+
+
+def test_chunk_slices_interval(multiscale_arrays):
+    vdata = VirtualData(multiscale_arrays[0])
+    interval = ((40, 0), (100, 32))
+    slices = chunk_slices(vdata, interval=interval)
+    assert slices[0] == [slice(32, 64), slice(64, 96), slice(96, 128)]
+    assert slices[1] == [slice(0, 32)]
+
+
+def test_chunk_slices_accepts_raw_arrays(multiscale_arrays):
+    slices = chunk_slices(multiscale_arrays[1])
+    assert len(slices[0]) == 128 // 32
+
+
+def test_chunk_priority_2d_center_first(multiscale_arrays):
+    vdata = VirtualData(multiscale_arrays[0])
+    keys = chunk_slices(vdata)
+    queue = chunk_priority_2D(keys, (0, 0), (256, 256))
+    assert len(queue) == 64
+    first_center = np.array([(sl.start + sl.stop) / 2 for sl in queue[0]])
+    last_center = np.array([(sl.start + sl.stop) / 2 for sl in queue[-1]])
+    view_center = np.array([128, 128])
+    assert np.linalg.norm(first_center - view_center) <= np.linalg.norm(
+        last_center - view_center
     )
-    dims = len(vdata.array.shape)
-
-    result = [
-        [slice(0, 512, None), slice(512, 1024, None)],
-        [slice(0, 512, None), slice(512, 1024, None)],
-    ]
-    assert len(chunk_keys) == dims
-    assert chunk_keys == result
 
 
-def test_chunk_slices_512_1024(mandelbrot_arrays, max_level):
-    scale = max_level - 1
-    vdata = _progressive_loading.VirtualData(
-        mandelbrot_arrays[scale], scale=scale
+def test_chunk_priority_2d_empty():
+    assert chunk_priority_2D([[], []], (0, 0), (0, 0)) == []
+
+
+def test_chunk_priority_3d_orders_by_depth():
+    arr = da.zeros((64, 64, 64), chunks=(16, 16, 16), dtype=np.uint8)
+    vdata = VirtualData(arr)
+    keys = chunk_slices(vdata)
+    queue = chunk_priority_3D(
+        keys,
+        (0, 0, 0),
+        (64, 64, 64),
+        camera_center=(32, 32, 32),
+        view_direction=(1, 0, 0),
+        zoom=1.0,
     )
-    data_interval = np.array([[512, 512], [1024, 1024]])
-    chunk_keys = _progressive_loading.chunk_slices(
-        vdata, interval=data_interval
-    )
-    dims = len(vdata.array.shape)
-
-    result = [
-        [slice(512, 1024, None)],
-        [slice(512, 1024, None)],
-    ]
-    assert len(chunk_keys) == dims
-    assert chunk_keys == result
+    assert len(queue) == 64
+    # chunks closer to the camera (small z) and near the center line first
+    first = queue[0]
+    assert first[0].start < 32
 
 
-def test_chunk_slices_600_1024(mandelbrot_arrays, max_level):
-    scale = max_level - 1
-    vdata = _progressive_loading.VirtualData(
-        mandelbrot_arrays[scale], scale=scale
-    )
-    data_interval = np.array([[600, 512], [600, 1024]])
-    chunk_keys = _progressive_loading.chunk_slices(
-        vdata, interval=data_interval
-    )
-    dims = len(vdata.array.shape)
-
-    result = [
-        [slice(512, 1024, None)],
-        [slice(512, 1024, None)],
-    ]
-    assert len(chunk_keys) == dims
-    assert chunk_keys == result
+# ---------- viewer integration ----------
 
 
-def test_get_chunk(mandelbrot_arrays, max_level):
-    scale = max_level - 1
-    virtual_data = _progressive_loading.VirtualData(
-        mandelbrot_arrays[scale], scale=scale
-    )
-    chunk_slice = (slice(1024, 1536, None), slice(512, 1024, None))
+def _wait_for_idle_loader(qtbot, loader, timeout=30000):
+    """Wait until the loader has no in-flight fetch workers."""
 
-    chunk_widths = (
-        chunk_slice[0].stop - chunk_slice[0].start,
-        chunk_slice[1].stop - chunk_slice[1].start,
-    )
-    real_array = get_chunk(chunk_slice, array=virtual_data)
+    def idle():
+        return loader._worker is None and loader._resident_worker is None
 
-    assert chunk_widths == real_array.shape
+    qtbot.waitUntil(idle, timeout=timeout)
 
 
-def test_get_chunk_retrieves_expected_data(chunked_array, chunk_slice):
-    """Test get_chunk returns expected chunk data."""
-    expected = chunked_array[chunk_slice].compute()
-    actual = get_chunk(chunk_slice, chunked_array)
-    da.utils.assert_eq(actual, expected)
-
-
-def test_get_chunk_spans_chunks(chunked_array):
-    """Test get_chunk works across chunk boundaries."""
-    sl = (slice(5, 15), slice(5, 15))
-    get_chunk(sl, chunked_array)
-
-
-def test_get_chunk_wrong_shape_raises(chunked_array):
-    """Test get_chunk raises error if chunk shape is wrong."""
-    bad_slice = (slice(5, 15), slice(5, 20))
-    with pytest.raises(ValueError):
-        get_chunk(bad_slice, chunked_array)
-
-
-def test_visual_depth(make_napari_viewer):
-    """TODO: this test passes if you run it by itself"""
+def test_add_progressive_loading_image(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
     viewer = make_napari_viewer()
-    points = np.array([10, 50, 20])
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
 
-    viewer.camera.set_view_direction((1, 0, 0))
-    projected_length = visual_depth(points, viewer.camera)
-    assert_array_almost_equal(projected_length, points[0])
+    # a single multiscale layer; the layer list is not polluted
+    assert len(viewer.layers) == 1
+    assert layer.multiscale
+    assert len(layer.data) == len(multiscale_arrays)
 
-    viewer.camera.set_view_direction((0, 1, 0))
-    projected_length = visual_depth(points, viewer.camera)
-    assert_array_almost_equal(projected_length, points[1])
+    loader = layer.metadata['progressive_loader']
+    assert isinstance(loader, ProgressiveLoader)
+    _wait_for_idle_loader(qtbot, loader)
 
-    with pytest.warns(UserWarning, match='Gimbal lock detected'):
-        viewer.camera.set_view_direction((0, 0, 1))
-        projected_length = visual_depth(points, viewer.camera)
-        assert_array_almost_equal(projected_length, points[2])
-    # qtbot.wait(5000) # wait for asyncronous tasks to complete, doesn't solve the problem
-
-
-def test_distance_from_camera_center_line(make_napari_viewer):
-    viewer = make_napari_viewer()
-    points = np.array([10, 0, 0])
-
-    viewer.camera.set_view_direction((1, 0, 0))
-    distances = distance_from_camera_center_line(points, viewer.camera)
-    assert_array_almost_equal(distances, np.array([0]))
-
-    viewer.camera.set_view_direction((0, 1, 0))
-    distances = distance_from_camera_center_line(points, viewer.camera)
-    assert_array_almost_equal(distances, np.array([10]))
-
-
-def test_chunk_centers_2d():
-    dask_arr = da.random.random((20, 20), chunks=(10, 10))
-    mapping = chunk_centers(dask_arr, ndim=2)
-    centers = list(mapping.keys())
-    expected = [(5.0, 5.0), (5.0, 15.0), (15.0, 5.0), (15.0, 15.0)]
-
-    assert centers == expected
-
-
-def test_chunk_centers_3d():
-    dask_arr = da.random.random((20, 20, 20), chunks=(10, 20, 20))
-    mapping = chunk_centers(dask_arr, ndim=3)
-    centers = list(mapping.keys())
-    expected = [(5.0, 10.0, 10.0), (15.0, 10.0, 10.0)]
-
-    assert centers == expected
-
-
-def test_chunk_slices_no_interval():
-    dask_arr = da.random.random((20, 20, 20), chunks=(10, 20, 20))
-    slices = chunk_slices(dask_arr, interval=None)
-    expected = [
-        [slice(0, 10, None), slice(10, 20, None)],
-        [slice(0, 20, None)],
-        [slice(0, 20, None)],
-    ]
-
-    assert slices == expected
-
-
-def test_chunk_slices_with_interval():
-    dask_arr = da.random.random((20, 20, 20), chunks=(10, 20, 20))
-    interval = np.array([[0, 0, 0], [20, 20, 20]])
-    slices = chunk_slices(dask_arr, interval=interval)
-    expected = [
-        [slice(0, 10, None), slice(10, 20, None)],
-        [slice(0, 20, None)],
-        [slice(0, 20, None)],
-    ]
-
-    assert slices == expected
-
-    interval = np.array([[11, 11, 11], [20, 20, 20]])
-    slices = chunk_slices(dask_arr, interval=interval)
-    expected = [
-        [slice(10, 20, None)],
-        [slice(0, 20, None)],
-        [slice(0, 20, None)],
-    ]
-
-    assert slices == expected
-
-    interval = np.array([[10, 10, 10], [20, 20, 20]])
-    slices = chunk_slices(dask_arr, interval=interval)
-    expected = [
-        [slice(0, 10, None), slice(10, 20, None)],
-        [slice(0, 20, None)],
-        [slice(0, 20, None)],
-    ]
-
-    assert slices == expected
-
-
-if __name__ == '__main__':
-    viewer = napari.Viewer()
-    max_level = 8
-
-    large_image = mandelbrot_dataset(max_levels=max_level)
-    mandelbrot_arrays = large_image['arrays']
-
-    scale = 7
-    vdata = _progressive_loading.VirtualData(
-        mandelbrot_arrays[scale], scale=scale
+    # the coarsest level is fully resident with real data
+    coarsest = loader._data[len(loader._data) - 1]
+    np.testing.assert_array_equal(
+        coarsest.hyperslice, np.asarray(multiscale_arrays[-1])
     )
-    mvdata = _progressive_loading.MultiScaleVirtualData(mandelbrot_arrays)
+
+
+def test_progressive_loading_data_matches_source(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    level = layer.data_level
+    vdata = loader._data[level]
+    interval = vdata.interval
+    assert interval is not None
+    key = tuple(slice(mn, mx) for mn, mx in zip(*interval, strict=True))
+    np.testing.assert_array_equal(
+        np.asarray(vdata[key]),
+        np.asarray(multiscale_arrays[level][key]),
+    )
+
+
+def test_locked_data_level_is_loaded(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    layer.locked_data_level = 0
+    _wait_for_idle_loader(qtbot, loader)
+
+    vdata = loader._data[0]
+    assert vdata.interval is not None
+    assert len(vdata.loaded_chunks) > 0
+    np.testing.assert_array_equal(
+        np.asarray(vdata[0:256, 0:256]), np.asarray(multiscale_arrays[0])
+    )
+
+
+def test_removing_layer_closes_loader(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+
+    viewer.layers.remove(layer)
+    assert loader._closed
+    qtbot.waitUntil(lambda: loader._worker is None, timeout=10000)
+
+
+def test_fetch_pass_is_cancelled_on_view_change(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    generation = loader._generation
+    layer.locked_data_level = 0
+    layer.locked_data_level = 1
+    # each view change bumps the generation (after the debounced check
+    # runs) so stale chunks from cancelled passes are dropped
+    qtbot.waitUntil(lambda: loader._generation > generation, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_contrast_limits_estimated(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    low, high = layer.contrast_limits
+    assert low < high
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_interval_clamped_to_memory_budget(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    from napari.experimental._virtual_data import MultiScaleVirtualData
+
+    viewer = make_napari_viewer()
+    data = MultiScaleVirtualData(multiscale_arrays)
+    layer = viewer.add_image(
+        data._data, multiscale=True, contrast_limits=(0, 255)
+    )
+    loader = ProgressiveLoader(viewer, layer, data, interval_max_bytes=4096)
+    layer.metadata['progressive_loader'] = loader
+    min_coord, max_coord = loader._level_interval(0)
+    extent = np.asarray(max_coord) - np.asarray(min_coord)
+    assert np.prod(extent) <= 4096
+    loader.close()

@@ -1,545 +1,536 @@
-import logging
-import sys
-from typing import Union
+"""Virtual array wrappers used by progressive loading.
 
-import dask.array as da
+This module provides array-like objects that present the full shape of a
+(potentially enormous) array while only keeping a small, chunk-aligned
+region of it in memory:
+
+- :class:`VirtualData` wraps a single scale level. It satisfies napari's
+  ``LayerDataProtocol`` (``shape``, ``dtype``, ``ndim``, ``size``,
+  ``__getitem__``) so it can be used directly as one level of a multiscale
+  ``Image`` layer. Reads outside the in-memory interval return zeros.
+- :class:`VirtualArrayView` is the lazy result of indexing a
+  :class:`VirtualData`. It records the requested region in absolute
+  coordinates and only materializes (zero-padded) data when converted with
+  ``np.asarray``. This lets napari's slicing machinery compose multiple
+  indexing operations (e.g. first the displayed-axis crop, then the
+  current-step point selection) before any data is copied.
+- :class:`MultiScaleVirtualData` coordinates one :class:`VirtualData` per
+  scale level and can initialize newly exposed regions from a coarser,
+  fully resident level so the canvas never shows empty space while chunks
+  stream in.
+
+All hyperslice accesses are guarded by a per-``VirtualData`` reentrant
+lock so background fetch threads and the main thread can safely interleave.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from typing import TYPE_CHECKING
+
 import numpy as np
 
-from napari.layers._data_protocols import Index, LayerDataProtocol
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
-LOGGER = logging.getLogger('napari.experimental._virtual_data')
-LOGGER.setLevel(logging.DEBUG)
+LOGGER = logging.getLogger(__name__)
 
-streamHandler = logging.StreamHandler(sys.stdout)
-formatter = logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-streamHandler.setFormatter(formatter)
-LOGGER.addHandler(streamHandler)
+
+def chunk_shape_for(array) -> tuple[int, ...]:
+    """Return a per-dimension chunk shape for an array.
+
+    Supports dask arrays (``chunksize``), zarr v2/v3 arrays (``chunks`` as a
+    tuple of ints), and falls back to a bounded chunk shape for plain
+    ndarrays.
+    """
+    chunksize = getattr(array, 'chunksize', None)  # dask
+    if chunksize is not None:
+        return tuple(int(c) for c in chunksize)
+    chunks = getattr(array, 'chunks', None)
+    if chunks is not None:
+        if all(isinstance(c, (int, np.integer)) for c in chunks):
+            # zarr (v2 and v3 regular chunk grids)
+            return tuple(int(c) for c in chunks)
+        # dask-style tuple of per-dimension chunk sizes
+        return tuple(int(c[0]) for c in chunks)
+    return tuple(min(int(s), 256) for s in array.shape)
+
+
+def chunk_boundaries(array) -> list[np.ndarray]:
+    """Per-dimension sorted arrays of chunk boundary positions.
+
+    Each entry covers ``0`` through ``shape[dim]`` inclusive, so consecutive
+    pairs of values describe one chunk along that dimension. Irregular dask
+    chunks are honored exactly; regular (zarr) grids are reconstructed from
+    the chunk shape.
+    """
+    chunks = getattr(array, 'chunks', None)
+    if chunks is not None and not all(
+        isinstance(c, (int, np.integer)) for c in chunks
+    ):
+        # dask: tuple of per-dimension chunk size tuples
+        return [
+            np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+            for sizes in chunks
+        ]
+    chunk_shape = chunk_shape_for(array)
+    return [
+        np.concatenate([np.arange(0, size, step), [size]]).astype(np.int64)
+        for size, step in zip(array.shape, chunk_shape, strict=True)
+    ]
+
+
+class VirtualArrayView:
+    """A lazy, zero-padded view into a :class:`VirtualData`.
+
+    The view tracks the requested region in the *absolute* coordinates of
+    the wrapped array. Indexing a view returns another view (with the keys
+    composed), and ``np.asarray`` materializes the data: regions inside the
+    currently resident interval are copied from the hyperslice and
+    everything else is zero.
+    """
+
+    def __init__(
+        self, data: VirtualData, index: tuple[int | tuple[int, int], ...]
+    ):
+        # index has one entry per dimension of ``data``:
+        # an int collapses the dimension, a (start, stop) pair keeps it.
+        self._data = data
+        self._index = index
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self._data.dtype
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(
+            stop - start
+            for entry in self._index
+            if isinstance(entry, tuple)
+            for start, stop in [entry]
+        )
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    @property
+    def size(self) -> int:
+        return int(np.prod(self.shape, dtype=np.int64))
+
+    def __getitem__(self, key) -> VirtualArrayView:
+        if not isinstance(key, tuple):
+            key = (key,)
+        if any(k is Ellipsis for k in key):
+            n_missing = self.ndim - sum(1 for k in key if k is not Ellipsis)
+            expanded: list = []
+            for k in key:
+                if k is Ellipsis:
+                    expanded.extend([slice(None)] * n_missing)
+                else:
+                    expanded.append(k)
+            key = tuple(expanded)
+
+        out: list[int | tuple[int, int]] = []
+        key_pos = 0
+        for entry in self._index:
+            if isinstance(entry, int):
+                out.append(entry)
+                continue
+            start, stop = entry
+            n = stop - start
+            k = key[key_pos] if key_pos < len(key) else slice(None)
+            key_pos += 1
+            if isinstance(k, slice):
+                k_start, k_stop, k_step = k.indices(n)
+                if k_step != 1:
+                    raise IndexError(
+                        'VirtualArrayView only supports step-1 slices, '
+                        f'got {k!r}'
+                    )
+                out.append((start + k_start, start + max(k_stop, k_start)))
+            elif isinstance(k, (int, np.integer)):
+                idx = int(k)
+                if idx < 0:
+                    idx += n
+                if not 0 <= idx < n:
+                    raise IndexError(
+                        f'index {k} is out of bounds for dimension of size {n}'
+                    )
+                out.append(start + idx)
+            else:
+                raise IndexError(
+                    f'unsupported index for VirtualArrayView: {k!r}'
+                )
+        if key_pos < len(key):
+            raise IndexError(
+                f'too many indices: array is {self.ndim}-dimensional, '
+                f'but {len(key)} were indexed'
+            )
+        return VirtualArrayView(self._data, tuple(out))
+
+    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+        data = self._data
+        out = np.zeros(self.shape, dtype=data.dtype)
+        with data.lock:
+            if data._min_coord is not None:
+                src_key: list = []
+                dst_key: list = []
+                inside = True
+                for dim, entry in enumerate(self._index):
+                    min_c = data._min_coord[dim]
+                    max_c = data._max_coord[dim]
+                    if isinstance(entry, int):
+                        if not min_c <= entry < max_c:
+                            inside = False
+                            break
+                        src_key.append(entry - min_c)
+                    else:
+                        start, stop = entry
+                        lo = max(start, min_c)
+                        hi = min(stop, max_c)
+                        if hi <= lo:
+                            inside = False
+                            break
+                        src_key.append(slice(lo - min_c, hi - min_c))
+                        dst_key.append(slice(lo - start, hi - start))
+                if inside:
+                    out[tuple(dst_key)] = data.hyperslice[tuple(src_key)]
+        if dtype is not None:
+            out = out.astype(dtype, copy=False)
+        return out
+
+    def transpose(self, axes=None) -> np.ndarray:
+        """Materialize and transpose (numpy compatibility)."""
+        return np.asarray(self).transpose(axes)
+
+    def __repr__(self) -> str:
+        return (
+            f'<VirtualArrayView shape={self.shape} dtype={self.dtype} '
+            f'index={self._index}>'
+        )
 
 
 class VirtualData:
-    """`VirtualData` wraps a particular scale level's array.
+    """Present a full-size array while holding only one region in memory.
 
-    It acts like an array of that size, but only works within the interval
-    setup by `set_interval`. Each `VirtualData` uses the scale level's
-    coordinates.
+    ``VirtualData`` wraps one scale level's array (zarr, dask, numpy, ...).
+    It reports the wrapped array's full ``shape``/``dtype`` but only stores
+    the data within the current *interval* (set via :meth:`set_interval`) in
+    an in-memory numpy array called the *hyperslice*. The interval is always
+    aligned outward to chunk boundaries of the wrapped array.
 
-    -- `VirtualData` uses a hyperslice to store the currently active interval.
-    -- `VirtualData.translate` specifies the offset of the
-    `VirtualData.hyperslice`'s origin from `VirtualData.array`'s origin, in
-    `VirtualData`'s coordinate system
-
-    VirtualData is used to use a ND array to represent
-    a larger shape. The purpose of this function is to provide
-    a ND slice that acts like a canvas for rendering a large ND image.
-
-    When you try to fetch a ND coordinate, only the last `ndisplay` dimensions
-    will be used as the (y, x) values.
-
-    NEW: use a translate to define subregion of image
+    Indexing uses the wrapped array's (absolute) coordinates and returns a
+    lazy :class:`VirtualArrayView`; reads outside the interval materialize
+    as zeros. Writes go through :meth:`set_offset`, which clips the value to
+    the resident interval.
 
     Attributes
     ----------
-    array: ndarray-like
-        nd-array like probably a Dask array or a zarr Array
-    dtype: dtype
-        dtype of the array
-    shape: tuple
-        shape of the true data (not the hyperslice)
-    ndim: int
-        Number of dimensions for this scale
-    translate: list[tuple(int)]
-        tuple for the translation
-    d: int
-        Dimension of the chunked slices ??? Hard coded to 2.
-    hyperslice: dask.array
-        Array of currently visible data for this layer
-    _min_coord: list
-        List of the minimum coordinates in each dimension
-    _max_coord: list
-        List of the maximum coordinates in each dimension
-
+    array : array-like
+        The wrapped array (not copied; only read from).
+    hyperslice : np.ndarray
+        In-memory data for the current interval.
+    translate : tuple of int
+        Offset of the hyperslice origin from the wrapped array's origin.
+    lock : threading.RLock
+        Guards ``hyperslice``/interval mutation and access.
     """
 
-    def __init__(self, array, scale, ndisplay=2):
+    def __init__(self, array, scale_level: int = 0):
         self.array = array
-        self.dtype = array.dtype
-        # This shape is the shape of the true data, but not our hyperslice
-        self.shape = array.shape
+        self.dtype = np.dtype(array.dtype)
+        self.shape = tuple(int(s) for s in array.shape)
         self.ndim = len(self.shape)
+        self.scale_level = scale_level
 
-        self.translate = tuple([0] * len(self.shape))
+        self.lock = threading.RLock()
+        self.translate: tuple[int, ...] = (0,) * self.ndim
+        self.hyperslice = np.zeros((0,) * self.ndim, dtype=self.dtype)
+        self._min_coord: list[int] | None = None
+        self._max_coord: list[int] | None = None
+        self._boundaries = chunk_boundaries(array)
+        # Chunk keys (tuples of (start, stop) pairs) whose data is resident
+        # in the hyperslice. Maintained by the progressive loader.
+        self.loaded_chunks: set[tuple[tuple[int, int], ...]] = set()
 
-        self.hyperslice = da.zeros(1)
-        self.ndisplay = ndisplay
+    @property
+    def size(self) -> int:
+        return int(np.prod(self.shape, dtype=np.int64))
 
-        self._max_coord = None
-        self._min_coord = None
-        self.scale = scale  # for debugging
+    @property
+    def chunk_shape(self) -> tuple[int, ...]:
+        return chunk_shape_for(self.array)
 
-    def set_interval(self, coords):
-        """Interval is the data for this scale that is currently visible.
+    @property
+    def interval(self) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+        """Current resident interval as ``(min_coord, max_coord)`` or None."""
+        with self.lock:
+            if self._min_coord is None:
+                return None
+            return tuple(self._min_coord), tuple(self._max_coord)
 
-        It is stored in `_min_coord` and `_max_coord` in the coordinates of
-        the original array.
+    def chunk_aligned_interval(
+        self, min_coord, max_coord
+    ) -> tuple[list[int], list[int]]:
+        """Expand ``[min_coord, max_coord)`` outward to chunk boundaries."""
+        lo: list[int] = []
+        hi: list[int] = []
+        for dim in range(self.ndim):
+            bounds = self._boundaries[dim]
+            min_c = int(np.clip(min_coord[dim], 0, self.shape[dim]))
+            max_c = int(np.clip(max_coord[dim], 0, self.shape[dim]))
+            i = max(int(np.searchsorted(bounds, min_c, side='right')) - 1, 0)
+            j = int(np.searchsorted(bounds, max_c, side='left'))
+            j = min(max(j, i + 1), len(bounds) - 1)
+            lo.append(int(bounds[i]))
+            hi.append(int(bounds[j]))
+        return lo, hi
 
-        This function takes a slice, converts it to a range (stored as
-        `_min_coord` and `_max_coord`), and extracts a subset of the original
-        data array (stored as `hyperslice`)
+    def covers(self, min_coord, max_coord) -> bool:
+        """Return True if the resident interval covers the given region."""
+        with self.lock:
+            if self._min_coord is None:
+                return False
+            return all(
+                self._min_coord[d] <= int(min_coord[d])
+                and int(max_coord[d]) <= self._max_coord[d]
+                for d in range(self.ndim)
+            )
+
+    def set_interval(self, min_coord, max_coord, backdrop=None) -> None:
+        """Set the resident interval, preserving overlapping data.
+
+        The interval is expanded outward to chunk boundaries. Data that
+        overlaps the previous interval is carried over; newly exposed
+        regions are initialized from ``backdrop`` (if given) or zeros.
 
         Parameters
         ----------
-        coords: tuple(slice(ndim))
-            tuple of slices in the same coordinate system as the parent array.
+        min_coord, max_coord : sequence of int
+            Requested interval in the wrapped array's coordinates
+            (half-open, like slices).
+        backdrop : callable, optional
+            ``backdrop(min_coord, max_coord) -> np.ndarray | None`` returning
+            initial content for the new hyperslice (e.g. upsampled data from
+            a coarser scale). Called with the chunk-aligned interval.
         """
-
-        # Validate coords
-        if not isinstance(coords, tuple):
-            raise ValueError('coords must be a tuple of slices.')
-
-        if len(coords) != self.ndim:
-            raise ValueError(
-                f'coords must have {self.ndim} slices, but got {len(coords)}'
-            )
-
-        for i, sl in enumerate(coords):
-            if not isinstance(sl, slice):
-                raise ValueError(f'coords[{i}] is not a slice object: {sl}')
-
-        if sl.start < 0 or sl.stop > self.shape[i]:
-            raise ValueError(
-                f'coords[{i}] is out of bounds for array shape: {self.shape}'
-            )
-
-        # store the last interval
-        prev_max_coord = self._max_coord
-        prev_min_coord = self._min_coord
-
-        # extract the coordinates as a range
-        self._max_coord = [sl.stop for sl in coords]
-        self._min_coord = [sl.start for sl in coords]
-
-        # Round max and min coord according to self.array.chunks
-        # for each dimension, reset the min/max coords, aka interval to be
-        # the range of chunk coordinates since we can't partially load a chunk
-        for dim in range(len(self._max_coord)):
-            if isinstance(self.array, da.Array):
-                chunks = self.array.chunks[dim]
-                cumuchunks = np.array(chunks).cumsum()
-            else:
-                # For zarr
-                cumuchunks = list(
-                    range(
-                        self.chunks[dim],
-                        self.array.shape[dim],
-                        self.chunks[dim],
-                    )
-                )
-                # Add last element
-                cumuchunks += [self.array.shape[dim]]
-                cumuchunks = np.array(cumuchunks)
-
-            # First value greater or equal to
-            min_where = np.where(cumuchunks >= self._min_coord[dim])
-            if min_where[0].size == 0:
-                raise ValueError(f'No chunk boundary found >= min_coord[{dim}]={self._min_coord[dim]}')
-            greaterthan_min_idx = (
-                min_where[0][0] if min_where[0] is not None else 0
-            )
-            self._min_coord[dim] = (
-                cumuchunks[greaterthan_min_idx - 1]
-                if greaterthan_min_idx > 0
-                else 0
-            )
-
-            max_where = np.where(cumuchunks >= self._max_coord[dim])
-            if max_where[0].size == 0:
-                raise ValueError(f'No chunk boundary found >= max_coord[{dim}]={self._max_coord[dim]}')
-            lessthan_max_idx = (
-                max_where[0][0] if max_where[0] is not None else 0
-            )
-            self._max_coord[dim] = (
-                cumuchunks[lessthan_max_idx]
-                if lessthan_max_idx < cumuchunks[-1]
-                else cumuchunks[-1] - 1
-            )
-
-        # Update translate
-        self.translate = self._min_coord
-
-        # interval size may be one or more chunks
-        interval_size = [
-            mx - mn for mx, mn in zip(self._max_coord, self._min_coord)
-        ]
-
-        LOGGER.debug(
-            f'VirtualData: update_with_minmax: {self.translate} max \
-            {self._max_coord} interval size {interval_size}'
-        )
-
-        # Update hyperslice
-        new_shape = [
-            int(mx - mn) for (mx, mn) in zip(self._max_coord, self._min_coord)
-        ]
-
-        # Try to reuse the previous hyperslice if possible (otherwise we get
-        # flashing) shape of the chunks
-        next_hyperslice = np.zeros(new_shape, dtype=self.dtype)
-
-        if prev_max_coord:
-            # Get the matching slice from both data planes
-            next_slices = []
-            prev_slices = []
-            for dim in range(len(self._max_coord)):
-                # to ensure that start is non-negative
-                # prev_start is the start of the overlapping region in the
-                # previous one
-                if self._min_coord[dim] < prev_min_coord[dim]:
-                    prev_start = 0
-                    next_start = prev_min_coord[dim] - self._min_coord[dim]
-                else:
-                    prev_start = self._min_coord[dim] - prev_min_coord[dim]
-                    next_start = 0
-
-                width = min(
-                    self.hyperslice.shape[dim], next_hyperslice.shape[dim]
-                )
-                # to make sure its not overflowing the shape
-                width = min(
-                    width,
-                    width
-                    - ((next_start + width) - next_hyperslice.shape[dim]),
-                    width
-                    - ((prev_start + width) - self.hyperslice.shape[dim]),
-                )
-
-                prev_stop = prev_start + width
-                next_stop = next_start + width
-
-                LOGGER.debug(
-                    f'Dimension {dim}, Prev start: {prev_start}, Next start: {next_start}, Width: {width}'
-                )
-
-                prev_slices += [slice(int(prev_start), int(prev_stop))]
-                next_slices += [slice(int(next_start), int(next_stop))]
+        new_min, new_max = self.chunk_aligned_interval(min_coord, max_coord)
+        with self.lock:
+            prev_min = self._min_coord
+            prev_hyperslice = self.hyperslice
 
             if (
-                next_hyperslice[tuple(next_slices)].size > 0
-                and self.hyperslice[tuple(prev_slices)].size > 0
+                prev_min is not None
+                and new_min == prev_min
+                and new_max == self._max_coord
             ):
-                LOGGER.info(
-                    f'reusing data plane: prev {prev_slices} next \
-                    {next_slices}'
-                )
-                if (
-                    next_hyperslice[tuple(next_slices)].size
-                    != self.hyperslice[tuple(prev_slices)].size
+                return
+
+            new_shape = [
+                mx - mn for mn, mx in zip(new_min, new_max, strict=True)
+            ]
+            next_hyperslice = None
+            if backdrop is not None:
+                try:
+                    content = backdrop(new_min, new_max)
+                except Exception:  # pragma: no cover - backdrop is advisory
+                    LOGGER.exception('backdrop initialization failed')
+                    content = None
+                if content is not None and tuple(content.shape) == tuple(
+                    new_shape
                 ):
-                    LOGGER.warning(
-                        f'Size mismatch: next {next_hyperslice[tuple(next_slices)].size} '
-                        f'!= prev {self.hyperslice[tuple(prev_slices)].size}'
+                    next_hyperslice = np.ascontiguousarray(
+                        content, dtype=self.dtype
                     )
-                next_hyperslice[tuple(next_slices)] = self.hyperslice[
-                    tuple(prev_slices)
-                ]
-            else:
-                LOGGER.info(
-                    f'could not reuse data plane: prev {prev_slices} next \
-                    {next_slices}'
+            if next_hyperslice is None:
+                next_hyperslice = np.zeros(new_shape, dtype=self.dtype)
+
+            # Carry over data overlapping the previous interval to avoid
+            # re-fetching and visual flashing.
+            if prev_min is not None and prev_hyperslice.size:
+                src_key = []
+                dst_key = []
+                overlaps = True
+                for dim in range(self.ndim):
+                    lo = max(prev_min[dim], new_min[dim])
+                    hi = min(
+                        prev_min[dim] + prev_hyperslice.shape[dim],
+                        new_max[dim],
+                    )
+                    if hi <= lo:
+                        overlaps = False
+                        break
+                    src_key.append(
+                        slice(lo - prev_min[dim], hi - prev_min[dim])
+                    )
+                    dst_key.append(slice(lo - new_min[dim], hi - new_min[dim]))
+                if overlaps:
+                    next_hyperslice[tuple(dst_key)] = prev_hyperslice[
+                        tuple(src_key)
+                    ]
+
+            self._min_coord = new_min
+            self._max_coord = new_max
+            self.translate = tuple(new_min)
+            self.hyperslice = next_hyperslice
+
+            # Drop bookkeeping for chunks that fell outside the interval.
+            self.loaded_chunks = {
+                key
+                for key in self.loaded_chunks
+                if all(
+                    new_min[d] <= start and stop <= new_max[d]
+                    for d, (start, stop) in enumerate(key)
                 )
+            }
 
-        self.hyperslice = next_hyperslice
+    def set_offset(self, key: tuple[slice, ...], value) -> None:
+        """Write ``value`` at ``key`` (absolute coordinates), clipped.
 
-    def _hyperslice_key(
-        self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol]
-    ):
-        """Convert a key in data coordinates to a key in 'hyperslice' coordinates.
-
-        Offsets both slice start/stop and any integer indices by `self.translate[i]`.
+        Regions of ``key`` outside the resident interval are ignored.
         """
-        # 1) always make key a tuple
-        if not isinstance(key, tuple):
-            key = (key,)
+        value = np.asarray(value)
+        with self.lock:
+            if self._min_coord is None:
+                return
+            dst_key = []
+            src_key = []
+            for dim, sl in enumerate(key):
+                lo = max(int(sl.start), self._min_coord[dim])
+                hi = min(int(sl.stop), self._max_coord[dim])
+                if hi <= lo:
+                    return
+                dst_key.append(
+                    slice(lo - self._min_coord[dim], hi - self._min_coord[dim])
+                )
+                src_key.append(slice(lo - int(sl.start), hi - int(sl.start)))
+            expected = tuple(s.stop - s.start for s in src_key)
+            if value[tuple(src_key)].shape != expected:
+                LOGGER.warning(
+                    'set_offset: value shape %s does not cover key %s',
+                    value.shape,
+                    key,
+                )
+                return
+            self.hyperslice[tuple(dst_key)] = value[tuple(src_key)]
 
-        output_key = []
-        # Note: we only offset the first len(self.translate) dims.
-        # If a user provides fewer or more dims than self.ndim, handle gracefully.
-        max_dims = min(len(key), len(self.translate))
+    def __getitem__(self, key) -> VirtualArrayView:
+        full = tuple((0, s) for s in self.shape)
+        return VirtualArrayView(self, full)[key]
 
-        for i, k in enumerate(key):
-            if i >= len(self.translate):
-                # If the user gave more indices than we have dims, just append as-is
-                output_key.append(k)
-                continue
+    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+        return VirtualArrayView(
+            self, tuple((0, s) for s in self.shape)
+        ).__array__(dtype=dtype)
 
-            tr = self.translate[i]
-
-            if isinstance(k, slice):
-                # Convert None -> 0 or shape to do the offset
-                start = k.start
-                stop = k.stop
-                step = k.step if k.step is not None else 1
-
-                # If start is not None, offset it
-                if start is not None:
-                    start = start - tr
-                    # Optionally clamp to 0
-                    # start = max(start, 0)
-
-                # If stop is not None, offset it
-                if stop is not None:
-                    stop = stop - tr
-                    # Optionally clamp to self.hyperslice.shape[i]
-                    # stop = min(stop, self.hyperslice.shape[i])
-
-                output_key.append(slice(start, stop, step))
-
-            elif isinstance(k, (int, np.integer)):
-                # offset integer index
-                output_key.append(k - tr)
-
-            else:
-                # fallback for Ellipsis, arrays, or other index types
-                output_key.append(k)
-
-        # If key has more elements than self.ndim, just keep them all
-        if len(key) > max_dims:
-            # we already appended them, so do nothing special
-            pass
-
-        return tuple(output_key)
-
-    def __getitem__(
-        self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol]
-    ) -> LayerDataProtocol:
-        """Return item from array.
-
-        key is in data coordinates
-        """
-        return self.get_offset(key)
-
-    def __setitem__(
-        self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol], value
-    ) -> LayerDataProtocol:
-        """Set an item in the array.
-
-        key is in data coordinates
-        """
-        self.hyperslice[key] = value
-        return self.hyperslice[key]
-
-    def get_offset(
-        self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol]
-    ) -> LayerDataProtocol:
-        """Return item from array.
-
-        key is in data coordinates.
-        """
-        hyperslice_key = self._hyperslice_key(key)
-        try:
-            return self.hyperslice[
-                hyperslice_key
-            ]  # Using square bracket notation
-        except Exception:
-            # if it isn't a slice it is an int so width=1
-            shape = tuple(
-                [
-                    (1 if sl.start is None else sl.stop - sl.start)
-                    if type(sl) is slice
-                    else 1
-                    for sl in key
-                ]
-            )
-            LOGGER.info(f'get_offset failed {key}')
-            return np.zeros(shape)
-
-    def set_offset(
-        self, key: Union[Index, Tuple[Index, ...], LayerDataProtocol], value
-    ) -> LayerDataProtocol:
-        """Return self[key]."""
-        hyperslice_key = self._hyperslice_key(key)
-        LOGGER.info(
-            f'hyperslice_key {hyperslice_key} hyperslice shape {self.hyperslice.shape}'
+    def __repr__(self) -> str:
+        return (
+            f'<VirtualData scale_level={self.scale_level} shape={self.shape} '
+            f'dtype={self.dtype} interval={self.interval}>'
         )
-        LOGGER.info(
-            f'set_offset: {hyperslice_key} hyperslice shape: \
-            {self.hyperslice[hyperslice_key].shape} value shape: {value.shape} '
-        )
-
-        # TODO hack for malformed data
-        if not np.all(
-            np.array(value.shape)
-            == np.array(self.hyperslice[hyperslice_key].shape)
-        ):
-            # Transpose value to match the expected shape
-            value = np.transpose(value, axes=(2, 1, 0))
-
-        if self.hyperslice[hyperslice_key].size > 0:
-            self.hyperslice[hyperslice_key] = value
-        return self.hyperslice[hyperslice_key]
-
-    @property
-    def chunksize(self):
-        """Return the size of a chunk."""
-        if isinstance(self.array, da.Array):
-            return self.array.chunksize
-        return self.array.info  # Based on zarr
-
-    @property
-    def chunks(self):
-        """Return the chunks of the array."""
-        # TODO this isn't safe because array can be dask or zarr
-        return self.array.chunks
 
 
 class MultiScaleVirtualData:
-    """MultiScaleVirtualData encapsulates multiscale arrays.
+    """Coordinate a :class:`VirtualData` per level of a multiscale image.
 
-    The added value is that MultiScaleVirtualData has a small memory
-    footprint.
+    The list of per-level :class:`VirtualData` objects (``._data``) can be
+    passed directly to ``viewer.add_image(..., multiscale=True)``. The
+    object also tracks the scale factors between levels and can initialize
+    a level's freshly exposed region from a coarser level's resident data
+    (:meth:`backdrop_for`), which keeps the canvas filled with low-resolution
+    content while high-resolution chunks stream in.
 
-    MultiScaleVirtualData is a parent that tracks the transformation
-    between each VirtualData child relative to the highest resolution
-    VirtualData (which is just a re-scaling transform). It accepts inputs in
-    the coordinate system of the highest resolution VirtualData.
-
-    VirtualData is used to use a 2D or 3D subarray to represent
-    a larger shape. The purpose of this function is to provide
-    a 2D or 3D slice that acts like a canvas for rendering a large ND image.
-
-    When you try to fetch a ND coordinate, only the last 2 dimensions
-    will be used as the (y, x) values.
-
-    _set_interval must be called to initialize
-
-    NEW: use a translate to define subregion of image
-
-    Attributes
+    Parameters
     ----------
-    arrays: dask.array
-        List of dask arrays of image data, one for each scale
-    dtype: dtype
-        dtype of the arrays
-    shape: tuple
-        Shape of the true data at the highest resolution (x, y) or (x, y, z)
-    ndim: int
-        Number of dimensions, aka scales
-    _data: list[VirtualData]
-        List of VirtualData objects for each scale
-    _translate: list[tuple(int)]
-        List of tuples, e.g. [(0, 0), (0, 0)] of translations for each scale
-        array
-    _scale_factors: list[list[float]]
-        List of scale factors between the highest resolution scale and each
-        subsequent scale
-    ndisplay: int
-        number of dimensions to display (equivalent to ndisplay in
-        napari.viewer.Viewer)
-    _chunk_slices: list of list of chunk slices
-        List of list of chunk slices. A slice object for each scale, for each
-        dimension,
-        e.g. [list of scales[list of slice objects[(x, y, z)]]]
+    arrays : sequence of array-like
+        Multiscale levels from highest resolution (index 0) to lowest.
     """
 
-    def __init__(self, arrays, ndisplay=2):
-        # TODO arrays should be typed as MultiScaleData
-        # each array represents a scale
-        self.arrays = arrays
-        # first array is considered the highest resolution
-        # TODO [kcp] - is that always true?
-        highest_res = arrays[0]
-
+    def __init__(self, arrays: Sequence):
+        if len(arrays) == 0:
+            raise ValueError('arrays must be a non-empty sequence')
+        self.arrays = list(arrays)
+        self._data = [
+            VirtualData(array, scale_level=level)
+            for level, array in enumerate(self.arrays)
+        ]
+        highest_res = self._data[0]
         self.dtype = highest_res.dtype
-        # This shape is the shape of the true data, but not our hyperslice
         self.shape = highest_res.shape
+        self.ndim = highest_res.ndim
 
-        self.ndim = len(arrays)
-
-        self.ndisplay = ndisplay
-
-        # Keep a VirtualData for each array
-        self._data = []
-        self._translate = []
-        self._scale_factors = []
-        for scale in range(len(self.arrays)):
-            virtual_data = VirtualData(
-                self.arrays[scale], scale=scale, ndisplay=self.ndisplay
-            )
-            self._translate += [
-                tuple([0] * len(self.shape))
-            ]  # Factors to shift the layer by in units of world coordinates.
-            # TODO [kcp] there are assumptions here, expect rounding errors
-            #      here, or should we force ints?
-            self._scale_factors += [
-                [
-                    hr_val / this_val
-                    for hr_val, this_val in zip(
-                        highest_res.shape, self.arrays[scale].shape
-                    )
-                ]
+        # Per-level, per-dimension downsampling factor relative to level 0.
+        self._scale_factors = [
+            [
+                hr_dim / level_dim
+                for hr_dim, level_dim in zip(
+                    highest_res.shape, vdata.shape, strict=True
+                )
             ]
-            self._data += [virtual_data]
+            for vdata in self._data
+        ]
 
-    def set_interval(self, min_coord, max_coord, visible_scales=None):
-        """Set the extents for each of the scales.
+    def __len__(self) -> int:
+        return len(self._data)
 
-        Extents are set in the coordinates of each individual scale array
+    def __getitem__(self, level: int) -> VirtualData:
+        return self._data[level]
 
-        visible_scales must be an empty list of a list equal to the number of
-        scales
+    @property
+    def levels(self) -> int:
+        return len(self._data)
 
-        Sets the _min_coord and _max_coord on each individual VirtualData
+    def backdrop_for(self, level: int, src_level: int):
+        """Return a backdrop callable that upsamples from ``src_level``.
 
-        min_coord and max_coord are in the same units as the highest resolution
-        scale data.
-
-        Note: if you are using this for stuff that goes to GPU or some other
-        memory constrained situation, then be careful about your interval size.
-
-        Parameters
-        ----------
-        min_coord: np.array
-            min coordinate in data space, should correspond to top left corner
-            of the visible canvas
-        max_coord: np.array
-            max coordinate in data space, should correspond to bottom right
-            corner of the visible canvas
-        visible_scales: list
-            Optional. ???
+        The returned function is suitable for
+        :meth:`VirtualData.set_interval`'s ``backdrop`` parameter; it samples
+        the source level's resident hyperslice with nearest-neighbor
+        interpolation. Returns ``None`` when no useful backdrop exists.
         """
-        # Bound min_coord and max_coord
-        if visible_scales is None:
-            visible_scales = [True] * len(self.arrays)
+        if src_level == level:
+            return None
+        src = self._data[src_level]
+        ratio = [
+            self._scale_factors[level][d] / self._scale_factors[src_level][d]
+            for d in range(self.ndim)
+        ]
 
-        max_coord = np.min((max_coord, self._data[0].shape), axis=0)
-        min_coord = np.max((min_coord, np.zeros_like(min_coord)), axis=0)
-
-        # for each scale, set the interval for the VirtualData
-        # e.g. a high resolution scale may cover [0,1,2,3,4] but a scale
-        # with half of that resolution will cover the same region with
-        # coords/indices of [0,1,2]
-        for scale in range(len(self.arrays)):
-            if visible_scales[scale]:
-                scaled_min = [
-                    int(coord / factor)
-                    for coord, factor in zip(
-                        min_coord, self._scale_factors[scale]
+        def backdrop(min_coord, max_coord):
+            with src.lock:
+                if src._min_coord is None or src.hyperslice.size == 0:
+                    return None
+                indices = []
+                for d in range(self.ndim):
+                    coords = (
+                        np.arange(min_coord[d], max_coord[d]) + 0.5
+                    ) * ratio[d]
+                    idx = coords.astype(np.int64) - src._min_coord[d]
+                    indices.append(
+                        np.clip(idx, 0, src.hyperslice.shape[d] - 1)
                     )
-                ]
-                scaled_max = [
-                    int(coord / factor)
-                    for coord, factor in zip(
-                        max_coord, self._scale_factors[scale]
-                    )
-                ]
+                return src.hyperslice[np.ix_(*indices)]
 
-                self._translate[scale] = scaled_min
-                LOGGER.info(
-                    f'MultiscaleVirtualData: update_with_minmax: scale {scale} min {min_coord} : {scaled_min} max {max_coord} : scaled max {scaled_max}'
-                )
+        return backdrop
 
-                coords = tuple(
-                    slice(mn, mx) for mn, mx in zip(scaled_min, scaled_max)
-                )
-                self._data[scale].set_interval(coords)
+    def set_interval(
+        self,
+        level: int,
+        min_coord,
+        max_coord,
+        backdrop_level: int | None = None,
+    ) -> None:
+        """Set the resident interval for ``level`` (in level coordinates).
+
+        If ``backdrop_level`` is given, newly exposed regions are initialized
+        with nearest-neighbor upsampled data from that level.
+        """
+        backdrop = (
+            self.backdrop_for(level, backdrop_level)
+            if backdrop_level is not None
+            else None
+        )
+        self._data[level].set_interval(min_coord, max_coord, backdrop=backdrop)

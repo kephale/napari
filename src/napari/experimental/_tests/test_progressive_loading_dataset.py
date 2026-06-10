@@ -1,56 +1,37 @@
-import dask
+import itertools
+
+import numpy as np
 import pytest
-import zarr
+
+pytest.importorskip('zarr')
 
 from napari.experimental._progressive_loading_datasets import (
-    idr0044A,
-    idr0051A,
-    idr0075A,
-    luethi_zenodo_7144919,
     mandelbrot_dataset,
-    openorganelle_mouse_kidney_em,
-    openorganelle_mouse_kidney_labels,
+    mandelbulb_dataset,
 )
 
-# list of (working) dataset loaders
-dataset_loaders = [
-    openorganelle_mouse_kidney_labels,
-    openorganelle_mouse_kidney_em,
-    luethi_zenodo_7144919,
-    mandelbrot_dataset,
-]
 
-# dataset loaders which currently fail
-dataset_loaders_fail = [
-    idr0044A,
-    idr0075A,
-    idr0051A,
-]
+def test_mandelbrot_dataset():
+    dataset = mandelbrot_dataset(max_levels=4, tilesize=32)
+    arrays = dataset['arrays']
+    assert len(arrays) == 4
+    assert arrays[0].shape == (32 * 2**4,) * 2
+    for fine, coarse in itertools.pairwise(arrays):
+        assert fine.shape[0] == coarse.shape[0] * 2
+    # data is readable and nontrivial
+    coarsest = arrays[-1][:]
+    assert coarsest.max() > 0
 
 
-@pytest.mark.slow
-@pytest.mark.parametrize('dataset_loader', dataset_loaders)
-def test_datasets(dataset_loader):
-    """Test to ensure that datasets are functional. Most of these are
-    time consuming and therefore should only be run infrequently.
-    """
-    large_image = dataset_loader()
-    sample_array = large_image['arrays'][0]
-    assert isinstance(sample_array, (dask.array.Array, zarr.Array))
+def test_mandelbrot_dataset_cache_consistency():
+    dataset = mandelbrot_dataset(max_levels=3, tilesize=16)
+    arr = dataset['arrays'][1]
+    np.testing.assert_array_equal(arr[:], arr[:])
 
 
-@pytest.mark.slow
-@pytest.mark.xfail
-@pytest.mark.parametrize('dataset_loader', dataset_loaders_fail)
-def test_failing_datasets(dataset_loader):
-    """Temporary placeholder for datasets that currently fail during creation"""
-    dataset_loader()
-
-
-@pytest.mark.parametrize('level', [2, 4])
-def test_mandelbrot_dataset(level):
-    large_image = mandelbrot_dataset(max_levels=level)
-    multiscale_img = large_image['arrays']
-
-    assert isinstance(multiscale_img[0], zarr.Array)
-    assert len(multiscale_img) == level
+def test_mandelbulb_dataset():
+    dataset = mandelbulb_dataset(max_levels=3, tilesize=8, maxiter=32)
+    arrays = dataset['arrays']
+    assert len(arrays) == 3
+    assert arrays[0].ndim == 3
+    assert arrays[-1][:].max() > 0
