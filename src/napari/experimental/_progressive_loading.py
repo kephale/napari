@@ -232,27 +232,49 @@ def chunk_priority_3D(
     -------
     list of tuple of slice
         Chunk keys sorted from highest to lowest priority.
+
+    Notes
+    -----
+    The camera state is sanitized: a degenerate (zero/non-finite) view
+    direction or non-finite camera center/zoom — which can occur before
+    the 3D camera is fully initialized — falls back to plain
+    view-center-distance ordering instead of producing NaN priorities.
     """
     keys = _chunk_keys_product(chunk_keys)
     if not keys:
         return []
     centers = np.array([get_chunk_center(key)[-3:] for key in keys])
-    camera_center = np.asarray(camera_center, dtype=float)[-3:]
-    view_direction = np.asarray(view_direction, dtype=float)[-3:]
-
-    relative = centers - camera_center
-    depth = relative @ view_direction
-    projected = view_direction * depth[:, np.newaxis]
-    center_line_dist = np.linalg.norm(projected - relative, axis=-1)
 
     view_center = (
         (np.asarray(min_coord, dtype=float) + np.asarray(max_coord)) / 2
     )[-3:]
     center_view_dist = np.linalg.norm(centers - view_center, axis=-1)
 
-    priority = (
-        depth + zoom * center_line_dist + center_weight * center_view_dist
+    camera_center = np.asarray(camera_center, dtype=float)[-3:]
+    view_direction = np.asarray(view_direction, dtype=float)[-3:]
+    direction_norm = (
+        float(np.linalg.norm(view_direction))
+        if np.all(np.isfinite(view_direction))
+        else 0.0
     )
+    if (
+        camera_center.shape != (3,)
+        or not np.all(np.isfinite(camera_center))
+        or direction_norm < 1e-12
+    ):
+        # Camera not (yet) in a usable 3D state: order by view center only.
+        priority = center_view_dist
+    else:
+        view_direction = view_direction / direction_norm
+        if not np.isfinite(zoom) or zoom <= 0:
+            zoom = 1.0
+        relative = centers - camera_center
+        depth = relative @ view_direction
+        projected = view_direction * depth[:, np.newaxis]
+        center_line_dist = np.linalg.norm(projected - relative, axis=-1)
+        priority = (
+            depth + zoom * center_line_dist + center_weight * center_view_dist
+        )
     return [keys[i] for i in np.argsort(priority, kind='stable')]
 
 
@@ -318,6 +340,10 @@ class ProgressiveLoader:
         explicit level in the selector suspends automatic selection until
         it is set back to "Auto". Levels too large for
         ``interval_max_bytes`` are skipped in favor of coarser ones.
+    max_pixel_size_3d : float
+        In 3D auto mode, target the coarsest level whose voxels project
+        to at most this many screen pixels. Lower values choose finer
+        (more expensive) levels sooner when zooming in.
     """
 
     def __init__(
@@ -331,6 +357,7 @@ class ProgressiveLoader:
         resident_max_bytes: int = DEFAULT_RESIDENT_MAX_BYTES,
         interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
         auto_level_3d: bool = True,
+        max_pixel_size_3d: float = 4.0,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -338,6 +365,7 @@ class ProgressiveLoader:
         self._refresh_interval_s = refresh_interval_s
         self._interval_max_bytes = interval_max_bytes
         self._auto_level_3d = auto_level_3d
+        self._max_pixel_size_3d = float(max_pixel_size_3d)
         # Level we set through layer._locked_data_level for 3D auto mode
         # (None when we are not driving the level).
         self._auto_locked: int | None = None
@@ -514,27 +542,39 @@ class ProgressiveLoader:
         """Track explicit level pins made through the resolution selector.
 
         This only fires for writes through the public
-        ``locked_data_level`` setter — 3D auto mode writes the private
-        attribute directly — so a non-None value here is always a user
-        (or API) choice.
+        ``locked_data_level`` setter (3D auto mode writes the private
+        attribute directly). The resolution selector widget may *echo*
+        the auto-driven value back through the setter when its items are
+        rebuilt, so a value equal to the current auto level is not
+        treated as a user pin — otherwise auto mode would silently
+        suspend itself after the first level change.
         """
-        self._user_locked = self._layer.locked_data_level is not None
-        if self._user_locked:
+        locked = self._layer.locked_data_level
+        if locked is None:
+            self._user_locked = False
+        elif locked != self._auto_locked:
+            self._user_locked = True
             self._auto_locked = None
+        # else: an echo of the level auto mode set; keep auto mode active.
 
-    def _zoom_target_level_3d(self, max_pixel_size: float = 4.0) -> int:
+    def _zoom_target_level_3d(self) -> int:
         """Pick the 3D data level appropriate for the current camera zoom.
 
         Chooses the coarsest level whose voxels project to at most
-        ``max_pixel_size`` screen pixels (so the displayed resolution
+        ``max_pixel_size_3d`` screen pixels (so the displayed resolution
         roughly matches the screen, like napari's 2D level selection),
         then falls back to coarser levels until the visible volume fits
-        the memory budget.
+        the memory budget. A camera that is not yet initialized (zoom of
+        zero, NaN, or inf — e.g. before the window is first shown)
+        selects the coarsest level.
         """
         layer = self._layer
         zoom = float(self._viewer.camera.zoom)
         displayed = list(layer._slice_input.displayed)
         n_levels = len(self._data)
+
+        if not np.isfinite(zoom) or zoom <= 0:
+            return n_levels - 1
 
         target = 0
         for level in range(n_levels - 1, -1, -1):
@@ -542,7 +582,7 @@ class ProgressiveLoader:
                 np.asarray(self._data._scale_factors[level]), displayed
             )
             pixel_size = zoom * float(np.max(factors))
-            if pixel_size <= max_pixel_size:
+            if pixel_size <= self._max_pixel_size_3d:
                 target = level
                 break
 
@@ -689,9 +729,13 @@ class ProgressiveLoader:
         camera = self._viewer.camera
         factors = np.asarray(self._data._scale_factors[level])
         displayed = list(self._layer._slice_input.displayed)[-3:]
+        if len(displayed) < 3:
+            # mid ndisplay transition: displayed dims not 3D yet
+            return chunk_priority_2D(keys, interval[0], interval[1])
         camera_center = np.asarray(camera.center, dtype=float) / np.take(
             factors, displayed
         )
+        # chunk_priority_3D sanitizes degenerate camera state internally
         return chunk_priority_3D(
             keys,
             interval[0],
@@ -900,6 +944,7 @@ def add_progressive_loading_image(
     rendering: str = 'attenuated_mip',
     name: str | None = None,
     auto_level_3d: bool = True,
+    max_pixel_size_3d: float = 4.0,
     **layer_kwargs,
 ):
     """Add a progressively loading multiscale image to a viewer.
@@ -932,6 +977,9 @@ def add_progressive_loading_image(
         zoom (napari itself always uses the coarsest level in 3D). The
         resolution selector stays on "Auto"; pinning an explicit level
         there suspends automatic selection.
+    max_pixel_size_3d : float
+        Tuning knob for 3D auto level selection: target the coarsest
+        level whose voxels project to at most this many screen pixels.
     **layer_kwargs
         Additional keyword arguments passed to ``viewer.add_image``.
 
@@ -961,7 +1009,11 @@ def add_progressive_loading_image(
         **layer_kwargs,
     )
     loader = ProgressiveLoader(
-        viewer, layer, data, auto_level_3d=auto_level_3d
+        viewer,
+        layer,
+        data,
+        auto_level_3d=auto_level_3d,
+        max_pixel_size_3d=max_pixel_size_3d,
     )
     layer.metadata['progressive_loader'] = loader
     return layer

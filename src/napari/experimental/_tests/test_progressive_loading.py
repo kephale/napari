@@ -323,3 +323,95 @@ def test_zoom_target_level_respects_memory_budget(
     # level 0 (64^3) and level 1 (32^3) exceed the budget; 2 (16^3) fits
     assert loader._zoom_target_level_3d() == 2
     loader.close()
+
+
+def test_chunk_priority_3d_degenerate_camera():
+    """NaN/zero camera state must not produce NaN priorities or warnings.
+
+    Regression test: before the 3D camera is fully initialized (e.g. the
+    window has not been shown yet), view_direction can be zero and
+    center/zoom non-finite, which corrupted the chunk sort order.
+    """
+    import warnings
+
+    arr = da.zeros((64, 64, 64), chunks=(16, 16, 16), dtype=np.uint8)
+    vdata = VirtualData(arr)
+    keys = chunk_slices(vdata)
+    degenerate_cameras = [
+        {'camera_center': (0, 0, 0), 'view_direction': (0, 0, 0)},
+        {
+            'camera_center': (np.nan, np.nan, np.nan),
+            'view_direction': (1, 0, 0),
+        },
+        {
+            'camera_center': (np.inf, 0, 0),
+            'view_direction': (1, 0, 0),
+            'zoom': np.nan,
+        },
+        {
+            'camera_center': (32, 32, 32),
+            'view_direction': (1, 0, 0),
+            'zoom': 0.0,
+        },
+    ]
+    for camera in degenerate_cameras:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', RuntimeWarning)
+            queue = chunk_priority_3D(keys, (0, 0, 0), (64, 64, 64), **camera)
+        assert len(queue) == 64
+        # the most central chunks must still come first
+        first_center = np.array([(sl.start + sl.stop) / 2 for sl in queue[0]])
+        assert np.all(np.abs(first_center - 32) <= 16)
+
+
+def test_zoom_target_level_3d_uninitialized_camera(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    """A NaN/zero zoom (camera not yet initialized) selects the coarsest
+    level instead of falling through to the finest."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    coarsest = len(multiscale_3d_arrays) - 1
+
+    # shim the camera: assigning NaN/zero zoom to a real camera breaks
+    # napari's own transforms, but a real camera can hold such values
+    # transiently before the window is first shown
+    from types import SimpleNamespace
+
+    real_viewer = loader._viewer
+    for bad_zoom in (float('nan'), float('inf'), 0.0):
+        loader._viewer = SimpleNamespace(
+            camera=SimpleNamespace(zoom=bad_zoom), dims=real_viewer.dims
+        )
+        assert loader._zoom_target_level_3d() == coarsest
+    loader._viewer = real_viewer
+
+    # camera in a valid state: zoom-driven selection resumes
+    viewer.camera.zoom = 50.0
+    qtbot.waitUntil(lambda: layer.data_level == 0, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_auto_level_3d_survives_selector_echo(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    """The resolution-selector widget may echo the auto-driven level back
+    through the public setter; this must not suspend auto mode."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    viewer.camera.zoom = 0.01
+    qtbot.waitUntil(lambda: loader._auto_locked is not None, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+
+    # simulate the widget writing the current (auto) value back
+    layer.locked_data_level = loader._auto_locked
+    assert not loader._user_locked
+
+    # auto mode still follows the zoom afterwards
+    viewer.camera.zoom = 50.0
+    qtbot.waitUntil(lambda: layer.data_level == 0, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
