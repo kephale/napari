@@ -48,6 +48,7 @@ from napari.experimental._virtual_data import (
     chunk_boundaries,
 )
 from napari.qt.threading import thread_worker
+from napari.utils import progress
 
 if TYPE_CHECKING:
     import napari
@@ -58,6 +59,9 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_RESIDENT_MAX_BYTES = 256 * 1024**2
 #: Maximum size of a single level's resident interval, in bytes.
 DEFAULT_INTERVAL_MAX_BYTES = 512 * 1024**2
+#: Show a progress bar (activity dock) for fetch passes with at least this
+#: many chunks; short interactive passes stay silent.
+PROGRESS_MIN_CHUNKS = 16
 
 
 # ---------- chunk geometry ----------
@@ -332,6 +336,8 @@ class ProgressiveLoader:
         self._chunks_done = 0
         self._chunks_total = 0
         self._last_refresh = 0.0
+        self._pbar = None
+        self._resident_pbar = None
 
         self._resident_worker = None
         self._resident_level = len(data) - 1
@@ -382,6 +388,8 @@ class ProgressiveLoader:
         if self._resident_worker is not None:
             self._resident_worker.quit()
             self._resident_worker = None
+        self._close_progress(self._resident_pbar)
+        self._resident_pbar = None
         for emitter, callback in self._connections:
             with contextlib.suppress(ValueError, TypeError):
                 emitter.disconnect(callback)
@@ -550,6 +558,9 @@ class ProgressiveLoader:
         generation = self._generation
         self._chunks_done = 0
         self._chunks_total = len(queue)
+        self._pbar = self._make_progress(
+            len(queue), f'{self._layer.name}: loading level {level}'
+        )
 
         worker = _fetch_chunks(vdata.array, queue)
         worker.yielded.connect(
@@ -575,12 +586,31 @@ class ProgressiveLoader:
             zoom=camera.zoom,
         )
 
+    def _make_progress(self, total: int, description: str):
+        """Best-effort progress bar shown in the napari activity dock."""
+        if total < PROGRESS_MIN_CHUNKS:
+            return None
+        try:
+            return progress(total=total, desc=description)
+        except (
+            Exception
+        ):  # pragma: no cover - progress is cosmetic  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _close_progress(pbar) -> None:
+        if pbar is not None:
+            with contextlib.suppress(Exception):
+                pbar.close()
+
     def _cancel_active(self) -> None:
         self._generation += 1
         if self._worker is not None:
             self._worker.quit()
             self._worker = None
         self._active = None
+        self._close_progress(self._pbar)
+        self._pbar = None
 
     def _on_chunk(self, generation: int, vdata: VirtualData, result) -> None:
         if generation != self._generation or self._closed:
@@ -589,7 +619,12 @@ class ProgressiveLoader:
         vdata.set_offset(chunk_key, chunk)
         vdata.loaded_chunks.add(_chunk_id(chunk_key))
         self._chunks_done += 1
+        if self._pbar is not None:
+            self._pbar.update(1)
         final = self._chunks_done >= self._chunks_total
+        if final:
+            self._close_progress(self._pbar)
+            self._pbar = None
         self._refresh(final=final)
 
     def _on_fetch_finished(self, generation: int) -> None:
@@ -674,6 +709,8 @@ class ProgressiveLoader:
         if self._resident_worker is not None:
             self._resident_worker.quit()
             self._resident_worker = None
+        self._close_progress(self._resident_pbar)
+        self._resident_pbar = None
         vdata = self._data[self._resident_level]
         vdata.set_interval(min_coord, max_coord)
         interval = vdata.interval
@@ -686,6 +723,9 @@ class ProgressiveLoader:
         if not queue:
             return
 
+        self._resident_pbar = self._make_progress(
+            len(queue), f'{self._layer.name}: loading overview'
+        )
         worker = _fetch_chunks(vdata.array, queue)
 
         def on_chunk(result, vdata=vdata):
@@ -694,6 +734,8 @@ class ProgressiveLoader:
             chunk_key, chunk = result
             vdata.set_offset(chunk_key, chunk)
             vdata.loaded_chunks.add(_chunk_id(chunk_key))
+            if self._resident_pbar is not None:
+                self._resident_pbar.update(1)
             if self._layer.data_level == self._resident_level:
                 self._refresh()
 
@@ -701,6 +743,8 @@ class ProgressiveLoader:
             if self._closed or self._resident_worker is not worker:
                 return
             self._resident_worker = None
+            self._close_progress(self._resident_pbar)
+            self._resident_pbar = None
             self._refresh(final=True)
             # Re-evaluate coverage now that backdrops are available.
             self._check()
