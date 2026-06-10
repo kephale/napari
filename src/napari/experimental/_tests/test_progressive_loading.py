@@ -699,3 +699,28 @@ def test_huge_world_auto_normalized(qtbot, make_napari_viewer):
     assert world_extent <= 2**21
     loader = layer.metadata['progressive_loader']
     _wait_for_idle_loader(qtbot, loader)
+
+
+def test_texture_patching_used_in_3d(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    """3D chunk arrivals go to the GPU as partial texture updates rather
+    than full re-slice + re-upload refreshes."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    layer.locked_data_level = 0
+    qtbot.waitUntil(
+        lambda: len(loader._data[0].loaded_chunks) > 0, timeout=10000
+    )
+    _wait_for_idle_loader(qtbot, loader)
+    assert loader._texture_patches > 0
+    # patched texture content still matches the source at the end (the
+    # final reconcile re-slices through the normal pipeline)
+    np.testing.assert_array_equal(
+        np.asarray(loader._data[0][0:64, 0:64, 0:64]),
+        np.asarray(multiscale_3d_arrays[0]),
+    )

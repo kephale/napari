@@ -419,6 +419,12 @@ class ProgressiveLoader:
     max_chunks_per_pass : int
         3D auto level selection coarsens until the viewport tile needs
         at most this many chunks, keeping pass duration reasonable.
+    texture_patching : bool
+        In 3D, write arriving chunks directly into the existing GPU
+        texture (a partial glTexSubImage3D upload) instead of re-slicing
+        and re-uploading the whole tile per refresh. The normal slicing
+        pipeline still reconciles periodically and at the end of each
+        pass. Greatly reduces main-thread blocking for large tiles.
     """
 
     def __init__(
@@ -435,6 +441,7 @@ class ProgressiveLoader:
         max_pixel_size_3d: float = 2.0,
         fetch_workers: int | None = None,
         max_chunks_per_pass: int = DEFAULT_MAX_CHUNKS_PER_PASS,
+        texture_patching: bool = True,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -444,6 +451,10 @@ class ProgressiveLoader:
         self._auto_level_3d = auto_level_3d
         self._max_pixel_size_3d = float(max_pixel_size_3d)
         self._max_chunks_per_pass = max(int(max_chunks_per_pass), 1)
+        self._texture_patching = texture_patching
+        self._texture_patches = 0
+        self._last_node_update = 0.0
+        self._last_reconcile = 0.0
         if fetch_workers is None:
             # leave cores for the GUI event loop: saturating every core
             # with chunk fetches makes the UI unresponsive on CPU-bound
@@ -1110,12 +1121,104 @@ class ProgressiveLoader:
         if final:
             self._close_progress(self._pbar)
             self._pbar = None
+        now = time.monotonic()
+        reconcile = final or now - self._last_reconcile > 2.0
+        if (
+            not reconcile
+            and self._texture_patching
+            and self._patch_texture(vdata, chunk_key)
+        ):
+            # the chunk is already on the GPU; just (throttled) redraws
+            if now - self._last_node_update >= max(
+                self._refresh_interval_s, 0.05
+            ):
+                self._last_node_update = now
+                self._update_node()
+            return
+        self._last_reconcile = now
         self._refresh(final=final)
 
     def _on_fetch_finished(self, generation: int) -> None:
         if generation != self._generation or self._closed:
             return
         self._worker = None
+
+    def _get_volume_node(self):
+        try:
+            visual = self._viewer.window._qt_viewer.layer_to_visual[
+                self._layer
+            ]
+            return visual._layer_node.get_node(3)
+        except (KeyError, AttributeError):  # pragma: no cover - headless
+            return None
+
+    def _patch_texture(self, vdata: VirtualData, chunk_key) -> bool:
+        """Write one chunk's region into the existing 3D GPU texture.
+
+        A partial texture upload (glTexSubImage3D) is orders of magnitude
+        cheaper than the re-slice plus whole-volume upload of a pipeline
+        refresh. Only used when the texture demonstrably matches the
+        current interval; any mismatch falls back to a normal refresh.
+        """
+        if self._viewer.dims.ndisplay != 3 or vdata.ndim != 3:
+            return False
+        displayed = list(self._layer._slice_input.displayed)
+        if displayed != sorted(displayed):
+            # transposed display order: let the slicing pipeline handle it
+            return False
+        if vdata.interval is None:
+            return False
+        node = self._get_volume_node()
+        if node is None:
+            return False
+        try:
+            texture = node._texture
+            tex_shape = tuple(texture.shape[:3])
+        except (AttributeError, TypeError):  # pragma: no cover
+            return False
+        # The texture holds the corner-pixels crop of the level (the
+        # rendered tile), which sits inside the chunk-aligned interval.
+        corners = self._layer.corner_pixels
+        box_min = [int(corners[0, d]) for d in range(3)]
+        box_max = [int(corners[1, d]) + 1 for d in range(3)]
+        if tex_shape != tuple(
+            mx - mn for mn, mx in zip(box_min, box_max, strict=True)
+        ):
+            # texture not (yet) synced to the current tile
+            return False
+        low = [
+            max(int(sl.start), mn)
+            for sl, mn in zip(chunk_key, box_min, strict=True)
+        ]
+        high = [
+            min(int(sl.stop), mx)
+            for sl, mx in zip(chunk_key, box_max, strict=True)
+        ]
+        if any(h <= lo for lo, h in zip(low, high, strict=True)):
+            return False
+        # region in absolute coords -> hyperslice coords for the source,
+        # and corner-box coords for the texture offset
+        translate = vdata.translate
+        source = tuple(
+            slice(lo - tr, h - tr)
+            for lo, h, tr in zip(low, high, translate, strict=True)
+        )
+        offset = tuple(lo - mn for lo, mn in zip(low, box_min, strict=True))
+        try:
+            with vdata.lock:
+                sub = np.ascontiguousarray(vdata.hyperslice[source])
+            texture.set_data(sub, offset=offset)
+        except (
+            Exception
+        ):  # pragma: no cover - dtype/driver mismatch  # noqa: BLE001
+            return False
+        self._texture_patches += 1
+        return True
+
+    def _update_node(self) -> None:
+        node = self._get_volume_node()
+        if node is not None:
+            node.update()
 
     def _refresh(self, final: bool = False, force: bool = False) -> None:
         # Adaptive throttle: refresh as often as every chunk (so loading is
