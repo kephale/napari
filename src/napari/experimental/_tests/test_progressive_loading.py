@@ -353,6 +353,16 @@ def test_chunk_priority_3d_degenerate_camera():
             'view_direction': (1, 0, 0),
             'zoom': 0.0,
         },
+        # huge-but-finite center: overflows the priority arithmetic
+        {
+            'camera_center': (1e308, -1e308, 1e308),
+            'view_direction': (1, 0, 0),
+        },
+        {
+            'camera_center': (32, 32, 32),
+            'view_direction': (1, 0, 0),
+            'zoom': 1e308,
+        },
     ]
     for camera in degenerate_cameras:
         with warnings.catch_warnings():
@@ -414,4 +424,54 @@ def test_auto_level_3d_survives_selector_echo(
     # auto mode still follows the zoom afterwards
     viewer.camera.zoom = 50.0
     qtbot.waitUntil(lambda: layer.data_level == 0, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+
+
+# ---------- never-empty canvas (backdrop across level switches) ----------
+
+
+def test_backdrop_prefers_nearest_loaded_level(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    """A level switch should source its backdrop from the level that was
+    just displayed, not always the coarsest level."""
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    # fully load level 1 (wait for chunks: the fetch pass itself only
+    # starts after the debounced check fires)
+    layer.locked_data_level = 1
+    qtbot.waitUntil(
+        lambda: len(loader._data[1].loaded_chunks) > 0, timeout=10000
+    )
+    _wait_for_idle_loader(qtbot, loader)
+
+    min_coord = np.zeros(2, dtype=np.int64)
+    max_coord = np.asarray(loader._data[0].shape, dtype=np.int64)
+    assert loader._backdrop_level(0, min_coord, max_coord) == 1
+
+
+def test_level_switch_keeps_canvas_filled(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    """Right after switching to a not-yet-fetched level, the level's data
+    must already contain (upsampled) content from a previously displayed
+    level — the canvas is never empty while chunks stream in."""
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    layer.locked_data_level = 0
+    # as soon as the interval exists (set by the fast backdrop path or the
+    # fetch pass), it must be filled with backdrop content — without
+    # waiting for the fetch to complete
+    qtbot.waitUntil(
+        lambda: loader._data[0].interval is not None, timeout=10000
+    )
+    hyperslice = loader._data[0].hyperslice
+    # source data has no zeros, so any zeros would be unfilled regions
+    assert (hyperslice == 0).mean() < 0.05
     _wait_for_idle_loader(qtbot, loader)

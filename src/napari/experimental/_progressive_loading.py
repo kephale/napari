@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from psygnal import debounced
+from qtpy.QtCore import QTimer
 from superqt import ensure_main_thread
 
 from napari.experimental._virtual_data import (
@@ -236,8 +237,9 @@ def chunk_priority_3D(
     Notes
     -----
     The camera state is sanitized: a degenerate (zero/non-finite) view
-    direction or non-finite camera center/zoom — which can occur before
-    the 3D camera is fully initialized — falls back to plain
+    direction, a non-finite camera center/zoom, or values so large that
+    the arithmetic overflows — all of which can occur before the 3D
+    camera is fully initialized — fall back to plain
     view-center-distance ordering instead of producing NaN priorities.
     """
     keys = _chunk_keys_product(chunk_keys)
@@ -257,24 +259,32 @@ def chunk_priority_3D(
         if np.all(np.isfinite(view_direction))
         else 0.0
     )
+    priority = None
     if (
-        camera_center.shape != (3,)
-        or not np.all(np.isfinite(camera_center))
-        or direction_norm < 1e-12
+        camera_center.shape == (3,)
+        and np.all(np.isfinite(camera_center))
+        and direction_norm >= 1e-12
     ):
-        # Camera not (yet) in a usable 3D state: order by view center only.
-        priority = center_view_dist
-    else:
         view_direction = view_direction / direction_norm
         if not np.isfinite(zoom) or zoom <= 0:
             zoom = 1.0
-        relative = centers - camera_center
-        depth = relative @ view_direction
-        projected = view_direction * depth[:, np.newaxis]
-        center_line_dist = np.linalg.norm(projected - relative, axis=-1)
-        priority = (
-            depth + zoom * center_line_dist + center_weight * center_view_dist
-        )
+        # Large-magnitude (but finite) camera coordinates can overflow
+        # the arithmetic below; compute silently and validate the result.
+        with np.errstate(all='ignore'):
+            relative = centers - camera_center
+            depth = relative @ view_direction
+            projected = view_direction * depth[:, np.newaxis]
+            center_line_dist = np.linalg.norm(projected - relative, axis=-1)
+            candidate = (
+                depth
+                + zoom * center_line_dist
+                + center_weight * center_view_dist
+            )
+        if np.all(np.isfinite(candidate)):
+            priority = candidate
+    if priority is None:
+        # Camera not (yet) in a usable 3D state: order by view center only.
+        priority = center_view_dist
     return [keys[i] for i in np.argsort(priority, kind='stable')]
 
 
@@ -382,6 +392,7 @@ class ProgressiveLoader:
         self._last_refresh = 0.0
         self._pbar = None
         self._resident_pbar = None
+        self._backdrop_pending = False
 
         self._resident_worker = None
         self._resident_level = len(data) - 1
@@ -408,6 +419,11 @@ class ProgressiveLoader:
             # napari runs when the data level or corners change; _check is
             # a cheap no-op when the view is already covered.
             (layer.events.set_data, self._debounced_check),
+            # fast (non-debounced) path: the instant napari slices a level
+            # whose interval does not cover the view (i.e. the canvas just
+            # went blank), put a backdrop up rather than waiting for the
+            # debounced fetch pass
+            (layer.events.set_data, self._on_set_data),
         ]
         for emitter, callback in self._connections:
             emitter.connect(callback)
@@ -623,6 +639,19 @@ class ProgressiveLoader:
         corners = np.zeros((2, layer.ndim), dtype=int)
         corners[1, displayed_axes] = shape_at_level[displayed_axes] - 1
         layer.corner_pixels = corners
+        # Prepare the new level's interval with a backdrop from the level
+        # that was just displayed BEFORE napari re-slices, so the previous
+        # resolution stays on screen until new chunks replace it.
+        min_coord, max_coord = self._level_interval(target)
+        if not np.any(max_coord <= min_coord):
+            self._data.set_interval(
+                target,
+                min_coord,
+                max_coord,
+                backdrop_level=self._backdrop_level(
+                    target, min_coord, max_coord
+                ),
+            )
         layer.refresh(extent=False)
 
     def _release_auto_level(self) -> None:
@@ -666,13 +695,88 @@ class ProgressiveLoader:
             return
         self._start_fetch(level, min_coord, max_coord)
 
-    def _backdrop_level(self, level: int) -> int | None:
-        coarsest = len(self._data) - 1
-        if level == coarsest:
-            return None
-        if self._data[coarsest].interval is None:
-            return None
-        return coarsest
+    def _backdrop_level(self, level: int, min_coord, max_coord) -> int | None:
+        """Pick the best level to initialize newly exposed regions from.
+
+        Prefers the level closest in resolution to ``level`` whose resident
+        data fully covers the requested region — usually the level that was
+        just displayed, so a resolution switch keeps the previous data on
+        screen until the new chunks arrive. Falls back to the coarsest
+        level with any loaded data.
+        """
+        n_levels = len(self._data)
+        factors = self._data._scale_factors
+        ndim = self._data.ndim
+        candidates = sorted(
+            (c for c in range(n_levels) if c != level),
+            key=lambda c: (abs(c - level), c),
+        )
+        fallback = None
+        for cand in candidates:
+            src = self._data[cand]
+            if not src.loaded_chunks:
+                continue
+            cand_min = [
+                int(
+                    np.floor(
+                        min_coord[d] * factors[level][d] / factors[cand][d]
+                    )
+                )
+                for d in range(ndim)
+            ]
+            cand_max = [
+                int(
+                    np.ceil(
+                        max_coord[d] * factors[level][d] / factors[cand][d]
+                    )
+                )
+                for d in range(ndim)
+            ]
+            cand_min = np.clip(cand_min, 0, src.shape)
+            cand_max = np.clip(cand_max, 0, src.shape)
+            if src.covers(cand_min, cand_max):
+                return cand
+            if cand == n_levels - 1:
+                fallback = cand
+        return fallback
+
+    def _on_set_data(self, event=None) -> None:
+        """Fast path keeping the canvas filled across level switches.
+
+        napari re-slices immediately when it changes the data level, often
+        before any fetch pass has prepared that level's interval — the
+        slice then materializes zeros. Detect that here and schedule a
+        backdrop (outside the event emission stack) so at most one blank
+        frame is shown.
+        """
+        if self._closed or self._backdrop_pending or not self._layer.visible:
+            return
+        level = int(self._layer.data_level)
+        min_coord, max_coord = self._level_interval(level)
+        if np.any(max_coord <= min_coord):
+            return
+        if self._data[level].covers(min_coord, max_coord):
+            return
+        self._backdrop_pending = True
+        QTimer.singleShot(0, self._prepare_backdrop)
+
+    def _prepare_backdrop(self) -> None:
+        self._backdrop_pending = False
+        if self._closed or not self._layer.visible:
+            return
+        level = int(self._layer.data_level)
+        min_coord, max_coord = self._level_interval(level)
+        if np.any(max_coord <= min_coord):
+            return
+        if self._data[level].covers(min_coord, max_coord):
+            return
+        self._data.set_interval(
+            level,
+            min_coord,
+            max_coord,
+            backdrop_level=self._backdrop_level(level, min_coord, max_coord),
+        )
+        self._refresh(force=True)
 
     def _start_fetch(self, level: int, min_coord, max_coord) -> None:
         self._cancel_active()
@@ -682,7 +786,7 @@ class ProgressiveLoader:
             level,
             min_coord,
             max_coord,
-            backdrop_level=self._backdrop_level(level),
+            backdrop_level=self._backdrop_level(level, min_coord, max_coord),
         )
         self._active = (level, tuple(min_coord), tuple(max_coord))
 
@@ -716,6 +820,10 @@ class ProgressiveLoader:
         self._pbar = self._make_progress(
             len(queue), f'{self._layer.name}: loading level {level}'
         )
+
+        # Show carried-over and backdrop content before the first chunk
+        # arrives so the canvas is never empty while fetching.
+        self._refresh(force=True)
 
         worker = _fetch_chunks(vdata.array, queue)
         worker.yielded.connect(
@@ -789,9 +897,12 @@ class ProgressiveLoader:
             return
         self._worker = None
 
-    def _refresh(self, final: bool = False) -> None:
+    def _refresh(self, final: bool = False, force: bool = False) -> None:
         now = time.monotonic()
-        if not final and now - self._last_refresh < self._refresh_interval_s:
+        if (
+            not (final or force)
+            and now - self._last_refresh < self._refresh_interval_s
+        ):
             return
         self._last_refresh = now
         self._layer.refresh(extent=False, highlight=False, thumbnail=final)
