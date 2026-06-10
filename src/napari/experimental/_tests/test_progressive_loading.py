@@ -210,3 +210,116 @@ def test_interval_clamped_to_memory_budget(
     extent = np.asarray(max_coord) - np.asarray(min_coord)
     assert np.prod(extent) <= 4096
     loader.close()
+
+
+# ---------- 3D automatic level selection ----------
+
+
+@pytest.fixture
+def multiscale_3d_arrays():
+    base = np.random.default_rng(0).integers(
+        1, 255, size=(64, 64, 64), dtype=np.uint8
+    )
+    levels = [base, base[::2, ::2, ::2].copy(), base[::4, ::4, ::4].copy()]
+    return [da.from_array(level, chunks=(16, 16, 16)) for level in levels]
+
+
+def test_auto_level_3d_follows_zoom(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    # zoomed far out: coarsest level
+    viewer.camera.zoom = 0.01
+    qtbot.waitUntil(lambda: layer.data_level == 2, timeout=10000)
+    # the resolution selector still reads "Auto" to the user: the level
+    # was driven without emitting locked_data_level events
+    assert not loader._user_locked
+    _wait_for_idle_loader(qtbot, loader)
+
+    # zoomed in: finest level
+    viewer.camera.zoom = 50.0
+    qtbot.waitUntil(lambda: layer.data_level == 0, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+    assert len(loader._data[0].loaded_chunks) > 0
+
+
+def test_auto_level_3d_respects_user_pin(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    layer.locked_data_level = 2
+    assert loader._user_locked
+    viewer.camera.zoom = 50.0
+    loader._check()
+    # auto mode must not override the user's pin
+    assert layer.data_level == 2
+    _wait_for_idle_loader(qtbot, loader)
+
+    # back to Auto: zoom-driven selection resumes
+    layer.locked_data_level = None
+    assert not loader._user_locked
+    qtbot.waitUntil(lambda: layer.data_level == 0, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_auto_level_3d_released_in_2d(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    viewer.camera.zoom = 50.0
+    qtbot.waitUntil(lambda: loader._auto_locked is not None, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+
+    viewer.dims.ndisplay = 2
+    qtbot.waitUntil(lambda: loader._auto_locked is None, timeout=10000)
+    # napari's own 2D level selection is back in control
+    assert layer._locked_data_level is None
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_auto_level_3d_can_be_disabled(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(
+        multiscale_3d_arrays, viewer=viewer, auto_level_3d=False
+    )
+    loader = layer.metadata['progressive_loader']
+    viewer.camera.zoom = 50.0
+    loader._check()
+    # napari's 3D behavior: coarsest level
+    assert layer.data_level == len(multiscale_3d_arrays) - 1
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_zoom_target_level_respects_memory_budget(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    from napari.experimental._virtual_data import MultiScaleVirtualData
+
+    data = MultiScaleVirtualData(multiscale_3d_arrays)
+    layer = viewer.add_image(
+        data._data, multiscale=True, contrast_limits=(0, 255)
+    )
+    loader = ProgressiveLoader(viewer, layer, data, interval_max_bytes=20**3)
+    layer.metadata['progressive_loader'] = loader
+    viewer.camera.zoom = 50.0
+    # level 0 (64^3) and level 1 (32^3) exceed the budget; 2 (16^3) fits
+    assert loader._zoom_target_level_3d() == 2
+    loader.close()

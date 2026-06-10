@@ -5,11 +5,13 @@ Progressive loading: 3D Mandelbulb
 Display a multiscale 3D volume whose chunks are computed on the fly, using
 napari's experimental progressive loading in 3D.
 
-In 3D, napari renders the coarsest level of a multiscale image. Chunks are
-prioritized by distance to the camera, so the volume fills in from the
-front of the view. Use the resolution selector in the layer controls
-(``locked_data_level``) to force a finer level — its chunks will stream in
-progressively, with coarser data shown as a backdrop in the meantime.
+While napari itself renders the coarsest level of a multiscale image in
+3D, progressive loading automatically selects the data level from the
+camera zoom: zoom in and finer chunks stream in progressively, with
+coarser data shown as a backdrop in the meantime. Chunks are prioritized
+by distance to the camera, so the volume fills in from the front of the
+view. The resolution selector in the layer controls can still pin an
+explicit level; set it back to "Auto" to resume zoom-driven selection.
 
 .. tags:: experimental
 """

@@ -310,6 +310,14 @@ class ProgressiveLoader:
         Keep the coarsest level fully in memory if it is at most this big.
     interval_max_bytes : int
         Upper bound for a single level's resident interval.
+    auto_level_3d : bool
+        In 3D, automatically select the data level from the camera zoom
+        (napari itself always renders the coarsest level in 3D). The level
+        is driven through the layer's internal level lock without emitting
+        events, so the resolution selector still reads "Auto"; choosing an
+        explicit level in the selector suspends automatic selection until
+        it is set back to "Auto". Levels too large for
+        ``interval_max_bytes`` are skipped in favor of coarser ones.
     """
 
     def __init__(
@@ -322,12 +330,20 @@ class ProgressiveLoader:
         refresh_interval_s: float = 0.1,
         resident_max_bytes: int = DEFAULT_RESIDENT_MAX_BYTES,
         interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
+        auto_level_3d: bool = True,
     ):
         self._viewer = viewer
         self._layer = layer
         self._data = data
         self._refresh_interval_s = refresh_interval_s
         self._interval_max_bytes = interval_max_bytes
+        self._auto_level_3d = auto_level_3d
+        # Level we set through layer._locked_data_level for 3D auto mode
+        # (None when we are not driving the level).
+        self._auto_locked: int | None = None
+        # True while the user has pinned an explicit level in the
+        # resolution selector; suspends 3D auto level selection.
+        self._user_locked = layer.locked_data_level is not None
         self._closed = False
 
         self._worker = None
@@ -355,6 +371,10 @@ class ProgressiveLoader:
             (viewer.dims.events.current_step, self._debounced_check),
             (viewer.dims.events.ndisplay, self._debounced_check),
             (layer.events.locked_data_level, self._debounced_check),
+            # the locked_data_level event only fires for user/API writes
+            # (3D auto mode bypasses the setter), so it reliably tells us
+            # whether the user has pinned a level
+            (layer.events.locked_data_level, self._on_user_locked_change),
             (layer.events.visible, self._debounced_check),
             # set_data fires after every (re-)slice, including the ones
             # napari runs when the data level or corners change; _check is
@@ -384,6 +404,7 @@ class ProgressiveLoader:
         if self._closed:
             return
         self._closed = True
+        self._release_auto_level()
         self._cancel_active()
         if self._resident_worker is not None:
             self._resident_worker.quit()
@@ -487,6 +508,99 @@ class ProgressiveLoader:
                 LOGGER.warning(message)
         return min_coord, max_coord
 
+    # -- 3D automatic level selection --
+
+    def _on_user_locked_change(self, event=None) -> None:
+        """Track explicit level pins made through the resolution selector.
+
+        This only fires for writes through the public
+        ``locked_data_level`` setter — 3D auto mode writes the private
+        attribute directly — so a non-None value here is always a user
+        (or API) choice.
+        """
+        self._user_locked = self._layer.locked_data_level is not None
+        if self._user_locked:
+            self._auto_locked = None
+
+    def _zoom_target_level_3d(self, max_pixel_size: float = 4.0) -> int:
+        """Pick the 3D data level appropriate for the current camera zoom.
+
+        Chooses the coarsest level whose voxels project to at most
+        ``max_pixel_size`` screen pixels (so the displayed resolution
+        roughly matches the screen, like napari's 2D level selection),
+        then falls back to coarser levels until the visible volume fits
+        the memory budget.
+        """
+        layer = self._layer
+        zoom = float(self._viewer.camera.zoom)
+        displayed = list(layer._slice_input.displayed)
+        n_levels = len(self._data)
+
+        target = 0
+        for level in range(n_levels - 1, -1, -1):
+            factors = np.take(
+                np.asarray(self._data._scale_factors[level]), displayed
+            )
+            pixel_size = zoom * float(np.max(factors))
+            if pixel_size <= max_pixel_size:
+                target = level
+                break
+
+        # Coarsen until the visible volume (full displayed extent at the
+        # current step of other dims) fits the interval budget.
+        for level in range(target, n_levels):
+            vdata = self._data[level]
+            extent = np.take(
+                np.asarray(vdata.shape, dtype=np.int64), displayed
+            )
+            nbytes = np.prod(extent, dtype=np.int64) * vdata.dtype.itemsize
+            if nbytes <= self._interval_max_bytes:
+                return level
+        return n_levels - 1
+
+    def _apply_auto_level(self) -> None:
+        """Drive the layer's data level from zoom while in 3D Auto mode.
+
+        Writes ``layer._locked_data_level`` directly (not the public
+        setter) so no ``locked_data_level`` event is emitted and the
+        resolution selector keeps displaying "Auto".
+        """
+        layer = self._layer
+        if not self._auto_level_3d or self._user_locked:
+            return
+        if self._viewer.dims.ndisplay != 3:
+            self._release_auto_level()
+            return
+        target = self._zoom_target_level_3d()
+        if target == self._auto_locked and layer._locked_data_level == target:
+            return
+        self._auto_locked = target
+        layer._locked_data_level = target
+        layer._data_level = target
+        # Mirror the corner_pixels update of the locked_data_level setter.
+        displayed_axes = layer._slice_input.displayed
+        shape_at_level = np.array(layer.level_shapes[target])
+        corners = np.zeros((2, layer.ndim), dtype=int)
+        corners[1, displayed_axes] = shape_at_level[displayed_axes] - 1
+        layer.corner_pixels = corners
+        layer.refresh(extent=False)
+
+    def _release_auto_level(self) -> None:
+        """Give level control back to napari (e.g. on 2D or teardown)."""
+        layer = self._layer
+        if (
+            self._auto_locked is not None
+            and not self._user_locked
+            and layer._locked_data_level == self._auto_locked
+        ):
+            layer._locked_data_level = None
+            layer._reset_data_level()
+            # _reset_data_level cleared the lock state; preserve our flag
+            self._auto_locked = None
+            layer.refresh(extent=False)
+        else:
+            self._auto_locked = None
+
     # -- fetch passes --
 
     def _check(self, event=None) -> None:
@@ -497,6 +611,7 @@ class ProgressiveLoader:
         if not layer.visible:
             self._cancel_active()
             return
+        self._apply_auto_level()
         self._ensure_resident()
         level = int(layer.data_level)
         min_coord, max_coord = self._level_interval(level)
@@ -592,9 +707,7 @@ class ProgressiveLoader:
             return None
         try:
             return progress(total=total, desc=description)
-        except (
-            Exception
-        ):  # pragma: no cover - progress is cosmetic  # noqa: BLE001
+        except Exception:  # noqa: BLE001 # pragma: no cover - cosmetic
             return None
 
     @staticmethod
@@ -786,6 +899,7 @@ def add_progressive_loading_image(
     colormap: str = 'gray',
     rendering: str = 'attenuated_mip',
     name: str | None = None,
+    auto_level_3d: bool = True,
     **layer_kwargs,
 ):
     """Add a progressively loading multiscale image to a viewer.
@@ -813,6 +927,11 @@ def add_progressive_loading_image(
         3D rendering mode for the layer.
     name : str, optional
         Layer name.
+    auto_level_3d : bool
+        In 3D, automatically pick the rendered data level from the camera
+        zoom (napari itself always uses the coarsest level in 3D). The
+        resolution selector stays on "Auto"; pinning an explicit level
+        there suspends automatic selection.
     **layer_kwargs
         Additional keyword arguments passed to ``viewer.add_image``.
 
@@ -841,6 +960,8 @@ def add_progressive_loading_image(
         name=name,
         **layer_kwargs,
     )
-    loader = ProgressiveLoader(viewer, layer, data)
+    loader = ProgressiveLoader(
+        viewer, layer, data, auto_level_3d=auto_level_3d
+    )
     layer.metadata['progressive_loader'] = loader
     return layer
