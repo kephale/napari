@@ -481,6 +481,8 @@ class ProgressiveLoader:
         self._max_chunks_per_pass = max(int(max_chunks_per_pass), 1)
         self._texture_patching = texture_patching
         self._texture_patches = 0
+        self._pass_all_patched = False
+        self._needs_final_reconcile = False
         self._last_node_update = 0.0
         if fetch_workers is None:
             # leave cores for the GUI event loop: saturating every core
@@ -898,6 +900,9 @@ class ProgressiveLoader:
         view_key = (level, tuple(min_coord), tuple(max_coord))
         if view_key == self._active:
             # A pass for exactly this view is in flight or already done.
+            if self._needs_final_reconcile and self._worker is None:
+                self._needs_final_reconcile = False
+                self._refresh(final=True, force=True)
             return
         self._start_fetch(level, min_coord, max_coord)
 
@@ -1023,6 +1028,8 @@ class ProgressiveLoader:
         generation = self._generation
         self._chunks_done = 0
         self._chunks_total = len(queue)
+        self._pass_all_patched = True
+        self._needs_final_reconcile = False
         self._pbar = self._make_progress(
             len(queue), f'{self._layer.name}: loading level {level}'
         )
@@ -1074,8 +1081,15 @@ class ProgressiveLoader:
         )
 
     def _make_progress(self, total: int, description: str):
-        """Best-effort progress bar shown in the napari activity dock."""
+        """Best-effort progress bar shown in the napari activity dock.
+
+        Disabled in 3D: the chunk fill-in is visible feedback there, and
+        Qt progress updates call processEvents(), which costs main-thread
+        time precisely when streaming is busiest.
+        """
         if total < PROGRESS_MIN_CHUNKS:
+            return None
+        if self._viewer.dims.ndisplay == 3:
             return None
         try:
             return progress(total=total, desc=description)
@@ -1158,25 +1172,34 @@ class ProgressiveLoader:
             self._close_progress(self._pbar)
             self._pbar = None
         # While the pass is streaming, patched chunks keep the GPU texture
-        # identical to what a pipeline refresh would produce, so the only
-        # full re-slice + re-upload happens once at the end of the pass
-        # (and at its start, for the backdrop). Mid-pass full uploads were
-        # the main remaining UI stalls on slow GL drivers.
-        patched = not final and self._texture_patching
-        if patched:
-            for chunk_key in batch:
-                if not self._patch_texture(vdata, chunk_key):
-                    patched = False
-                    break
-        if patched:
-            now = time.monotonic()
-            if now - self._last_node_update >= max(
-                self._refresh_interval_s, 0.05
-            ):
-                self._last_node_update = now
-                self._update_node()
+        # identical to what a pipeline refresh would produce: each batch
+        # is one coalesced partial upload, and the only full re-slice +
+        # re-upload runs once per pass — at its start (backdrop) and,
+        # deferred to idle, after its end. Mid-pass full uploads were the
+        # main remaining UI stalls on slow GL drivers.
+        patched = self._texture_patching and self._patch_texture_batch(
+            vdata, batch
+        )
+        if not patched:
+            self._pass_all_patched = False
+            self._refresh(final=final)
             return
-        self._refresh(final=final)
+        now = time.monotonic()
+        if final:
+            self._update_node()
+            if self._pass_all_patched:
+                # The texture already shows every chunk. Defer the full
+                # consistency refresh (thumbnail, slice state) to the
+                # next interaction, where it folds into the pass-start
+                # refresh instead of stalling the moment loading ends.
+                self._needs_final_reconcile = True
+            else:
+                self._refresh(final=True)
+        elif now - self._last_node_update >= max(
+            self._refresh_interval_s, 0.05
+        ):
+            self._last_node_update = now
+            self._update_node()
 
     def _on_fetch_finished(self, generation: int) -> None:
         if generation != self._generation or self._closed:
@@ -1193,7 +1216,30 @@ class ProgressiveLoader:
             return None
 
     def _patch_texture(self, vdata: VirtualData, chunk_key) -> bool:
-        """Write one chunk's region into the existing 3D GPU texture.
+        """Write one chunk's region into the existing 3D GPU texture."""
+        low = [int(sl.start) for sl in chunk_key]
+        high = [int(sl.stop) for sl in chunk_key]
+        return self._patch_texture_region(vdata, low, high)
+
+    def _patch_texture_batch(self, vdata: VirtualData, batch) -> bool:
+        """Upload a batch of chunks as ONE coalesced texture update.
+
+        Uploads the union bounding box of the batch from the hyperslice
+        in a single partial transfer — front-to-back ordering makes
+        batches spatially coherent, and many small GL calls cost more
+        than one slightly larger one. Voxels inside the box that are not
+        loaded yet simply re-upload their current (backdrop) content.
+        """
+        if not batch:
+            return True
+        if self._viewer.dims.ndisplay != 3 or vdata.ndim != 3:
+            return False
+        low = [min(int(key[d].start) for key in batch) for d in range(3)]
+        high = [max(int(key[d].stop) for key in batch) for d in range(3)]
+        return self._patch_texture_region(vdata, low, high)
+
+    def _patch_texture_region(self, vdata: VirtualData, low, high) -> bool:
+        """Write an absolute-coordinate region into the 3D GPU texture.
 
         A partial texture upload (glTexSubImage3D) is orders of magnitude
         cheaper than the re-slice plus whole-volume upload of a pipeline
@@ -1226,14 +1272,8 @@ class ProgressiveLoader:
         ):
             # texture not (yet) synced to the current tile
             return False
-        low = [
-            max(int(sl.start), mn)
-            for sl, mn in zip(chunk_key, box_min, strict=True)
-        ]
-        high = [
-            min(int(sl.stop), mx)
-            for sl, mx in zip(chunk_key, box_max, strict=True)
-        ]
+        low = [max(int(lo), mn) for lo, mn in zip(low, box_min, strict=True)]
+        high = [min(int(h), mx) for h, mx in zip(high, box_max, strict=True)]
         if any(h <= lo for lo, h in zip(low, high, strict=True)):
             return False
         # region in absolute coords -> hyperslice coords for the source,
