@@ -68,6 +68,10 @@ PROGRESS_MIN_CHUNKS = 16
 #: 3D auto level selection coarsens until the viewport tile needs at most
 #: this many chunks, so a pass completes in seconds rather than minutes.
 DEFAULT_MAX_CHUNKS_PER_PASS = 384
+#: Maximum size of a 3D sub-volume tile, in bytes. Full-tile GPU uploads
+#: (pass start/end) block the GUI for roughly size / 125 MB/s on slow GL
+#: drivers, so this is deliberately much smaller than the memory budget.
+DEFAULT_TILE_MAX_BYTES_3D = 32 * 1024**2
 
 
 # ---------- chunk geometry ----------
@@ -453,6 +457,11 @@ class ProgressiveLoader:
         and re-uploading the whole tile per refresh. The normal slicing
         pipeline still reconciles periodically and at the end of each
         pass. Greatly reduces main-thread blocking for large tiles.
+    tile_max_bytes_3d : int
+        Upper bound for a 3D sub-volume tile. Each pass performs a full
+        tile GPU upload at its boundaries, which blocks the GUI roughly
+        in proportion to this size; raise it on fast GPUs for larger
+        high-resolution tiles.
     """
 
     def __init__(
@@ -470,6 +479,7 @@ class ProgressiveLoader:
         fetch_workers: int | None = None,
         max_chunks_per_pass: int = DEFAULT_MAX_CHUNKS_PER_PASS,
         texture_patching: bool = True,
+        tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -569,7 +579,7 @@ class ProgressiveLoader:
         # this size, so even the finest levels of huge volumes are usable
         # in 3D. Bounded by the memory budget and the GL 3D texture limit.
         self._tile_extent_3d = _tile_extent_3d_for(
-            data.dtype, interval_max_bytes
+            data.dtype, min(interval_max_bytes, tile_max_bytes_3d)
         )
         layer._max_tile_extent_3d = self._tile_extent_3d
 
@@ -1522,6 +1532,7 @@ def add_progressive_loading_image(
     auto_level_3d: bool = True,
     max_pixel_size_3d: float = 2.0,
     interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
+    tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
     **layer_kwargs,
 ):
     """Add a progressively loading multiscale image to a viewer.
@@ -1558,8 +1569,11 @@ def add_progressive_loading_image(
         Tuning knob for 3D auto level selection: target the coarsest
         level whose voxels project to at most this many screen pixels.
     interval_max_bytes : int
-        Memory budget for a single level's resident interval; also
-        bounds the 3D sub-volume tile size.
+        Memory budget for a single level's resident interval.
+    tile_max_bytes_3d : int
+        Upper bound for a 3D sub-volume tile; bounds the cost of the
+        full-tile GPU uploads at pass boundaries (roughly
+        size / 125 MB/s of GUI blocking on slow GL drivers).
     **layer_kwargs
         Additional keyword arguments passed to ``viewer.add_image``.
 
@@ -1615,7 +1629,7 @@ def add_progressive_loading_image(
         **layer_kwargs,
     )
     layer._max_tile_extent_3d = _tile_extent_3d_for(
-        data.dtype, interval_max_bytes
+        data.dtype, min(interval_max_bytes, tile_max_bytes_3d)
     )
     viewer.layers.append(layer)
     # Slice off the main thread: refreshes materialize the visible tile
@@ -1634,6 +1648,7 @@ def add_progressive_loading_image(
         auto_level_3d=auto_level_3d,
         max_pixel_size_3d=max_pixel_size_3d,
         interval_max_bytes=interval_max_bytes,
+        tile_max_bytes_3d=tile_max_bytes_3d,
     )
     layer.metadata['progressive_loader'] = loader
     return layer
