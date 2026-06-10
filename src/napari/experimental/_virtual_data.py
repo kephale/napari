@@ -25,6 +25,7 @@ lock so background fetch threads and the main thread can safely interleave.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import threading
 from typing import TYPE_CHECKING
@@ -534,3 +535,55 @@ class MultiScaleVirtualData:
             else None
         )
         self._data[level].set_interval(min_coord, max_coord, backdrop=backdrop)
+
+    def fill_unloaded_from(self, level: int, src_level: int) -> bool:
+        """Fill not-yet-loaded chunk regions of ``level`` from ``src_level``.
+
+        Used to repair the backdrop when the source level finished loading
+        only after the destination level's interval had been initialized
+        (which would otherwise leave zeros on screen until real chunks
+        arrive). Already-loaded chunks are left untouched.
+
+        Returns True if anything was written.
+        """
+        backdrop = self.backdrop_for(level, src_level)
+        if backdrop is None:
+            return False
+        dst = self._data[level]
+        with dst.lock:
+            if dst._min_coord is None or dst.hyperslice.size == 0:
+                return False
+            content = backdrop(dst._min_coord, dst._max_coord)
+            if content is None or content.shape != dst.hyperslice.shape:
+                return False
+            if not dst.loaded_chunks:
+                dst.hyperslice[:] = content
+                return True
+            # per-dimension chunk extents covering the interval, as
+            # (relative_start, relative_stop, absolute_id) entries
+            per_dim: list[list[tuple[int, int, tuple[int, int]]]] = []
+            for dim in range(dst.ndim):
+                bounds = dst._boundaries[dim]
+                lo, hi = dst._min_coord[dim], dst._max_coord[dim]
+                first = int(np.searchsorted(bounds, lo, side='left'))
+                entries = []
+                start = int(bounds[first])
+                for stop in bounds[first + 1 :]:
+                    stop = int(stop)
+                    if start >= hi:
+                        break
+                    entries.append((start - lo, stop - lo, (start, stop)))
+                    start = stop
+                per_dim.append(entries)
+            wrote = False
+            for combo in itertools.product(*per_dim):
+                chunk_id = tuple(absolute for *_rel, absolute in combo)
+                if chunk_id in dst.loaded_chunks:
+                    continue
+                key = tuple(
+                    slice(rel_start, rel_stop)
+                    for rel_start, rel_stop, _absolute in combo
+                )
+                dst.hyperslice[key] = content[key]
+                wrote = True
+            return wrote

@@ -321,8 +321,11 @@ def test_zoom_target_level_respects_memory_budget(
     )
     loader = ProgressiveLoader(viewer, layer, data, interval_max_bytes=20**3)
     layer.metadata['progressive_loader'] = loader
-    viewer.camera.zoom = 50.0
-    # level 0 (64^3) and level 1 (32^3) exceed the budget; 2 (16^3) fits
+    # zoomed OUT, the viewport covers the whole volume: level 0 (64^3,
+    # tiled to 32^3 minimum) and level 1 (32^3) exceed the byte budget;
+    # level 2 (16^3) fits. (Zoomed in, the viewport bound can make finer
+    # levels affordable - see test_zoom_target_respects_chunk_budget.)
+    viewer.camera.zoom = 0.1
     assert loader._zoom_target_level_3d() == 2
     loader.close()
 
@@ -613,4 +616,86 @@ def test_auto_label_shows_current_level(
 
     layer.locked_data_level = 0
     qtbot.waitUntil(lambda: combo.itemText(0) == 'Auto (0)', timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+
+
+# ---------- deep pyramids (zoomed-out economics, world-size limits) ----------
+
+
+def test_zoom_target_respects_chunk_budget(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    """Auto level selection coarsens until the viewport tile can be
+    fetched within max_chunks_per_pass."""
+    from napari.experimental._virtual_data import MultiScaleVirtualData
+
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    data = MultiScaleVirtualData(multiscale_3d_arrays)
+    layer = viewer.add_image(
+        data._data, multiscale=True, contrast_limits=(0, 255)
+    )
+    loader = ProgressiveLoader(
+        viewer, layer, data, max_chunks_per_pass=8, auto_level_3d=True
+    )
+    layer.metadata['progressive_loader'] = loader
+    _wait_for_idle_loader(qtbot, loader)
+    # close first so the camera change cannot start fetch passes; the
+    # level computation itself is a pure function of the camera state
+    loader.close()
+    viewer.camera.zoom = 0.1  # zoomed out: viewport covers the volume
+    target = loader._zoom_target_level_3d()
+    # level 0 = 4^3 = 64 chunks > 8; level 1 = 2^3 = 8 chunks fits
+    assert target >= 1
+
+
+def test_fill_unloaded_from_repairs_backdrop():
+    """Backdrop repair fills only chunks without real data."""
+    from napari.experimental._virtual_data import MultiScaleVirtualData
+
+    base = np.full((64, 64), 7, dtype=np.uint8)
+    coarse = np.full((32, 32), 9, dtype=np.uint8)
+    msvd = MultiScaleVirtualData(
+        [
+            da.from_array(base, chunks=(16, 16)),
+            da.from_array(coarse, chunks=(16, 16)),
+        ]
+    )
+    # resident coarse level fully loaded
+    msvd[1].set_interval((0, 0), (32, 32))
+    msvd[1].set_offset((slice(0, 32), slice(0, 32)), coarse)
+    msvd[1].loaded_chunks.add(((0, 16), (0, 16)))
+
+    # fine level: interval initialized to zeros (the race), one real chunk
+    msvd[0].set_interval((0, 0), (64, 64))
+    msvd[0].set_offset((slice(0, 16), slice(0, 16)), base[:16, :16])
+    msvd[0].loaded_chunks.add(((0, 16), (0, 16)))
+
+    assert msvd.fill_unloaded_from(0, 1)
+    hyperslice = msvd[0].hyperslice
+    # the loaded chunk keeps its real data
+    assert (hyperslice[:16, :16] == 7).all()
+    # everything else now shows the upsampled coarse value
+    assert (hyperslice[16:, 16:] == 9).all()
+    assert (hyperslice[:16, 16:] == 9).all()
+
+
+def test_huge_world_auto_normalized(qtbot, make_napari_viewer):
+    """Pyramids whose extent exceeds float32 rendering precision get a
+    normalizing layer scale (3D rendering goes blank past 2**22)."""
+    base_shape = 2**23
+    levels = []
+    size = base_shape
+    while size >= 64:
+        levels.append(
+            da.zeros((size, size), chunks=(min(size, 64),) * 2, dtype='u1')
+        )
+        size //= 2
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(
+        levels, viewer=viewer, contrast_limits=(0, 255)
+    )
+    world_extent = base_shape * layer.scale[0]
+    assert world_extent <= 2**21
+    loader = layer.metadata['progressive_loader']
     _wait_for_idle_loader(qtbot, loader)

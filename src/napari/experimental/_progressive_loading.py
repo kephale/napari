@@ -65,6 +65,9 @@ DEFAULT_INTERVAL_MAX_BYTES = 512 * 1024**2
 #: Show a progress bar (activity dock) for fetch passes with at least this
 #: many chunks; short interactive passes stay silent.
 PROGRESS_MIN_CHUNKS = 16
+#: 3D auto level selection coarsens until the viewport tile needs at most
+#: this many chunks, so a pass completes in seconds rather than minutes.
+DEFAULT_MAX_CHUNKS_PER_PASS = 384
 
 
 # ---------- chunk geometry ----------
@@ -413,6 +416,9 @@ class ProgressiveLoader:
         Completion order stays close to priority order. Raise this for
         high-latency remote data; lower it (or pace the store, see
         ``GenerativeZarrStore.cpu_relief``) for compute-bound sources.
+    max_chunks_per_pass : int
+        3D auto level selection coarsens until the viewport tile needs
+        at most this many chunks, keeping pass duration reasonable.
     """
 
     def __init__(
@@ -428,6 +434,7 @@ class ProgressiveLoader:
         auto_level_3d: bool = True,
         max_pixel_size_3d: float = 2.0,
         fetch_workers: int | None = None,
+        max_chunks_per_pass: int = DEFAULT_MAX_CHUNKS_PER_PASS,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -436,6 +443,7 @@ class ProgressiveLoader:
         self._interval_max_bytes = interval_max_bytes
         self._auto_level_3d = auto_level_3d
         self._max_pixel_size_3d = float(max_pixel_size_3d)
+        self._max_chunks_per_pass = max(int(max_chunks_per_pass), 1)
         if fetch_workers is None:
             # leave cores for the GUI event loop: saturating every core
             # with chunk fetches makes the UI unresponsive on CPU-bound
@@ -682,27 +690,55 @@ class ProgressiveLoader:
         if not np.isfinite(zoom) or zoom <= 0:
             return n_levels - 1
 
+        # screen pixels per level-0 data pixel (layer scale maps data to
+        # world; zoom maps world to screen)
+        layer_scale = float(
+            np.max(np.take(np.asarray(layer.scale), displayed))
+        )
+        data_zoom = zoom * layer_scale
+
         target = 0
         for level in range(n_levels - 1, -1, -1):
             factors = np.take(
                 np.asarray(self._data._scale_factors[level]), displayed
             )
-            pixel_size = zoom * float(np.max(factors))
+            pixel_size = data_zoom * float(np.max(factors))
             if pixel_size <= self._max_pixel_size_3d:
                 target = level
                 break
 
-        # Coarsen until the rendered volume fits the interval budget.
-        # Levels larger than the 3D tile extent render a sub-volume tile,
-        # so they are bounded by the tile size rather than the level size.
+        bbox = self._camera_bbox_level0(displayed)
+
+        # Coarsen until the viewport tile fits the memory budget AND can
+        # be fetched in a reasonable number of chunks — a fully zoomed-out
+        # view of a deep pyramid would otherwise pick a level needing
+        # thousands of chunks, taking minutes to sharpen. Finer levels
+        # unlock progressively as zooming shrinks the viewport tile.
         for level in range(target, n_levels):
             vdata = self._data[level]
             extent = np.take(
                 np.asarray(vdata.shape, dtype=np.int64), displayed
             )
             extent = np.minimum(extent, self._tile_extent_3d)
+            if bbox is not None:
+                downsample = np.take(
+                    np.asarray(self._data._scale_factors[level]), displayed
+                )
+                view_extent = np.ceil((bbox[1] - bbox[0]) / downsample).astype(
+                    np.int64
+                )
+                extent = np.minimum(extent, np.maximum(view_extent, 1))
             nbytes = np.prod(extent, dtype=np.int64) * vdata.dtype.itemsize
-            if nbytes <= self._interval_max_bytes:
+            chunk_shape = np.take(
+                np.asarray(vdata.chunk_shape, dtype=np.int64), displayed
+            )
+            n_chunks = np.prod(
+                -(-extent // chunk_shape), dtype=np.int64
+            )  # ceil-div
+            if (
+                nbytes <= self._interval_max_bytes
+                and n_chunks <= self._max_chunks_per_pass
+            ):
                 return level
         return n_levels - 1
 
@@ -737,7 +773,11 @@ class ProgressiveLoader:
             canvas_size = 800
         if not np.isfinite(zoom) or zoom <= 0 or canvas_size <= 0:
             return np.stack([center, center])
-        half_extent = (canvas_size / zoom) / 2
+        # world units -> level-0 data units (per displayed axis)
+        layer_scale = np.take(
+            np.asarray(self._layer.scale, dtype=float), list(displayed_axes)
+        )
+        half_extent = (canvas_size / zoom) / 2 / np.maximum(layer_scale, 1e-12)
         return np.stack([center - half_extent, center + half_extent])
 
     def _apply_auto_level(self) -> None:
@@ -968,8 +1008,11 @@ class ProgressiveLoader:
         if len(displayed) < 3:
             # mid ndisplay transition: displayed dims not 3D yet
             return chunk_priority_2D(keys, interval[0], interval[1])
-        camera_center = np.asarray(camera.center, dtype=float) / np.take(
-            factors, displayed
+        layer_scale = np.take(
+            np.asarray(self._layer.scale, dtype=float), displayed
+        )
+        camera_center = np.asarray(camera.center, dtype=float) / (
+            np.take(factors, displayed) * np.maximum(layer_scale, 1e-12)
         )
         # chunk_priority_3D sanitizes degenerate camera state internally
         return chunk_priority_3D(
@@ -1080,6 +1123,14 @@ class ProgressiveLoader:
         self._layer.refresh(extent=False, highlight=False, thumbnail=final)
         self._last_refresh_duration = time.monotonic() - start
 
+    def _repair_backdrop(self) -> None:
+        """Backfill unloaded regions of the active level from the coarsest."""
+        level = int(self._layer.data_level)
+        if level == self._resident_level:
+            return
+        if self._data.fill_unloaded_from(level, self._resident_level):
+            self._refresh(force=True)
+
     # -- resident coarsest level --
 
     def _resident_target_interval(
@@ -1189,6 +1240,11 @@ class ProgressiveLoader:
             self._resident_worker = None
             self._close_progress(self._resident_pbar)
             self._resident_pbar = None
+            # If the active level's interval was initialized before this
+            # fill finished, its backdrop is zeros; repair the regions
+            # that have no real chunks yet so the canvas shows the
+            # (coarse) volume immediately.
+            self._repair_backdrop()
             self._refresh(final=True)
             # Re-evaluate coverage now that backdrops are available.
             self._check()
@@ -1286,6 +1342,26 @@ def add_progressive_loading_image(
         viewer = Viewer()
 
     data = MultiScaleVirtualData(img)
+
+    # vispy renders with float32: world extents beyond 2**24 lose pixel
+    # precision and 3D rendering goes blank entirely. If the caller did
+    # not specify a scale, normalize the world size of very deep pyramids.
+    scale = layer_kwargs.get('scale')
+    if scale is None:
+        max_extent = float(max(data.shape))
+        # vanilla napari 3D rendering goes blank for world extents at or
+        # beyond 2**22 (measured; float32 precision in the render path)
+        limit = float(2**21)
+        if max_extent > limit:
+            factor = 2.0 ** -int(np.ceil(np.log2(max_extent / limit)))
+            layer_kwargs['scale'] = (factor,) * data.ndim
+            LOGGER.warning(
+                'image extent %.3g exceeds float32 rendering precision; '
+                'scaling the layer by %g to keep it renderable. Pass '
+                'scale= explicitly to override.',
+                max_extent,
+                factor,
+            )
 
     if contrast_limits is None:
         contrast_limits = _estimate_contrast_limits(data.arrays[-1])
