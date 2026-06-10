@@ -293,6 +293,24 @@ def _chunk_id(chunk_key: tuple[slice, ...]) -> tuple[tuple[int, int], ...]:
     return tuple((int(sl.start), int(sl.stop)) for sl in chunk_key)
 
 
+def _tile_extent_3d_for(dtype: np.dtype, interval_max_bytes: int) -> int:
+    """Per-axis extent of 3D sub-volume tiles.
+
+    The largest cube that fits the interval memory budget, further
+    bounded by the GL 3D texture size limit when available.
+    """
+    extent = int((interval_max_bytes / np.dtype(dtype).itemsize) ** (1 / 3))
+    try:
+        from napari._vispy.utils.gl import get_max_texture_sizes
+
+        _, max_3d = get_max_texture_sizes()
+        if max_3d is not None:
+            extent = min(extent, int(max_3d))
+    except Exception:  # pragma: no cover - no GL context  # noqa: BLE001
+        pass
+    return max(extent, 32)
+
+
 # ---------- background fetching ----------
 
 
@@ -337,7 +355,9 @@ class ProgressiveLoader:
     debounce_ms : int
         Debounce interval for camera/dims events.
     refresh_interval_s : float
-        Minimum time between layer refreshes while chunks stream in.
+        Minimum time between layer refreshes while chunks stream in. The
+        effective interval adapts upward when refreshes are expensive
+        (e.g. full 3D texture uploads).
     resident_max_bytes : int
         Keep the coarsest level fully in memory if it is at most this big.
     interval_max_bytes : int
@@ -363,7 +383,7 @@ class ProgressiveLoader:
         data: MultiScaleVirtualData,
         *,
         debounce_ms: int = 100,
-        refresh_interval_s: float = 0.1,
+        refresh_interval_s: float = 0.03,
         resident_max_bytes: int = DEFAULT_RESIDENT_MAX_BYTES,
         interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
         auto_level_3d: bool = True,
@@ -390,6 +410,7 @@ class ProgressiveLoader:
         self._chunks_done = 0
         self._chunks_total = 0
         self._last_refresh = 0.0
+        self._last_refresh_duration = 0.0
         self._pbar = None
         self._resident_pbar = None
         self._backdrop_pending = False
@@ -434,6 +455,15 @@ class ProgressiveLoader:
         # pre-load (all-zero) content. Disable it: materializing a resident
         # VirtualData is a plain memory copy.
         layer._level_materializer = None
+
+        # Enable 3D sub-volume tiles: locking (or auto-selecting) a level
+        # larger than this extent renders a view-centered tile of at most
+        # this size, so even the finest levels of huge volumes are usable
+        # in 3D. Bounded by the memory budget and the GL 3D texture limit.
+        self._tile_extent_3d = _tile_extent_3d_for(
+            data.dtype, interval_max_bytes
+        )
+        layer._max_tile_extent_3d = self._tile_extent_3d
 
         self._check()
 
@@ -481,12 +511,14 @@ class ProgressiveLoader:
         min_coord = np.zeros(ndim, dtype=np.int64)
         max_coord = shape.copy()
 
+        # corner_pixels bound the displayed dimensions in both 2D (the
+        # visible canvas region) and 3D (the full level or a sub-volume
+        # tile when _max_tile_extent_3d applies)
         displayed = set(layer._slice_input.displayed)
-        if self._viewer.dims.ndisplay == 2:
-            corners = layer.corner_pixels
-            for d in displayed:
-                min_coord[d] = corners[0, d]
-                max_coord[d] = corners[1, d] + 1
+        corners = layer.corner_pixels
+        for d in displayed:
+            min_coord[d] = corners[0, d]
+            max_coord[d] = corners[1, d] + 1
 
         self._restrict_to_current_step(level, displayed, min_coord, max_coord)
 
@@ -602,17 +634,39 @@ class ProgressiveLoader:
                 target = level
                 break
 
-        # Coarsen until the visible volume (full displayed extent at the
-        # current step of other dims) fits the interval budget.
+        # Coarsen until the rendered volume fits the interval budget.
+        # Levels larger than the 3D tile extent render a sub-volume tile,
+        # so they are bounded by the tile size rather than the level size.
         for level in range(target, n_levels):
             vdata = self._data[level]
             extent = np.take(
                 np.asarray(vdata.shape, dtype=np.int64), displayed
             )
+            extent = np.minimum(extent, self._tile_extent_3d)
             nbytes = np.prod(extent, dtype=np.int64) * vdata.dtype.itemsize
             if nbytes <= self._interval_max_bytes:
                 return level
         return n_levels - 1
+
+    def _camera_bbox_level0(self, displayed_axes) -> np.ndarray | None:
+        """Camera center as a degenerate bbox in level-0 data coords."""
+        camera_center = np.asarray(self._viewer.camera.center, dtype=float)
+        if not np.all(np.isfinite(camera_center)):
+            return None
+        try:
+            world_point = np.array(self._viewer.dims.point, dtype=float)
+            world_point[list(displayed_axes)] = camera_center[
+                -len(displayed_axes) :
+            ]
+            data_point = np.asarray(
+                self._layer.world_to_data(world_point), dtype=float
+            )
+        except Exception:  # pragma: no cover - dims mismatch  # noqa: BLE001
+            return None
+        center = data_point[list(displayed_axes)]
+        if not np.all(np.isfinite(center)):
+            return None
+        return np.stack([center, center])
 
     def _apply_auto_level(self) -> None:
         """Drive the layer's data level from zoom while in 3D Auto mode.
@@ -633,12 +687,12 @@ class ProgressiveLoader:
         self._auto_locked = target
         layer._locked_data_level = target
         layer._data_level = target
-        # Mirror the corner_pixels update of the locked_data_level setter.
+        # Mirror the corner_pixels update of the locked_data_level setter,
+        # centering any sub-volume tile on the camera.
         displayed_axes = layer._slice_input.displayed
-        shape_at_level = np.array(layer.level_shapes[target])
-        corners = np.zeros((2, layer.ndim), dtype=int)
-        corners[1, displayed_axes] = shape_at_level[displayed_axes] - 1
-        layer.corner_pixels = corners
+        layer.corner_pixels = layer._corners_for_locked_level(
+            target, displayed_axes, self._camera_bbox_level0(displayed_axes)
+        )
         # Prepare the new level's interval with a backdrop from the level
         # that was just displayed BEFORE napari re-slices, so the previous
         # resolution stays on screen until new chunks replace it.
@@ -898,14 +952,20 @@ class ProgressiveLoader:
         self._worker = None
 
     def _refresh(self, final: bool = False, force: bool = False) -> None:
+        # Adaptive throttle: refresh as often as every chunk (so loading is
+        # visibly progressive) while never spending more than ~half the
+        # time re-slicing — large 3D volumes re-upload the whole texture
+        # per refresh, so their interval backs off automatically.
         now = time.monotonic()
-        if (
-            not (final or force)
-            and now - self._last_refresh < self._refresh_interval_s
-        ):
+        min_interval = max(
+            self._refresh_interval_s, 2.0 * self._last_refresh_duration
+        )
+        if not (final or force) and now - self._last_refresh < min_interval:
             return
         self._last_refresh = now
+        start = time.monotonic()
         self._layer.refresh(extent=False, highlight=False, thumbnail=final)
+        self._last_refresh_duration = time.monotonic() - start
 
     # -- resident coarsest level --
 
@@ -1056,6 +1116,7 @@ def add_progressive_loading_image(
     name: str | None = None,
     auto_level_3d: bool = True,
     max_pixel_size_3d: float = 4.0,
+    interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
     **layer_kwargs,
 ):
     """Add a progressively loading multiscale image to a viewer.
@@ -1091,6 +1152,9 @@ def add_progressive_loading_image(
     max_pixel_size_3d : float
         Tuning knob for 3D auto level selection: target the coarsest
         level whose voxels project to at most this many screen pixels.
+    interval_max_bytes : int
+        Memory budget for a single level's resident interval; also
+        bounds the 3D sub-volume tile size.
     **layer_kwargs
         Additional keyword arguments passed to ``viewer.add_image``.
 
@@ -1110,7 +1174,13 @@ def add_progressive_loading_image(
     if contrast_limits is None:
         contrast_limits = _estimate_contrast_limits(data.arrays[-1])
 
-    layer = viewer.add_image(
+    from napari.layers import Image
+
+    # Construct the layer directly (instead of viewer.add_image) so the
+    # 3D tile extent is set before the layer controls are built — the
+    # resolution selector then knows fine levels render as sub-volume
+    # tiles and does not disable them.
+    layer = Image(
         data._data,
         multiscale=True,
         contrast_limits=contrast_limits,
@@ -1119,12 +1189,17 @@ def add_progressive_loading_image(
         name=name,
         **layer_kwargs,
     )
+    layer._max_tile_extent_3d = _tile_extent_3d_for(
+        data.dtype, interval_max_bytes
+    )
+    viewer.layers.append(layer)
     loader = ProgressiveLoader(
         viewer,
         layer,
         data,
         auto_level_3d=auto_level_3d,
         max_pixel_size_3d=max_pixel_size_3d,
+        interval_max_bytes=interval_max_bytes,
     )
     layer.metadata['progressive_loader'] = loader
     return layer

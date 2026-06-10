@@ -111,11 +111,24 @@ class QtMultiscaleLevelControl(  # type: ignore[metaclass]
                     )
                     self.level_combobox.addItem(label, i)
 
-                    # Disable levels that exceed the GL texture limit in 3D
+                    # Disable levels that exceed the GL texture limit in
+                    # 3D. Layers with a 3D tile extent cap render an
+                    # at-most-cap-sized sub-volume, so compare that size
+                    # instead of the full level shape.
+                    tile_cap = self._layer._max_tile_extent_3d
                     if (
                         ndisplay == 3
                         and max_size_3d is not None
-                        and any(shape[ax] > max_size_3d for ax in displayed)
+                        and any(
+                            min(
+                                shape[ax],
+                                tile_cap
+                                if tile_cap is not None
+                                else shape[ax],
+                            )
+                            > max_size_3d
+                            for ax in displayed
+                        )
                     ):
                         item_index = self.level_combobox.count() - 1
                         model = self.level_combobox.model()

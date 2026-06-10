@@ -475,3 +475,100 @@ def test_level_switch_keeps_canvas_filled(
     # source data has no zeros, so any zeros would be unfilled regions
     assert (hyperslice == 0).mean() < 0.05
     _wait_for_idle_loader(qtbot, loader)
+
+
+# ---------- 3D sub-volume tiles ----------
+
+
+def test_corners_for_locked_level_subvolume(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    """With _max_tile_extent_3d set, a locked 3D level larger than the
+    extent renders a centered sub-volume tile instead of the full level."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = viewer.add_image(
+        list(multiscale_3d_arrays), multiscale=True, contrast_limits=(0, 255)
+    )
+    displayed = layer._slice_input.displayed
+
+    # default: full extent
+    corners = layer._corners_for_locked_level(0, displayed)
+    assert (corners[1] - corners[0] + 1).max() == 64
+
+    layer._max_tile_extent_3d = 32
+    bbox = np.array([[40, 40, 40], [40, 40, 40]])
+    corners = layer._corners_for_locked_level(0, displayed, bbox)
+    extent = corners[1] - corners[0] + 1
+    np.testing.assert_array_equal(extent[list(displayed)], 32)
+    center = corners.mean(axis=0)[list(displayed)]
+    np.testing.assert_allclose(center, 39.5, atol=1)
+
+    # small level: unaffected
+    corners = layer._corners_for_locked_level(2, displayed, bbox)
+    assert (corners[1] - corners[0] + 1)[list(displayed)].max() == 16
+
+
+def test_locked_tile_hysteresis(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = viewer.add_image(
+        list(multiscale_3d_arrays), multiscale=True, contrast_limits=(0, 255)
+    )
+    layer._max_tile_extent_3d = 32
+    displayed = layer._slice_input.displayed
+    bbox = np.array([[32, 32, 32], [32, 32, 32]])
+    corners = layer._corners_for_locked_level(0, displayed, bbox)
+    layer.corner_pixels = corners
+
+    # small movement (< extent/4): no re-slice
+    near = layer._corners_for_locked_level(
+        0, displayed, np.array([[36, 36, 36]] * 2)
+    )
+    assert not layer._locked_tile_moved(near, displayed)
+    # large movement: re-slice
+    far = layer._corners_for_locked_level(
+        0, displayed, np.array([[60, 60, 60]] * 2)
+    )
+    assert layer._locked_tile_moved(far, displayed)
+
+
+def test_progressive_loading_3d_subvolume_tile(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    """The finest level of a volume larger than the tile budget is
+    selectable and loads only the tile's chunks."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(
+        multiscale_3d_arrays,
+        viewer=viewer,
+        # 32^3 voxels (uint8): level 0 (64^3) must be tiled
+        interval_max_bytes=32**3,
+    )
+    loader = layer.metadata['progressive_loader']
+    assert loader._tile_extent_3d == 32
+    assert layer._max_tile_extent_3d == 32
+    _wait_for_idle_loader(qtbot, loader)
+
+    layer.locked_data_level = 0
+    qtbot.waitUntil(
+        lambda: len(loader._data[0].loaded_chunks) > 0, timeout=10000
+    )
+    _wait_for_idle_loader(qtbot, loader)
+
+    extent = layer.corner_pixels[1] - layer.corner_pixels[0] + 1
+    displayed = list(layer._slice_input.displayed)
+    assert np.all(extent[displayed] <= 32)
+    interval = loader._data[0].interval
+    interval_extent = np.array(interval[1]) - np.array(interval[0])
+    # the resident interval covers the tile, not the whole level
+    assert np.all(interval_extent <= 48)  # tile + chunk alignment slack
+    # tile content matches the source data
+    key = tuple(slice(mn, mx) for mn, mx in zip(*interval, strict=True))
+    np.testing.assert_array_equal(
+        np.asarray(loader._data[0][key]),
+        np.asarray(multiscale_3d_arrays[0][key]),
+    )
