@@ -824,5 +824,166 @@ def test_loader_unlimited_by_default(
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
     loader = layer.metadata['progressive_loader']
     assert loader._max_bytes_per_second is None
-    assert loader._make_limiter() is None
+    # a limiter is still created (it doubles as the interaction-hold
+    # gate) but performs no rate pacing
+    assert loader._make_limiter().bytes_per_second is None
     _wait_for_idle_loader(qtbot, loader)
+
+
+# ---------- interaction hold ----------
+
+
+def test_rate_limiter_pause_blocks_until_resume():
+    import threading as _threading
+    import time as _time
+
+    from napari.experimental._progressive_loading import _FetchRateLimiter
+
+    limiter = _FetchRateLimiter()  # unlimited rate, gate only
+    limiter.pause()
+    passed = _threading.Event()
+
+    def worker():
+        limiter.acquire(1)
+        passed.set()
+
+    t = _threading.Thread(target=worker, daemon=True)
+    t.start()
+    _time.sleep(0.05)
+    assert not passed.is_set(), 'paused limiter let a fetch through'
+    limiter.resume()
+    assert passed.wait(1.0), 'resume() did not release the worker'
+
+
+def test_rate_limiter_cancel_releases_paused_worker():
+    import threading as _threading
+    import time as _time
+
+    from napari.experimental._progressive_loading import _FetchRateLimiter
+
+    limiter = _FetchRateLimiter()
+    limiter.pause()
+    passed = _threading.Event()
+    t = _threading.Thread(
+        target=lambda: (limiter.acquire(1), passed.set()), daemon=True
+    )
+    t.start()
+    _time.sleep(0.05)
+    limiter.cancel()
+    assert passed.wait(1.0), 'cancel() did not release a paused worker'
+
+
+def test_interaction_hold_buffers_batches_and_refreshes(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    import time as _time
+
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    assert not loader._holding
+    loader._on_interaction()
+    assert loader._holding
+
+    # chunk batches arriving during the hold are buffered, not patched
+    generation = loader._generation
+    vdata = loader._data[int(layer.data_level)]
+    loader._on_chunks(generation, vdata, [])
+    assert loader._held_batches == [(generation, vdata, [])]
+
+    # throttled refreshes are deferred; forced ones still run
+    loader._held_refresh = False
+    loader._refresh()
+    assert loader._held_refresh
+
+    # the debounced check ends the hold and replays the buffer
+    loader._check()
+    assert not loader._holding
+    assert loader._held_batches == []
+    assert not loader._held_refresh
+    assert loader._hold_until == 0.0
+    # repeated interaction re-arms the hold
+    loader._on_interaction()
+    assert loader._holding
+    assert loader._hold_until > _time.monotonic()
+    loader._end_hold()
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_interaction_hold_disabled_by_env(
+    qtbot, make_napari_viewer, multiscale_arrays, monkeypatch
+):
+    monkeypatch.setenv('NAPARI_PROGRESSIVE_HOLD', '0')
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    loader._on_interaction()
+    assert not loader._holding
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_interaction_hold_pauses_fetch_limiter(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    loader._limiter = loader._make_limiter()
+    loader._on_interaction()
+    assert not loader._limiter._go.is_set()
+    loader._end_hold()
+    assert loader._limiter._go.is_set()
+    loader._limiter = None
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_glir_hold_defers_all_uploads(monkeypatch):
+    import time as _time
+
+    from vispy.gloo import glir
+
+    from napari.experimental import _glir_metering as gm
+
+    monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
+
+    class FakeParser:
+        def __init__(self):
+            self._objects = {}
+            self.executed = []
+
+        def _parse(self, command):
+            self.executed.append(command)
+
+        def parse(self, commands):
+            for c in commands:
+                self._parse(c)
+
+    parser = FakeParser()
+    parser._objects[1] = glir.GlirTexture3D.__new__(glir.GlirTexture3D)
+    try:
+        assert gm.install(frame_budget_bytes=64 * 2**20, slab_bytes=2**20)
+        gm.hold_uploads_until(_time.monotonic() + 60.0)
+        queue = glir.GlirQueue()
+        data = np.zeros((4, 64, 64), dtype=np.uint8)
+        queue.command('DATA', 1, (0, 0, 0), data)
+        queue.command('UNIFORM', 7, 'u_x', 'float', 1.0)
+        queue.flush(parser)
+        # the upload was held but other commands ran
+        assert [c[0] for c in parser.executed] == ['UNIFORM']
+        state = gm._states[parser]
+        assert sum(c[3].nbytes for c in state.carry) == data.nbytes
+        # hold expiry releases the carry on the next flush
+        gm._upload_hold_until = 0.0
+        state.reset_budget()
+        queue.flush(parser)
+        assert state.carry == []
+        assert (
+            sum(c[3].nbytes for c in parser.executed if c[0] == 'DATA')
+            == data.nbytes
+        )
+    finally:
+        gm._upload_hold_until = 0.0
+        gm.uninstall()

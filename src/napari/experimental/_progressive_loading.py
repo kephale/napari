@@ -358,27 +358,36 @@ def _key_nbytes(chunk_key: tuple[slice, ...], itemsize: int) -> int:
 
 
 class _FetchRateLimiter:
-    """Pace fetch throughput to a global bytes-per-second budget.
+    """Gate and pace fetch throughput across all fetch workers.
 
-    A leaky bucket shared by all fetch workers: ``acquire(nbytes)``
-    blocks the calling *worker* thread until issuing a fetch of that
-    size keeps the average rate at or below ``bytes_per_second``. This
-    bounds every downstream cost of chunk delivery — GIL pressure from
-    fetch compute, slice/refresh event cascades, and GPU upload traffic
-    — with a single knob, trading load latency for interactivity.
+    ``acquire(nbytes)`` blocks the calling *worker* thread, first while
+    the limiter is paused (interaction hold), then — when a
+    bytes-per-second rate is configured — until issuing a fetch of that
+    size keeps the average rate within budget (leaky bucket). Pacing on
+    the worker side bounds every downstream cost of chunk delivery:
+    GIL pressure from fetch compute, slice/refresh event cascades, and
+    GPU upload traffic.
 
-    ``cancel()`` wakes all sleeping workers immediately so a cancelled
-    pass can wind down without waiting out its pacing delays.
+    ``pause()``/``resume()`` suspend fetching entirely while the user
+    interacts. ``cancel()`` wakes all sleeping workers immediately so a
+    cancelled pass can wind down without waiting out its delays.
     """
 
-    def __init__(self, bytes_per_second: float):
-        self.bytes_per_second = float(bytes_per_second)
+    def __init__(self, bytes_per_second: float | None = None):
+        self.bytes_per_second = (
+            float(bytes_per_second) if bytes_per_second else None
+        )
         self._lock = threading.Lock()
         self._next_free = time.monotonic()
         self._cancelled = threading.Event()
+        self._go = threading.Event()
+        self._go.set()
 
     def acquire(self, nbytes: int) -> None:
-        if self.bytes_per_second <= 0 or self._cancelled.is_set():
+        while not self._go.wait(timeout=1.0):  # paused
+            if self._cancelled.is_set():
+                return
+        if self.bytes_per_second is None or self._cancelled.is_set():
             return
         with self._lock:
             now = time.monotonic()
@@ -388,8 +397,15 @@ class _FetchRateLimiter:
         if delay > 0:
             self._cancelled.wait(delay)
 
+    def pause(self) -> None:
+        self._go.clear()
+
+    def resume(self) -> None:
+        self._go.set()
+
     def cancel(self) -> None:
         self._cancelled.set()
+        self._go.set()  # wake paused workers; cancelled passes must exit
 
 
 @thread_worker
@@ -554,6 +570,16 @@ class ProgressiveLoader:
         unlimited. The ``NAPARI_PROGRESSIVE_MAX_BPS`` environment
         variable overrides this (e.g. ``8e6`` for 8 MB/s; 0 or unset
         means unlimited), handy for sweeps without code changes.
+    interaction_hold : bool
+        Suspend all streaming work while the user interacts (camera
+        motion, slider scrubbing): fetch workers pause, arriving chunk
+        batches are buffered instead of patched, throttled refreshes
+        are deferred, and metered GLIR texture uploads hold. Everything
+        resumes when interaction settles (the debounced check). This
+        keeps interaction frames free of upload work, slice-completion
+        event cascades, and fetch-thread GIL pressure. The
+        ``NAPARI_PROGRESSIVE_HOLD`` environment variable overrides
+        (``0`` disables).
     """
 
     def __init__(
@@ -573,6 +599,7 @@ class ProgressiveLoader:
         texture_patching: bool = True,
         tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
         max_bytes_per_second: float | None = None,
+        interaction_hold: bool = True,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -607,6 +634,16 @@ class ProgressiveLoader:
         )
         self._limiter: _FetchRateLimiter | None = None
         self._resident_limiter: _FetchRateLimiter | None = None
+        env_hold = os.environ.get('NAPARI_PROGRESSIVE_HOLD')
+        if env_hold is not None:
+            interaction_hold = env_hold not in ('0', 'false', '')
+        self._interaction_hold = bool(interaction_hold)
+        # interaction hold: extended by every camera/scrub event, ended
+        # by the debounced _check once interaction settles
+        self._hold_until = 0.0
+        self._hold_s = max(0.15, 1.5 * debounce_ms / 1000.0)
+        self._held_batches: list[tuple] = []
+        self._held_refresh = False
         # Level we set through layer._locked_data_level for 3D auto mode
         # (None when we are not driving the level).
         self._auto_locked: int | None = None
@@ -648,6 +685,11 @@ class ProgressiveLoader:
             ensure_main_thread(self._check), timeout=debounce_ms
         )
         self._connections = [
+            # fast (non-debounced) path: suspend streaming work the
+            # moment interaction starts, so drag frames stay free of
+            # uploads, slice cascades and fetch GIL pressure
+            (viewer.camera.events, self._on_interaction),
+            (viewer.dims.events.current_step, self._on_interaction),
             (viewer.camera.events, self._debounced_check),
             (viewer.dims.events.current_step, self._debounced_check),
             (viewer.dims.events.ndisplay, self._debounced_check),
@@ -1008,10 +1050,54 @@ class ProgressiveLoader:
 
     # -- fetch passes --
 
+    @property
+    def _holding(self) -> bool:
+        return time.monotonic() < self._hold_until
+
+    def _on_interaction(self, event=None) -> None:
+        """Suspend streaming work while the user interacts.
+
+        Fires on every camera/scrub event. The hold window is extended
+        each time; the debounced ``_check`` (which fires once
+        interaction settles) ends it. Rate limiting alone does not keep
+        interaction smooth on slow GL drivers — any upload or slice
+        cascade landing in a drag frame stalls it — so during the hold
+        nothing lands at all: fetch workers pause, arriving batches are
+        buffered, throttled refreshes defer, and the GLIR upload meter
+        holds its carry.
+        """
+        if self._closed or not self._interaction_hold:
+            return
+        first = not self._holding
+        self._hold_until = time.monotonic() + self._hold_s
+        if first:
+            for limiter in (self._limiter, self._resident_limiter):
+                if limiter is not None:
+                    limiter.pause()
+        from napari.experimental import _glir_metering
+
+        if _glir_metering.is_installed():
+            _glir_metering.hold_uploads_until(self._hold_until)
+
+    def _end_hold(self) -> None:
+        self._hold_until = 0.0
+        for limiter in (self._limiter, self._resident_limiter):
+            if limiter is not None:
+                limiter.resume()
+        if self._held_batches:
+            held, self._held_batches = self._held_batches, []
+            for generation, vdata, batch in held:
+                # stale generations are dropped inside _on_chunks
+                self._on_chunks(generation, vdata, batch)
+        if self._held_refresh:
+            self._held_refresh = False
+            self._refresh()
+
     def _check(self, event=None) -> None:
         """Start a fetch pass if the current view is not fully loaded."""
         if self._closed:
             return
+        self._end_hold()
         layer = self._layer
         if not layer.visible:
             self._cancel_active()
@@ -1292,13 +1378,15 @@ class ProgressiveLoader:
             finally:
                 self._pbar_flushing = False
 
-    def _make_limiter(self) -> _FetchRateLimiter | None:
-        if self._max_bytes_per_second is None:
-            return None
-        return _FetchRateLimiter(self._max_bytes_per_second)
+    def _make_limiter(self) -> _FetchRateLimiter:
+        limiter = _FetchRateLimiter(self._max_bytes_per_second)
+        if self._holding:
+            limiter.pause()
+        return limiter
 
     def _cancel_active(self) -> None:
         self._generation += 1
+        self._held_batches.clear()  # all stale now
         if self._limiter is not None:
             # wake workers sleeping on rate pacing so the pass winds
             # down promptly
@@ -1315,6 +1403,11 @@ class ProgressiveLoader:
     def _on_chunks(self, generation: int, vdata: VirtualData, batch) -> None:
         """Handle a batch of fetched chunks (already applied off-thread)."""
         if generation != self._generation or self._closed:
+            return
+        if self._holding:
+            # interaction in progress: no GPU patches, no refreshes, no
+            # progress churn; _end_hold replays these once it settles
+            self._held_batches.append((generation, vdata, batch))
             return
         block = None
         if isinstance(batch, tuple):
@@ -1480,6 +1573,14 @@ class ProgressiveLoader:
             node.update()
 
     def _refresh(self, final: bool = False, force: bool = False) -> None:
+        # During interaction, defer throttled refreshes entirely (the
+        # reload -> async re-slice cascade is main-thread work that
+        # would land in drag frames); forced refreshes — backdrops at
+        # pass boundaries, where the canvas would otherwise be wrong —
+        # still go through.
+        if self._holding and not force:
+            self._held_refresh = True
+            return
         # Adaptive throttle: refresh as often as every chunk (so loading is
         # visibly progressive) while never spending more than ~half the
         # time re-slicing — large 3D volumes re-upload the whole texture
@@ -1702,6 +1803,7 @@ def add_progressive_loading_image(
     interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
     tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
     max_bytes_per_second: float | None = None,
+    interaction_hold: bool = True,
     **layer_kwargs,
 ):
     """Add a progressively loading multiscale image to a viewer.
@@ -1747,6 +1849,10 @@ def add_progressive_loading_image(
         Rate-limit chunk loading (see
         :class:`ProgressiveLoader`). ``None`` = unlimited; the
         ``NAPARI_PROGRESSIVE_MAX_BPS`` environment variable overrides.
+    interaction_hold : bool
+        Suspend all streaming work while the user interacts (see
+        :class:`ProgressiveLoader`). ``NAPARI_PROGRESSIVE_HOLD=0``
+        disables.
     **layer_kwargs
         Additional keyword arguments passed to ``viewer.add_image``.
 
@@ -1830,6 +1936,7 @@ def add_progressive_loading_image(
         interval_max_bytes=interval_max_bytes,
         tile_max_bytes_3d=tile_max_bytes_3d,
         max_bytes_per_second=max_bytes_per_second,
+        interaction_hold=interaction_hold,
     )
     layer.metadata['progressive_loader'] = loader
     with contextlib.suppress(AttributeError):

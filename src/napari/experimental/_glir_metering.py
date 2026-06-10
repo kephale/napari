@@ -56,6 +56,20 @@ _OBJECT_COMMANDS = frozenset(
 
 _original_flush = None
 _hooked_canvases: weakref.WeakSet = weakref.WeakSet()
+# while time.monotonic() < this, defer ALL metered texture uploads
+# (interaction hold: see ProgressiveLoader._on_interaction)
+_upload_hold_until = 0.0
+
+
+def hold_uploads_until(deadline: float) -> None:
+    """Defer all metered texture uploads until ``time.monotonic()`` >= deadline.
+
+    Called on every interaction event; the deadline only ever extends.
+    Carried uploads keep scheduling redraws, so draining resumes by
+    itself once the hold expires.
+    """
+    global _upload_hold_until
+    _upload_hold_until = max(_upload_hold_until, float(deadline))
 
 
 class _ParserState:
@@ -138,8 +152,12 @@ def _drop_deleted_carry(carry, new_commands):
     return [c for c in carry if c[1] not in deleted]
 
 
-def _metered_parse(parser, commands, state):
-    """Execute commands under the upload budget; return the leftovers."""
+def _metered_parse(parser, commands, state, force_defer=False):
+    """Execute commands under the upload budget; return the leftovers.
+
+    With ``force_defer`` every metered texture upload is deferred
+    regardless of budget (interaction hold); other commands still run.
+    """
     # mirror GlirParser.parse's deferred deletion bookkeeping, which we
     # bypass by calling _parse directly
     from vispy.gloo.glir import JUST_DELETED
@@ -168,9 +186,13 @@ def _metered_parse(parser, commands, state):
                     # always make progress: with a full budget, upload at
                     # least one slab even if it alone exceeds the budget
                     fresh = state.budget_left >= state.frame_budget
-                    if state.budget_left <= 0 or (
-                        sub.nbytes > state.budget_left
-                        and not (fresh and not executed_any)
+                    if (
+                        force_defer
+                        or state.budget_left <= 0
+                        or (
+                            sub.nbytes > state.budget_left
+                            and not (fresh and not executed_any)
+                        )
                     ):
                         deferred_ids.add(id_)
                         leftover.append(('DATA', id_, sub_offset, sub))
@@ -229,7 +251,8 @@ def _metered_flush(self, parser):
     new_commands = self.clear()
     carry = _drop_deleted_carry(carry, new_commands)
     commands = self._filter(carry + new_commands, parser)
-    state.carry = _metered_parse(parser, commands, state)
+    holding = time.monotonic() < _upload_hold_until
+    state.carry = _metered_parse(parser, commands, state, force_defer=holding)
 
     if state.carry and canvas is not None:
         # keep draining even without interaction
