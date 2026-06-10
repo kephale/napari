@@ -36,6 +36,7 @@ import contextlib
 import itertools
 import logging
 import os
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING
@@ -348,6 +349,49 @@ def _tile_extent_3d_for(dtype: np.dtype, interval_max_bytes: int) -> int:
 # ---------- background fetching ----------
 
 
+def _key_nbytes(chunk_key: tuple[slice, ...], itemsize: int) -> int:
+    """Size in bytes of the data selected by a concrete chunk key."""
+    n = int(itemsize)
+    for s in chunk_key:
+        n *= max(0, int(s.stop) - int(s.start))
+    return n
+
+
+class _FetchRateLimiter:
+    """Pace fetch throughput to a global bytes-per-second budget.
+
+    A leaky bucket shared by all fetch workers: ``acquire(nbytes)``
+    blocks the calling *worker* thread until issuing a fetch of that
+    size keeps the average rate at or below ``bytes_per_second``. This
+    bounds every downstream cost of chunk delivery — GIL pressure from
+    fetch compute, slice/refresh event cascades, and GPU upload traffic
+    — with a single knob, trading load latency for interactivity.
+
+    ``cancel()`` wakes all sleeping workers immediately so a cancelled
+    pass can wind down without waiting out its pacing delays.
+    """
+
+    def __init__(self, bytes_per_second: float):
+        self.bytes_per_second = float(bytes_per_second)
+        self._lock = threading.Lock()
+        self._next_free = time.monotonic()
+        self._cancelled = threading.Event()
+
+    def acquire(self, nbytes: int) -> None:
+        if self.bytes_per_second <= 0 or self._cancelled.is_set():
+            return
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_free)
+            self._next_free = start + nbytes / self.bytes_per_second
+        delay = start - time.monotonic()
+        if delay > 0:
+            self._cancelled.wait(delay)
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+
 @thread_worker
 def _fetch_chunks(
     array,
@@ -356,6 +400,7 @@ def _fetch_chunks(
     apply=None,
     batch_seconds: float = 0.05,
     pack=None,
+    limiter: _FetchRateLimiter | None = None,
 ):
     """Fetch chunks from ``array``, yielding batches of completed keys.
 
@@ -374,7 +419,13 @@ def _fetch_chunks(
     completion order close to the priority order of ``chunk_queue``.
     """
 
+    itemsize = np.dtype(array.dtype).itemsize
+
     def fetch(chunk_key):
+        if limiter is not None:
+            # paces the worker BEFORE the fetch, so compute, delivery
+            # and GPU upload all follow the configured byte rate
+            limiter.acquire(_key_nbytes(chunk_key, itemsize))
         start = time.monotonic()
         chunk = np.asarray(array[chunk_key])
         if apply is not None:
@@ -493,6 +544,16 @@ class ProgressiveLoader:
         tile GPU upload at its boundaries, which blocks the GUI roughly
         in proportion to this size; raise it on fast GPUs for larger
         high-resolution tiles.
+    max_bytes_per_second : float, optional
+        Rate-limit chunk loading to this many bytes per second (shared
+        across all fetch workers). Pacing happens on the worker threads
+        before each fetch, so it bounds every per-chunk cost in one
+        knob: fetch compute (GIL pressure), slice/refresh event
+        cascades, and GPU upload traffic. Loading takes proportionally
+        longer; interaction stays smooth. ``None`` (default) is
+        unlimited. The ``NAPARI_PROGRESSIVE_MAX_BPS`` environment
+        variable overrides this (e.g. ``8e6`` for 8 MB/s; 0 or unset
+        means unlimited), handy for sweeps without code changes.
     """
 
     def __init__(
@@ -511,6 +572,7 @@ class ProgressiveLoader:
         max_chunks_per_pass: int = DEFAULT_MAX_CHUNKS_PER_PASS,
         texture_patching: bool = True,
         tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
+        max_bytes_per_second: float | None = None,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -535,6 +597,16 @@ class ProgressiveLoader:
                 n_cpus = os.cpu_count() or 3
             fetch_workers = min(4, n_cpus - 2)
         self._fetch_workers = max(int(fetch_workers), 1)
+        env_bps = os.environ.get('NAPARI_PROGRESSIVE_MAX_BPS')
+        if env_bps:
+            max_bytes_per_second = float(env_bps)
+        self._max_bytes_per_second = (
+            float(max_bytes_per_second)
+            if max_bytes_per_second
+            else None  # 0/None = unlimited
+        )
+        self._limiter: _FetchRateLimiter | None = None
+        self._resident_limiter: _FetchRateLimiter | None = None
         # Level we set through layer._locked_data_level for 3D auto mode
         # (None when we are not driving the level).
         self._auto_locked: int | None = None
@@ -633,6 +705,9 @@ class ProgressiveLoader:
             self._debounced_check.cancel()
         self._release_auto_level()
         self._cancel_active()
+        if self._resident_limiter is not None:
+            self._resident_limiter.cancel()
+            self._resident_limiter = None
         if self._resident_worker is not None:
             self._resident_worker.quit()
             self._resident_worker = None
@@ -1108,12 +1183,14 @@ class ProgressiveLoader:
             and self._viewer.dims.ndisplay == 3
             and vdata.ndim == 3
         )
+        self._limiter = self._make_limiter()
         worker = _fetch_chunks(
             vdata.array,
             queue,
             num_workers=self._fetch_workers,
             apply=apply,
             pack=pack if use_pack else None,
+            limiter=self._limiter,
         )
         worker.yielded.connect(
             lambda batch: self._on_chunks(generation, vdata, batch)
@@ -1215,8 +1292,18 @@ class ProgressiveLoader:
             finally:
                 self._pbar_flushing = False
 
+    def _make_limiter(self) -> _FetchRateLimiter | None:
+        if self._max_bytes_per_second is None:
+            return None
+        return _FetchRateLimiter(self._max_bytes_per_second)
+
     def _cancel_active(self) -> None:
         self._generation += 1
+        if self._limiter is not None:
+            # wake workers sleeping on rate pacing so the pass winds
+            # down promptly
+            self._limiter.cancel()
+            self._limiter = None
         if self._worker is not None:
             self._worker.quit()
             self._worker = None
@@ -1512,6 +1599,9 @@ class ProgressiveLoader:
         self._start_resident_fill(min_coord, max_coord)
 
     def _start_resident_fill(self, min_coord, max_coord) -> None:
+        if self._resident_limiter is not None:
+            self._resident_limiter.cancel()
+            self._resident_limiter = None
         if self._resident_worker is not None:
             self._resident_worker.quit()
             self._resident_worker = None
@@ -1538,11 +1628,13 @@ class ProgressiveLoader:
             vdata.set_offset(chunk_key, chunk)
             vdata.loaded_chunks.add(_chunk_id(chunk_key))
 
+        self._resident_limiter = self._make_limiter()
         worker = _fetch_chunks(
             vdata.array,
             queue,
             num_workers=self._fetch_workers,
             apply=apply,
+            limiter=self._resident_limiter,
         )
 
         def on_chunk(batch, vdata=vdata):
@@ -1609,6 +1701,7 @@ def add_progressive_loading_image(
     max_pixel_size_3d: float = 2.0,
     interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
     tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
+    max_bytes_per_second: float | None = None,
     **layer_kwargs,
 ):
     """Add a progressively loading multiscale image to a viewer.
@@ -1650,6 +1743,10 @@ def add_progressive_loading_image(
         Upper bound for a 3D sub-volume tile; bounds the cost of the
         full-tile GPU uploads at pass boundaries (roughly
         size / 125 MB/s of GUI blocking on slow GL drivers).
+    max_bytes_per_second : float, optional
+        Rate-limit chunk loading (see
+        :class:`ProgressiveLoader`). ``None`` = unlimited; the
+        ``NAPARI_PROGRESSIVE_MAX_BPS`` environment variable overrides.
     **layer_kwargs
         Additional keyword arguments passed to ``viewer.add_image``.
 
@@ -1732,6 +1829,7 @@ def add_progressive_loading_image(
         max_pixel_size_3d=max_pixel_size_3d,
         interval_max_bytes=interval_max_bytes,
         tile_max_bytes_3d=tile_max_bytes_3d,
+        max_bytes_per_second=max_bytes_per_second,
     )
     layer.metadata['progressive_loader'] = loader
     with contextlib.suppress(AttributeError):

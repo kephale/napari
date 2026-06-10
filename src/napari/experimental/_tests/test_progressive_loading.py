@@ -727,3 +727,102 @@ def test_texture_patching_used_in_3d(
         np.asarray(loader._data[0][0:64, 0:64, 0:64]),
         np.asarray(multiscale_3d_arrays[0]),
     )
+
+
+# ---------- fetch rate limiting ----------
+
+
+def test_rate_limiter_paces_bytes_per_second():
+    import time as _time
+
+    from napari.experimental._progressive_loading import _FetchRateLimiter
+
+    limiter = _FetchRateLimiter(bytes_per_second=1e6)  # 1 MB/s
+    start = _time.monotonic()
+    # 5 x 100 KB: first acquire is free, the rest are paced -> >= ~0.4s
+    for _ in range(5):
+        limiter.acquire(100_000)
+    elapsed = _time.monotonic() - start
+    assert elapsed >= 0.35
+    assert elapsed < 2.0
+
+
+def test_rate_limiter_cancel_wakes_sleepers():
+    import threading as _threading
+    import time as _time
+
+    from napari.experimental._progressive_loading import _FetchRateLimiter
+
+    limiter = _FetchRateLimiter(bytes_per_second=1.0)  # absurdly slow
+    limiter.acquire(10)  # next acquire would sleep ~10s
+    done = _threading.Event()
+
+    def sleeper():
+        limiter.acquire(10)
+        done.set()
+
+    t = _threading.Thread(target=sleeper, daemon=True)
+    t.start()
+    _time.sleep(0.05)
+    limiter.cancel()
+    assert done.wait(1.0), 'cancel() did not wake the sleeping acquire'
+    # cancelled limiter no longer paces at all
+    start = _time.monotonic()
+    limiter.acquire(10**9)
+    assert _time.monotonic() - start < 0.1
+
+
+def test_key_nbytes():
+    from napari.experimental._progressive_loading import _key_nbytes
+
+    key = (slice(0, 4), slice(8, 16), slice(0, 32))
+    assert _key_nbytes(key, 2) == 4 * 8 * 32 * 2
+
+
+def test_fetch_chunks_respects_limiter(multiscale_arrays):
+    import time as _time
+
+    from napari.experimental._progressive_loading import (
+        _fetch_chunks,
+        _FetchRateLimiter,
+    )
+
+    vdata = VirtualData(multiscale_arrays[2])  # 64x64 uint8
+    vdata.set_interval((0, 0), (64, 64))
+    keys = [
+        (slice(i, i + 32), slice(j, j + 32)) for i in (0, 32) for j in (0, 32)
+    ]  # 4 chunks x 1 KB
+    limiter = _FetchRateLimiter(bytes_per_second=8_192)  # 8 chunks/s
+    start = _time.monotonic()
+    batches = list(
+        _fetch_chunks.__wrapped__(
+            vdata.array, keys, num_workers=2, limiter=limiter
+        )
+    )
+    elapsed = _time.monotonic() - start
+    fetched = [key for batch in batches for key in batch]
+    assert sorted(map(str, fetched)) == sorted(map(str, keys))
+    # 4 KB at 8 KB/s with the first chunk free -> >= ~0.375s
+    assert elapsed >= 0.3
+
+
+def test_loader_max_bytes_per_second_env_override(
+    qtbot, make_napari_viewer, multiscale_arrays, monkeypatch
+):
+    monkeypatch.setenv('NAPARI_PROGRESSIVE_MAX_BPS', '12500000')
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    assert loader._max_bytes_per_second == 12_500_000
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_loader_unlimited_by_default(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    assert loader._max_bytes_per_second is None
+    assert loader._make_limiter() is None
+    _wait_for_idle_loader(qtbot, loader)
