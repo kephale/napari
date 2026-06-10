@@ -150,6 +150,15 @@ class Camera(EventedModel):
         )
         self.angles = R.from_matrix(matrix).as_euler('xyz', degrees=True)
 
+    def look_at(self, point: tuple[float, float, float]):
+        """Point the camera at a point in 3D scene coordinates.
+
+        This method modifies only the view direction, not the current center
+        point.
+        """
+        view_direction = np.asarray(point) - np.asarray(self.center)
+        self.set_view_direction(view_direction, up_direction=self.up_direction)
+
     def calculate_nd_view_direction(
         self, ndim: int, dims_displayed: tuple[int, ...]
     ) -> npt.NDArray[np.float64] | None:
