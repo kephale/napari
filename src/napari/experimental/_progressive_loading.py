@@ -318,31 +318,50 @@ def _tile_extent_3d_for(dtype: np.dtype, interval_max_bytes: int) -> int:
 
 @thread_worker
 def _fetch_chunks(
-    array, chunk_queue: list[tuple[slice, ...]], num_workers: int = 1
+    array,
+    chunk_queue: list[tuple[slice, ...]],
+    num_workers: int = 1,
+    apply=None,
+    batch_seconds: float = 0.05,
 ):
-    """Fetch chunks from ``array``, yielding each result as it completes.
+    """Fetch chunks from ``array``, yielding batches of completed keys.
 
-    Yields ``(chunk_key, ndarray)`` tuples. Runs on a background thread;
-    cancellation is delivered at yield points by the thread worker
-    machinery. With ``num_workers > 1``, chunks are fetched by a small
-    thread pool (useful for GIL-releasing compute like numba and for
-    remote IO); a bounded in-flight window keeps completion order close
-    to the priority order of ``chunk_queue``.
+    ``apply(chunk_key, ndarray)`` is called on the *worker* thread for
+    every fetched chunk — typically ``VirtualData.set_offset``, which is
+    lock-guarded numpy work that has no reason to occupy the GUI thread.
+    Completed chunk keys are then yielded to the main thread in batches
+    (at most one signal per ``batch_seconds``), so chunk bursts do not
+    flood the Qt event loop with per-chunk signal dispatches.
+
+    Yields lists of chunk keys. With ``num_workers > 1``, chunks are
+    fetched by a small thread pool (useful for GIL-releasing compute
+    like numba and for remote IO); a bounded in-flight window keeps
+    completion order close to the priority order of ``chunk_queue``.
     """
-    if num_workers <= 1 or len(chunk_queue) <= 1:
-        for chunk_key in chunk_queue:
-            start = time.monotonic()
-            chunk = np.asarray(array[chunk_key])
-            LOGGER.debug(
-                'fetched chunk %s in %.3fs',
-                chunk_key,
-                time.monotonic() - start,
-            )
-            yield chunk_key, chunk
-        return
 
     def fetch(chunk_key):
-        return np.asarray(array[chunk_key])
+        start = time.monotonic()
+        chunk = np.asarray(array[chunk_key])
+        if apply is not None:
+            apply(chunk_key, chunk)
+        LOGGER.debug(
+            'fetched chunk %s in %.3fs', chunk_key, time.monotonic() - start
+        )
+        return chunk_key
+
+    if num_workers <= 1 or len(chunk_queue) <= 1:
+        batch: list = []
+        last_yield = time.monotonic()
+        for chunk_key in chunk_queue:
+            batch.append(fetch(chunk_key))
+            now = time.monotonic()
+            if now - last_yield >= batch_seconds:
+                last_yield = now
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+        return
 
     pool = ThreadPoolExecutor(max_workers=num_workers)
     pending = iter(chunk_queue)
@@ -350,18 +369,27 @@ def _fetch_chunks(
         pool.submit(fetch, chunk_key): chunk_key
         for chunk_key in itertools.islice(pending, num_workers)
     }
+    batch = []
+    last_yield = time.monotonic()
     try:
         while in_flight:
             done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
             for future in done:
-                chunk_key = in_flight.pop(future)
+                in_flight.pop(future)
                 next_key = next(pending, None)
                 if next_key is not None:
                     try:
                         in_flight[pool.submit(fetch, next_key)] = next_key
                     except RuntimeError:  # pool/interpreter shutting down
                         pending = iter(())
-                yield chunk_key, future.result()
+                batch.append(future.result())
+            now = time.monotonic()
+            if batch and (now - last_yield >= batch_seconds):
+                last_yield = now
+                yield batch
+                batch = []
+        if batch:
+            yield batch
     finally:
         # don't block cancellation on fetches that haven't started
         pool.shutdown(wait=False, cancel_futures=True)
@@ -1003,11 +1031,20 @@ class ProgressiveLoader:
         # arrives so the canvas is never empty while fetching.
         self._refresh(force=True)
 
+        def apply(chunk_key, chunk, vdata=vdata):
+            # worker thread: lock-guarded numpy writes; the main thread
+            # only handles GPU patching and bookkeeping per batch
+            vdata.set_offset(chunk_key, chunk)
+            vdata.loaded_chunks.add(_chunk_id(chunk_key))
+
         worker = _fetch_chunks(
-            vdata.array, queue, num_workers=self._fetch_workers
+            vdata.array,
+            queue,
+            num_workers=self._fetch_workers,
+            apply=apply,
         )
         worker.yielded.connect(
-            lambda result: self._on_chunk(generation, vdata, result)
+            lambda batch: self._on_chunks(generation, vdata, batch)
         )
         worker.finished.connect(lambda: self._on_fetch_finished(generation))
         self._worker = worker
@@ -1051,7 +1088,9 @@ class ProgressiveLoader:
             with contextlib.suppress(Exception):
                 pbar.close()
 
-    def _advance_progress(self, resident: bool = False) -> None:
+    def _advance_progress(
+        self, count: int = 1, resident: bool = False
+    ) -> None:
         """Reentrancy-safe progress bar increment.
 
         ``QtLabeledProgressBar.setValue`` runs ``processEvents()``, which
@@ -1064,7 +1103,7 @@ class ProgressiveLoader:
         # flush at most ~5x per second
         now = time.monotonic()
         if resident:
-            self._resident_pbar_pending += 1
+            self._resident_pbar_pending += count
             if (
                 self._resident_pbar_flushing
                 or now - self._resident_pbar_last_flush < 0.2
@@ -1082,7 +1121,7 @@ class ProgressiveLoader:
             finally:
                 self._resident_pbar_flushing = False
         else:
-            self._pbar_pending += 1
+            self._pbar_pending += count
             if self._pbar_flushing or now - self._pbar_last_flush < 0.2:
                 return
             self._pbar_last_flush = now
@@ -1107,31 +1146,30 @@ class ProgressiveLoader:
         self._pbar = None
         self._pbar_pending = 0
 
-    def _on_chunk(self, generation: int, vdata: VirtualData, result) -> None:
+    def _on_chunks(self, generation: int, vdata: VirtualData, batch) -> None:
+        """Handle a batch of fetched chunks (already applied off-thread)."""
         if generation != self._generation or self._closed:
             return
-        chunk_key, chunk = result
-        vdata.set_offset(chunk_key, chunk)
-        vdata.loaded_chunks.add(_chunk_id(chunk_key))
-        self._chunks_done += 1
+        self._chunks_done += len(batch)
         if self._pbar is not None:
-            self._advance_progress()
+            self._advance_progress(len(batch))
         final = self._chunks_done >= self._chunks_total
         if final:
             self._close_progress(self._pbar)
             self._pbar = None
-        now = time.monotonic()
         # While the pass is streaming, patched chunks keep the GPU texture
         # identical to what a pipeline refresh would produce, so the only
         # full re-slice + re-upload happens once at the end of the pass
         # (and at its start, for the backdrop). Mid-pass full uploads were
         # the main remaining UI stalls on slow GL drivers.
-        if (
-            not final
-            and self._texture_patching
-            and self._patch_texture(vdata, chunk_key)
-        ):
-            # the chunk is already on the GPU; just (throttled) redraws
+        patched = not final and self._texture_patching
+        if patched:
+            for chunk_key in batch:
+                if not self._patch_texture(vdata, chunk_key):
+                    patched = False
+                    break
+        if patched:
+            now = time.monotonic()
             if now - self._last_node_update >= max(
                 self._refresh_interval_s, 0.05
             ):
@@ -1332,18 +1370,23 @@ class ProgressiveLoader:
         self._resident_pbar = self._make_progress(
             len(queue), f'{self._layer.name}: loading overview'
         )
-        worker = _fetch_chunks(
-            vdata.array, queue, num_workers=self._fetch_workers
-        )
 
-        def on_chunk(result, vdata=vdata):
-            if self._closed or self._resident_worker is not worker:
-                return
-            chunk_key, chunk = result
+        def apply(chunk_key, chunk, vdata=vdata):
             vdata.set_offset(chunk_key, chunk)
             vdata.loaded_chunks.add(_chunk_id(chunk_key))
+
+        worker = _fetch_chunks(
+            vdata.array,
+            queue,
+            num_workers=self._fetch_workers,
+            apply=apply,
+        )
+
+        def on_chunk(batch, vdata=vdata):
+            if self._closed or self._resident_worker is not worker:
+                return
             if self._resident_pbar is not None:
-                self._advance_progress(resident=True)
+                self._advance_progress(len(batch), resident=True)
             if self._layer.data_level == self._resident_level:
                 self._refresh()
 
