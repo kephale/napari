@@ -35,6 +35,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import logging
+import os
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING
@@ -353,7 +354,10 @@ def _fetch_chunks(
                 chunk_key = in_flight.pop(future)
                 next_key = next(pending, None)
                 if next_key is not None:
-                    in_flight[pool.submit(fetch, next_key)] = next_key
+                    try:
+                        in_flight[pool.submit(fetch, next_key)] = next_key
+                    except RuntimeError:  # pool/interpreter shutting down
+                        pending = iter(())
                 yield chunk_key, future.result()
     finally:
         # don't block cancellation on fetches that haven't started
@@ -403,9 +407,10 @@ class ProgressiveLoader:
         In 3D auto mode, target the coarsest level whose voxels project
         to at most this many screen pixels. Lower values choose finer
         (more expensive) levels sooner when zooming in.
-    fetch_workers : int
-        Number of threads fetching chunks concurrently within a pass.
-        Completion order stays close to priority order.
+    fetch_workers : int, optional
+        Number of threads fetching chunks concurrently within a pass
+        (default: up to 8, bounded by the CPU count). Completion order
+        stays close to priority order.
     """
 
     def __init__(
@@ -419,8 +424,8 @@ class ProgressiveLoader:
         resident_max_bytes: int = DEFAULT_RESIDENT_MAX_BYTES,
         interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
         auto_level_3d: bool = True,
-        max_pixel_size_3d: float = 4.0,
-        fetch_workers: int = 4,
+        max_pixel_size_3d: float = 2.0,
+        fetch_workers: int | None = None,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -429,6 +434,8 @@ class ProgressiveLoader:
         self._interval_max_bytes = interval_max_bytes
         self._auto_level_3d = auto_level_3d
         self._max_pixel_size_3d = float(max_pixel_size_3d)
+        if fetch_workers is None:
+            fetch_workers = min(8, os.cpu_count() or 4)
         self._fetch_workers = max(int(fetch_workers), 1)
         # Level we set through layer._locked_data_level for 3D auto mode
         # (None when we are not driving the level).
@@ -447,6 +454,13 @@ class ProgressiveLoader:
         self._last_refresh_duration = 0.0
         self._pbar = None
         self._resident_pbar = None
+        # napari's Qt progress bar calls QApplication.processEvents() on
+        # every update, which re-enters event handling; these counters
+        # make progress updates reentrancy-safe (see _advance_progress)
+        self._pbar_pending = 0
+        self._pbar_flushing = False
+        self._resident_pbar_pending = 0
+        self._resident_pbar_flushing = False
         self._backdrop_pending = False
 
         self._resident_worker = None
@@ -519,6 +533,7 @@ class ProgressiveLoader:
             self._resident_worker = None
         self._close_progress(self._resident_pbar)
         self._resident_pbar = None
+        self._resident_pbar_pending = 0
         for emitter, callback in self._connections:
             with contextlib.suppress(ValueError, TypeError):
                 emitter.disconnect(callback)
@@ -683,8 +698,14 @@ class ProgressiveLoader:
         return n_levels - 1
 
     def _camera_bbox_level0(self, displayed_axes) -> np.ndarray | None:
-        """Camera center as a degenerate bbox in level-0 data coords."""
-        camera_center = np.asarray(self._viewer.camera.center, dtype=float)
+        """Approximate visible bbox around the camera, in level-0 coords.
+
+        Sized from the canvas dimensions and zoom so 3D sub-volume tiles
+        cover (roughly) what is on screen rather than the whole memory
+        budget.
+        """
+        camera = self._viewer.camera
+        camera_center = np.asarray(camera.center, dtype=float)
         if not np.all(np.isfinite(camera_center)):
             return None
         try:
@@ -700,7 +721,15 @@ class ProgressiveLoader:
         center = data_point[list(displayed_axes)]
         if not np.all(np.isfinite(center)):
             return None
-        return np.stack([center, center])
+        zoom = float(camera.zoom)
+        try:
+            canvas_size = max(self._viewer._canvas_size)
+        except Exception:  # pragma: no cover - headless  # noqa: BLE001
+            canvas_size = 800
+        if not np.isfinite(zoom) or zoom <= 0 or canvas_size <= 0:
+            return np.stack([center, center])
+        half_extent = (canvas_size / zoom) / 2
+        return np.stack([center - half_extent, center + half_extent])
 
     def _apply_auto_level(self) -> None:
         """Drive the layer's data level from zoom while in 3D Auto mode.
@@ -958,6 +987,44 @@ class ProgressiveLoader:
             with contextlib.suppress(Exception):
                 pbar.close()
 
+    def _advance_progress(self, resident: bool = False) -> None:
+        """Reentrancy-safe progress bar increment.
+
+        ``QtLabeledProgressBar.setValue`` runs ``processEvents()``, which
+        can deliver the next queued chunk *inside* the current handler;
+        unguarded per-chunk ``pbar.update`` calls then nest the stack one
+        level per pending chunk until ``RecursionError``. Nested calls
+        here only increment a counter; the outermost call flushes it.
+        """
+        if resident:
+            self._resident_pbar_pending += 1
+            if self._resident_pbar_flushing:
+                return
+            self._resident_pbar_flushing = True
+            try:
+                while self._resident_pbar_pending:
+                    count = self._resident_pbar_pending
+                    self._resident_pbar_pending = 0
+                    if self._resident_pbar is None:
+                        break
+                    self._resident_pbar.update(count)
+            finally:
+                self._resident_pbar_flushing = False
+        else:
+            self._pbar_pending += 1
+            if self._pbar_flushing:
+                return
+            self._pbar_flushing = True
+            try:
+                while self._pbar_pending:
+                    count = self._pbar_pending
+                    self._pbar_pending = 0
+                    if self._pbar is None:
+                        break
+                    self._pbar.update(count)
+            finally:
+                self._pbar_flushing = False
+
     def _cancel_active(self) -> None:
         self._generation += 1
         if self._worker is not None:
@@ -966,6 +1033,7 @@ class ProgressiveLoader:
         self._active = None
         self._close_progress(self._pbar)
         self._pbar = None
+        self._pbar_pending = 0
 
     def _on_chunk(self, generation: int, vdata: VirtualData, result) -> None:
         if generation != self._generation or self._closed:
@@ -975,7 +1043,7 @@ class ProgressiveLoader:
         vdata.loaded_chunks.add(_chunk_id(chunk_key))
         self._chunks_done += 1
         if self._pbar is not None:
-            self._pbar.update(1)
+            self._advance_progress()
         final = self._chunks_done >= self._chunks_total
         if final:
             self._close_progress(self._pbar)
@@ -1075,6 +1143,7 @@ class ProgressiveLoader:
             self._resident_worker = None
         self._close_progress(self._resident_pbar)
         self._resident_pbar = None
+        self._resident_pbar_pending = 0
         vdata = self._data[self._resident_level]
         vdata.set_interval(min_coord, max_coord)
         interval = vdata.interval
@@ -1101,7 +1170,7 @@ class ProgressiveLoader:
             vdata.set_offset(chunk_key, chunk)
             vdata.loaded_chunks.add(_chunk_id(chunk_key))
             if self._resident_pbar is not None:
-                self._resident_pbar.update(1)
+                self._advance_progress(resident=True)
             if self._layer.data_level == self._resident_level:
                 self._refresh()
 
@@ -1153,7 +1222,7 @@ def add_progressive_loading_image(
     rendering: str = 'attenuated_mip',
     name: str | None = None,
     auto_level_3d: bool = True,
-    max_pixel_size_3d: float = 4.0,
+    max_pixel_size_3d: float = 2.0,
     interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
     **layer_kwargs,
 ):

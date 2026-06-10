@@ -348,22 +348,11 @@ def test_chunk_priority_3d_degenerate_camera():
         {
             'camera_center': (np.inf, 0, 0),
             'view_direction': (1, 0, 0),
-            'zoom': np.nan,
-        },
-        {
-            'camera_center': (32, 32, 32),
-            'view_direction': (1, 0, 0),
-            'zoom': 0.0,
         },
         # huge-but-finite center: overflows the priority arithmetic
         {
             'camera_center': (1e308, -1e308, 1e308),
             'view_direction': (1, 0, 0),
-        },
-        {
-            'camera_center': (32, 32, 32),
-            'view_direction': (1, 0, 0),
-            'zoom': 1e308,
         },
     ]
     for camera in degenerate_cameras:
@@ -371,9 +360,23 @@ def test_chunk_priority_3d_degenerate_camera():
             warnings.simplefilter('error', RuntimeWarning)
             queue = chunk_priority_3D(keys, (0, 0, 0), (64, 64, 64), **camera)
         assert len(queue) == 64
-        # the most central chunks must still come first
+        # fallback ordering: the most central chunks come first
         first_center = np.array([(sl.start + sl.stop) / 2 for sl in queue[0]])
         assert np.all(np.abs(first_center - 32) <= 16)
+    # a valid camera with a junk zoom value must not warn either (zoom is
+    # unused by the front-to-back ordering)
+    for zoom in (0.0, np.nan, 1e308):
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', RuntimeWarning)
+            queue = chunk_priority_3D(
+                keys,
+                (0, 0, 0),
+                (64, 64, 64),
+                camera_center=(32, 32, 32),
+                view_direction=(1, 0, 0),
+                zoom=zoom,
+            )
+        assert queue[0][0].start == 0  # front-to-back
 
 
 def test_zoom_target_level_3d_uninitialized_camera(
@@ -604,7 +607,7 @@ def test_auto_label_shows_current_level(
     loader = layer.metadata['progressive_loader']
     _wait_for_idle_loader(qtbot, loader)
 
-    control = viewer.window.qt_viewer.controls.widgets[layer]
+    control = viewer.window._qt_viewer.controls.widgets[layer]
     combo = control._multiscale_level_control.level_combobox
     assert combo.itemText(0) == f'Auto ({layer.data_level})'
 

@@ -13,6 +13,7 @@ functional, and fine for tests with small tiles).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import numpy as np
@@ -260,7 +261,9 @@ class GenerativeZarrStore(MemoryStore):
         parsed = self._parse_chunk_key(key)
         if parsed is None:
             return None
-        chunk = self.get_chunk(*parsed)
+        # run the (GIL-releasing) chunk computation off the event loop so
+        # concurrent reads synthesize chunks in parallel
+        chunk = await asyncio.to_thread(self.get_chunk, *parsed)
         data = np.ascontiguousarray(chunk, dtype=self.dtype).tobytes()
         if prototype is None:
             prototype = default_buffer_prototype()

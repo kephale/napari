@@ -50,6 +50,10 @@ if TYPE_CHECKING:
 
 __all__ = ('ScalarFieldBase',)
 
+#: Lower bound for the per-axis extent of 3D sub-volume tiles, so extreme
+#: zooms do not thrash on tiny slices.
+_MIN_TILE_EXTENT_3D = 32
+
 
 def _make_level_materializer(
     data: MultiScaleData,
@@ -579,23 +583,33 @@ class ScalarFieldBase(Layer, ABC):
         corners[1, displayed_axes] = shape_at_level - 1
 
         extent_cap = self._max_tile_extent_3d
-        if (
-            self._slice_input.ndisplay != 3
-            or extent_cap is None
-            or not np.any(shape_at_level > extent_cap)
-        ):
+        if self._slice_input.ndisplay != 3 or extent_cap is None:
             return corners
 
         downsample = np.take(
             np.asarray(self.downsample_factors[level]), displayed_axes
         )
+        tile_extent = np.minimum(shape_at_level, extent_cap)
         if data_bbox_int is not None and np.all(np.isfinite(data_bbox_int)):
-            center = np.asarray(data_bbox_int).mean(axis=0) / downsample
+            bbox = np.asarray(data_bbox_int, dtype=float) / downsample
+            center = bbox.mean(axis=0)
+            # Bound the tile by the visible extent so deep zooms slice
+            # (and fetch) only what is on screen. The canvas-plane bbox is
+            # degenerate along the view axis, so give every axis at least
+            # the largest on-screen extent (a view-sized cube).
+            view_extent = bbox[1] - bbox[0]
+            view_extent = np.maximum(view_extent, view_extent.max())
+            view_extent = np.ceil(view_extent).astype(np.int64)
+            if np.all(view_extent > 0):
+                tile_extent = np.minimum(
+                    tile_extent,
+                    np.maximum(view_extent, _MIN_TILE_EXTENT_3D),
+                )
         else:
             center = shape_at_level / 2
         center = np.clip(center, 0, shape_at_level - 1)
-
-        tile_extent = np.minimum(shape_at_level, extent_cap)
+        if np.all(tile_extent >= shape_at_level):
+            return corners
         low = np.clip(
             (center - tile_extent / 2).astype(int),
             0,
