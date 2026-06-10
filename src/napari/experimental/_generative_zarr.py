@@ -46,7 +46,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised without numba
         return decorator
 
 
-@njit(nogil=True)
+@njit(nogil=True, cache=True)
 def tile_bounds(level, coords, max_level, min_coord=-2.5, max_coord=2.5):
     """Return the fractal-space bounds of an ND tile.
 
@@ -76,7 +76,7 @@ def tile_bounds(level, coords, max_level, min_coord=-2.5, max_coord=2.5):
     return bounds
 
 
-@njit(nogil=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def mandelbrot(out, from_x, from_y, to_x, to_y, grid_size, maxiter):
     """Fill ``out`` with Mandelbrot escape iteration counts.
 
@@ -112,7 +112,7 @@ def mandelbrot(out, from_x, from_y, to_x, to_y, grid_size, maxiter):
 
 
 # Based on http://www.fractal.org/Formula-Mandelbulb.pdf
-@njit(nogil=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def mandelbulb(
     out, from_x, from_y, from_z, to_x, to_y, to_z, grid_size, maxiter, order
 ):

@@ -77,9 +77,11 @@ def test_chunk_priority_3d_orders_by_depth():
         zoom=1.0,
     )
     assert len(queue) == 64
-    # chunks closer to the camera (small z) and near the center line first
-    first = queue[0]
-    assert first[0].start < 32
+    # strictly front-to-back: the chunk closest to the viewer loads first,
+    # and depth along the view direction never decreases
+    assert queue[0][0].start == 0
+    depths = [key[0].start for key in queue]
+    assert depths == sorted(depths)
 
 
 # ---------- viewer integration ----------
@@ -572,3 +574,40 @@ def test_progressive_loading_3d_subvolume_tile(
         np.asarray(loader._data[0][key]),
         np.asarray(multiscale_3d_arrays[0][key]),
     )
+
+
+def test_chunk_priority_3d_closest_visible_first():
+    """Among chunks at the same depth, on-axis chunks lead; across depths,
+    closer-to-viewer always wins."""
+    arr = da.zeros((64, 64, 64), chunks=(16, 16, 16), dtype=np.uint8)
+    keys = chunk_slices(VirtualData(arr))
+    queue = chunk_priority_3D(
+        keys,
+        (0, 0, 0),
+        (64, 64, 64),
+        camera_center=(32, 32, 32),
+        view_direction=(1, 0, 0),
+    )
+    # first chunk: front slab, on the center line
+    first = queue[0]
+    assert first[0].start == 0
+    assert first[1] == slice(16, 32) or first[1] == slice(32, 48)
+    assert first[2] == slice(16, 32) or first[2] == slice(32, 48)
+
+
+def test_auto_label_shows_current_level(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    """The resolution selector's Auto entry indicates the rendered level."""
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    control = viewer.window.qt_viewer.controls.widgets[layer]
+    combo = control._multiscale_level_control.level_combobox
+    assert combo.itemText(0) == f'Auto ({layer.data_level})'
+
+    layer.locked_data_level = 0
+    qtbot.waitUntil(lambda: combo.itemText(0) == 'Auto (0)', timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)

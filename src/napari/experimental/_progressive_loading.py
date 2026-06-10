@@ -36,6 +36,7 @@ import contextlib
 import itertools
 import logging
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -205,13 +206,15 @@ def chunk_priority_3D(
     camera_center,
     view_direction,
     zoom: float = 1.0,
-    center_weight: float = 5.0,
+    center_line_weight: float = 0.5,
 ) -> list[tuple[slice, ...]]:
-    """Order chunk keys for 3D rendering.
+    """Order chunk keys front-to-back for 3D rendering.
 
-    Priority combines visual depth along the view direction, distance from
-    the camera's center line, and distance from the view center, so chunks
-    in front of and near the middle of the camera load first.
+    Chunks are ordered primarily by depth along the camera's view
+    direction — with napari's orthographic camera, the chunk closest to
+    the viewer loads first — with the distance from the camera's center
+    line as a (down-weighted) secondary term so on-axis chunks lead at
+    equal depth.
 
     Parameters
     ----------
@@ -225,9 +228,10 @@ def chunk_priority_3D(
     view_direction : sequence of float
         Camera view direction (3-vector over the displayed dimensions).
     zoom : float
-        Camera zoom; weights the center-line distance term.
-    center_weight : float
-        Weight of the view-center distance term.
+        Unused; kept for API compatibility.
+    center_line_weight : float
+        Weight of the center-line distance term relative to depth (both
+        are in this level's data units).
 
     Returns
     -------
@@ -266,8 +270,6 @@ def chunk_priority_3D(
         and direction_norm >= 1e-12
     ):
         view_direction = view_direction / direction_norm
-        if not np.isfinite(zoom) or zoom <= 0:
-            zoom = 1.0
         # Large-magnitude (but finite) camera coordinates can overflow
         # the arithmetic below; compute silently and validate the result.
         with np.errstate(all='ignore'):
@@ -275,11 +277,7 @@ def chunk_priority_3D(
             depth = relative @ view_direction
             projected = view_direction * depth[:, np.newaxis]
             center_line_dist = np.linalg.norm(projected - relative, axis=-1)
-            candidate = (
-                depth
-                + zoom * center_line_dist
-                + center_weight * center_view_dist
-            )
+            candidate = depth + center_line_weight * center_line_dist
         if np.all(np.isfinite(candidate)):
             priority = candidate
     if priority is None:
@@ -315,20 +313,51 @@ def _tile_extent_3d_for(dtype: np.dtype, interval_max_bytes: int) -> int:
 
 
 @thread_worker
-def _fetch_chunks(array, chunk_queue: list[tuple[slice, ...]]):
-    """Fetch chunks from ``array`` one at a time, yielding each result.
+def _fetch_chunks(
+    array, chunk_queue: list[tuple[slice, ...]], num_workers: int = 1
+):
+    """Fetch chunks from ``array``, yielding each result as it completes.
 
     Yields ``(chunk_key, ndarray)`` tuples. Runs on a background thread;
     cancellation is delivered at yield points by the thread worker
-    machinery.
+    machinery. With ``num_workers > 1``, chunks are fetched by a small
+    thread pool (useful for GIL-releasing compute like numba and for
+    remote IO); a bounded in-flight window keeps completion order close
+    to the priority order of ``chunk_queue``.
     """
-    for chunk_key in chunk_queue:
-        start = time.monotonic()
-        chunk = np.asarray(array[chunk_key])
-        LOGGER.debug(
-            'fetched chunk %s in %.3fs', chunk_key, time.monotonic() - start
-        )
-        yield chunk_key, chunk
+    if num_workers <= 1 or len(chunk_queue) <= 1:
+        for chunk_key in chunk_queue:
+            start = time.monotonic()
+            chunk = np.asarray(array[chunk_key])
+            LOGGER.debug(
+                'fetched chunk %s in %.3fs',
+                chunk_key,
+                time.monotonic() - start,
+            )
+            yield chunk_key, chunk
+        return
+
+    def fetch(chunk_key):
+        return np.asarray(array[chunk_key])
+
+    pool = ThreadPoolExecutor(max_workers=num_workers)
+    pending = iter(chunk_queue)
+    in_flight = {
+        pool.submit(fetch, chunk_key): chunk_key
+        for chunk_key in itertools.islice(pending, num_workers)
+    }
+    try:
+        while in_flight:
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in done:
+                chunk_key = in_flight.pop(future)
+                next_key = next(pending, None)
+                if next_key is not None:
+                    in_flight[pool.submit(fetch, next_key)] = next_key
+                yield chunk_key, future.result()
+    finally:
+        # don't block cancellation on fetches that haven't started
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 class ProgressiveLoader:
@@ -374,6 +403,9 @@ class ProgressiveLoader:
         In 3D auto mode, target the coarsest level whose voxels project
         to at most this many screen pixels. Lower values choose finer
         (more expensive) levels sooner when zooming in.
+    fetch_workers : int
+        Number of threads fetching chunks concurrently within a pass.
+        Completion order stays close to priority order.
     """
 
     def __init__(
@@ -388,6 +420,7 @@ class ProgressiveLoader:
         interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
         auto_level_3d: bool = True,
         max_pixel_size_3d: float = 4.0,
+        fetch_workers: int = 4,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -396,6 +429,7 @@ class ProgressiveLoader:
         self._interval_max_bytes = interval_max_bytes
         self._auto_level_3d = auto_level_3d
         self._max_pixel_size_3d = float(max_pixel_size_3d)
+        self._fetch_workers = max(int(fetch_workers), 1)
         # Level we set through layer._locked_data_level for 3D auto mode
         # (None when we are not driving the level).
         self._auto_locked: int | None = None
@@ -879,7 +913,9 @@ class ProgressiveLoader:
         # arrives so the canvas is never empty while fetching.
         self._refresh(force=True)
 
-        worker = _fetch_chunks(vdata.array, queue)
+        worker = _fetch_chunks(
+            vdata.array, queue, num_workers=self._fetch_workers
+        )
         worker.yielded.connect(
             lambda result: self._on_chunk(generation, vdata, result)
         )
@@ -1054,7 +1090,9 @@ class ProgressiveLoader:
         self._resident_pbar = self._make_progress(
             len(queue), f'{self._layer.name}: loading overview'
         )
-        worker = _fetch_chunks(vdata.array, queue)
+        worker = _fetch_chunks(
+            vdata.array, queue, num_workers=self._fetch_workers
+        )
 
         def on_chunk(result, vdata=vdata):
             if self._closed or self._resident_worker is not worker:
