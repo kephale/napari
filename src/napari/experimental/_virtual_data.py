@@ -536,13 +536,22 @@ class MultiScaleVirtualData:
         )
         self._data[level].set_interval(min_coord, max_coord, backdrop=backdrop)
 
-    def fill_unloaded_from(self, level: int, src_level: int) -> bool:
+    def fill_unloaded_from(
+        self, level: int, src_level: int, region=None
+    ) -> bool:
         """Fill not-yet-loaded chunk regions of ``level`` from ``src_level``.
 
         Used to repair the backdrop when the source level finished loading
         only after the destination level's interval had been initialized
         (which would otherwise leave zeros on screen until real chunks
         arrive). Already-loaded chunks are left untouched.
+
+        Parameters
+        ----------
+        region : tuple of (min_coord, max_coord), optional
+            Restrict the repair to this absolute-coordinate region (e.g.
+            the currently rendered tile); the upsampling gather scales
+            with the region size.
 
         Returns True if anything was written.
         """
@@ -553,37 +562,78 @@ class MultiScaleVirtualData:
         with dst.lock:
             if dst._min_coord is None or dst.hyperslice.size == 0:
                 return False
-            content = backdrop(dst._min_coord, dst._max_coord)
-            if content is None or content.shape != dst.hyperslice.shape:
+            fill_min = list(dst._min_coord)
+            fill_max = list(dst._max_coord)
+            if region is not None:
+                fill_min = [
+                    min(max(int(r), lo), hi)
+                    for r, lo, hi in zip(region[0], fill_min, fill_max)
+                ]
+                fill_max = [
+                    min(max(int(r), lo), hi)
+                    for r, lo, hi in zip(region[1], dst._min_coord, fill_max)
+                ]
+                if any(mx <= mn for mn, mx in zip(fill_min, fill_max)):
+                    return False
+            content = backdrop(fill_min, fill_max)
+            expected = tuple(mx - mn for mn, mx in zip(fill_min, fill_max))
+            if content is None or tuple(content.shape) != expected:
                 return False
+            region_key = tuple(
+                slice(mn - lo, mx - lo)
+                for mn, mx, lo in zip(fill_min, fill_max, dst._min_coord)
+            )
             if not dst.loaded_chunks:
-                dst.hyperslice[:] = content
+                dst.hyperslice[region_key] = content
                 return True
-            # per-dimension chunk extents covering the interval, as
-            # (relative_start, relative_stop, absolute_id) entries
+            # per-dimension chunk extents covering the fill region, as
+            # (hyperslice_start, hyperslice_stop, absolute_id) entries
             per_dim: list[list[tuple[int, int, tuple[int, int]]]] = []
             for dim in range(dst.ndim):
                 bounds = dst._boundaries[dim]
-                lo, hi = dst._min_coord[dim], dst._max_coord[dim]
-                first = int(np.searchsorted(bounds, lo, side='left'))
+                lo = dst._min_coord[dim]
+                region_lo, region_hi = fill_min[dim], fill_max[dim]
+                first = max(
+                    int(np.searchsorted(bounds, region_lo, side='right')) - 1,
+                    0,
+                )
                 entries = []
                 start = int(bounds[first])
                 for stop in bounds[first + 1 :]:
                     stop = int(stop)
-                    if start >= hi:
+                    if start >= region_hi:
                         break
                     entries.append((start - lo, stop - lo, (start, stop)))
                     start = stop
                 per_dim.append(entries)
+            offset = [mn - lo for mn, lo in zip(fill_min, dst._min_coord)]
             wrote = False
             for combo in itertools.product(*per_dim):
                 chunk_id = tuple(absolute for *_rel, absolute in combo)
                 if chunk_id in dst.loaded_chunks:
                     continue
-                key = tuple(
-                    slice(rel_start, rel_stop)
-                    for rel_start, rel_stop, _absolute in combo
+                dst_key = tuple(
+                    slice(max(rel_start, off), rel_stop)
+                    for (rel_start, rel_stop, _absolute), off in zip(
+                        combo, offset
+                    )
                 )
-                dst.hyperslice[key] = content[key]
+                src_key = tuple(
+                    slice(sl.start - off, sl.stop - off)
+                    for sl, off in zip(dst_key, offset)
+                )
+                if any(sl.stop <= sl.start for sl in src_key):
+                    continue
+                src_clipped = tuple(
+                    slice(sl.start, min(sl.stop, dim_len))
+                    for sl, dim_len in zip(src_key, content.shape)
+                )
+                if any(sl.stop <= sl.start for sl in src_clipped):
+                    continue
+                dst_clipped = tuple(
+                    slice(d.start, d.start + (sc.stop - sc.start))
+                    for d, sc in zip(dst_key, src_clipped)
+                )
+                dst.hyperslice[dst_clipped] = content[src_clipped]
                 wrote = True
             return wrote

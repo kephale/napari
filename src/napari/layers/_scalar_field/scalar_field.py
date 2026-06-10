@@ -309,6 +309,10 @@ class ScalarFieldBase(Layer, ABC):
         # automatically selecting one based on the viewport / 3D mode.
         self._locked_data_level: int | None = None
 
+        # Viewport bbox from the most recent draw, as
+        # (displayed_axes, data_bbox_int); see _update_level_and_corners.
+        self._last_data_bbox: tuple | None = None
+
         # Experimental: maximum per-axis extent (in data pixels) of the
         # region sliced for a locked multiscale level in 3D. When set,
         # locking a level larger than this renders a sub-volume tile of
@@ -460,11 +464,30 @@ class ScalarFieldBase(Layer, ABC):
             n_levels = len(self.level_shapes)
             if level < 0 or level >= n_levels:
                 return
+        old_level = self._data_level
         self._locked_data_level = level
         if level is not None:
             displayed_axes = self._slice_input.displayed
+            # Size any 3D sub-volume tile to the viewport instead of the
+            # full memory budget — slicing a budget-sized cube here would
+            # stall the UI before the next draw refines it. Use the
+            # viewport bbox cached from the last draw when available,
+            # falling back to the previous level's corner pixels.
+            data_bbox_int = None
+            if self._last_data_bbox is not None and self._last_data_bbox[
+                0
+            ] == tuple(displayed_axes):
+                data_bbox_int = self._last_data_bbox[1]
+            else:
+                data_bbox_int = (
+                    self.corner_pixels[:, displayed_axes]
+                    * np.take(
+                        np.asarray(self.downsample_factors[old_level]),
+                        displayed_axes,
+                    )
+                ).astype(int)
             self.corner_pixels = self._corners_for_locked_level(
-                level, displayed_axes
+                level, displayed_axes, data_bbox_int
             )
             self._data_level = level
         else:
@@ -500,6 +523,11 @@ class ScalarFieldBase(Layer, ABC):
                 data_bbox_int, shape_threshold, displayed_axes
             )
             return
+
+        # remember the viewport bbox (level-0 data coords) so that other
+        # corner computations (e.g. the locked_data_level setter, which
+        # runs outside a draw) can size 3D sub-volume tiles to the view
+        self._last_data_bbox = (tuple(displayed_axes), data_bbox_int)
 
         if self._locked_data_level is not None:
             # User has explicitly locked the data level; skip automatic

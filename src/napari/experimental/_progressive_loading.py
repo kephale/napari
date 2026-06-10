@@ -523,6 +523,7 @@ class ProgressiveLoader:
         self._backdrop_pending = False
 
         self._resident_worker = None
+        self._repair_worker = None
         self._resident_level = len(data) - 1
         self._resident_max_bytes = resident_max_bytes
         self._resident_disabled = False
@@ -835,6 +836,14 @@ class ProgressiveLoader:
         if self._viewer.dims.ndisplay != 3:
             self._release_auto_level()
             return
+        displayed_axes = layer._slice_input.displayed
+        camera_bbox = self._camera_bbox_level0(displayed_axes)
+        if camera_bbox is None:
+            # camera not in a usable state (e.g. before the first draw):
+            # without a viewport bbox the tile would fall back to the full
+            # memory-budget cube, whose synchronous slice can stall the UI
+            # for seconds; wait for a valid camera instead
+            return
         target = self._zoom_target_level_3d()
         if target == self._auto_locked and layer._locked_data_level == target:
             return
@@ -843,9 +852,8 @@ class ProgressiveLoader:
         layer._data_level = target
         # Mirror the corner_pixels update of the locked_data_level setter,
         # centering any sub-volume tile on the camera.
-        displayed_axes = layer._slice_input.displayed
         layer.corner_pixels = layer._corners_for_locked_level(
-            target, displayed_axes, self._camera_bbox_level0(displayed_axes)
+            target, displayed_axes, camera_bbox
         )
         # Prepare the new level's interval with a backdrop from the level
         # that was just displayed BEFORE napari re-slices, so the previous
@@ -1315,12 +1323,41 @@ class ProgressiveLoader:
         self._last_refresh_duration = time.monotonic() - start
 
     def _repair_backdrop(self) -> None:
-        """Backfill unloaded regions of the active level from the coarsest."""
+        """Backfill unloaded regions of the active level from the coarsest.
+
+        The upsampling gather can take seconds for large tiles, so it runs
+        on a background thread (VirtualData is lock-guarded) limited to
+        the currently rendered region; the layer refreshes on completion.
+        """
         level = int(self._layer.data_level)
         if level == self._resident_level:
             return
-        if self._data.fill_unloaded_from(level, self._resident_level):
-            self._refresh(force=True)
+        min_coord, max_coord = self._level_interval(level)
+        if np.any(max_coord <= min_coord):
+            return
+        if self._repair_worker is not None:
+            return  # one repair at a time; _check will re-trigger if needed
+
+        @thread_worker
+        def repair():
+            return self._data.fill_unloaded_from(
+                level,
+                self._resident_level,
+                region=(min_coord, max_coord),
+            )
+
+        worker = repair()
+
+        def on_done(wrote):
+            if self._repair_worker is worker:
+                self._repair_worker = None
+            if wrote and not self._closed:
+                self._refresh(force=True)
+
+        worker.returned.connect(on_done)
+        worker.errored.connect(lambda _e: on_done(False))  # pragma: no cover
+        self._repair_worker = worker
+        worker.start()
 
     # -- resident coarsest level --
 
@@ -1581,9 +1618,14 @@ def add_progressive_loading_image(
         data.dtype, interval_max_bytes
     )
     viewer.layers.append(layer)
-    # Slice off the main thread: each chunk-driven refresh materializes
-    # the visible tile, which would otherwise block the UI. VirtualData
-    # access is lock-guarded, so concurrent slicing is safe.
+    # Slice off the main thread: refreshes materialize the visible tile
+    # (np.asarray over up to hundreds of MB), which would otherwise block
+    # the UI. Layer.refresh only routes through the async slicer when the
+    # experimental setting is on; VirtualData access is lock-guarded, so
+    # concurrent slicing is safe.
+    from napari.settings import get_settings
+
+    get_settings().experimental.async_ = True
     viewer._layer_slicer._force_sync = False
     loader = ProgressiveLoader(
         viewer,
