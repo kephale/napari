@@ -165,7 +165,10 @@ def test_removing_layer_closes_loader(
 
     viewer.layers.remove(layer)
     assert loader._closed
-    qtbot.waitUntil(lambda: loader._worker is None, timeout=10000)
+    assert loader._worker is None
+    # cancellation is cooperative: give in-flight fetch threads a moment
+    # to drain before teardown checks for live thread pools
+    qtbot.wait(300)
 
 
 def test_fetch_pass_is_cancelled_on_view_change(

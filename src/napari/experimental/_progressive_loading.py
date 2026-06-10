@@ -299,6 +299,34 @@ def _chunk_id(chunk_key: tuple[slice, ...]) -> tuple[tuple[int, int], ...]:
     return tuple((int(sl.start), int(sl.stop)) for sl in chunk_key)
 
 
+def _pack_upload_block(vdata: VirtualData, keys) -> tuple | None:
+    """Contiguous copy of the union region of ``keys`` (worker thread).
+
+    Returns ``(low, high, block)`` in absolute coordinates, or ``None``
+    when the region is outside the resident interval.
+    """
+    ndim = vdata.ndim
+    low = [min(int(k[d].start) for k in keys) for d in range(ndim)]
+    high = [max(int(k[d].stop) for k in keys) for d in range(ndim)]
+    with vdata.lock:
+        if vdata._min_coord is None:
+            return None
+        low = [
+            max(lo, mn) for lo, mn in zip(low, vdata._min_coord, strict=True)
+        ]
+        high = [
+            min(hi, mx) for hi, mx in zip(high, vdata._max_coord, strict=True)
+        ]
+        if any(hi <= lo for lo, hi in zip(low, high, strict=True)):
+            return None
+        source = tuple(
+            slice(lo - mn, hi - mn)
+            for lo, hi, mn in zip(low, high, vdata._min_coord, strict=True)
+        )
+        block = np.ascontiguousarray(vdata.hyperslice[source])
+    return low, high, block
+
+
 def _tile_extent_3d_for(dtype: np.dtype, interval_max_bytes: int) -> int:
     """Per-axis extent of 3D sub-volume tiles.
 
@@ -327,6 +355,7 @@ def _fetch_chunks(
     num_workers: int = 1,
     apply=None,
     batch_seconds: float = 0.05,
+    pack=None,
 ):
     """Fetch chunks from ``array``, yielding batches of completed keys.
 
@@ -337,7 +366,9 @@ def _fetch_chunks(
     (at most one signal per ``batch_seconds``), so chunk bursts do not
     flood the Qt event loop with per-chunk signal dispatches.
 
-    Yields lists of chunk keys. With ``num_workers > 1``, chunks are
+    Yields lists of chunk keys (or ``pack(keys)`` when ``pack`` is
+    given — e.g. to precompute a contiguous upload block on the worker
+    rather than the GUI thread). With ``num_workers > 1``, chunks are
     fetched by a small thread pool (useful for GIL-releasing compute
     like numba and for remote IO); a bounded in-flight window keeps
     completion order close to the priority order of ``chunk_queue``.
@@ -361,10 +392,10 @@ def _fetch_chunks(
             now = time.monotonic()
             if now - last_yield >= batch_seconds:
                 last_yield = now
-                yield batch
+                yield pack(batch) if pack is not None else batch
                 batch = []
         if batch:
-            yield batch
+            yield pack(batch) if pack is not None else batch
         return
 
     pool = ThreadPoolExecutor(max_workers=num_workers)
@@ -390,10 +421,10 @@ def _fetch_chunks(
             now = time.monotonic()
             if batch and (now - last_yield >= batch_seconds):
                 last_yield = now
-                yield batch
+                yield pack(batch) if pack is not None else batch
                 batch = []
         if batch:
-            yield batch
+            yield pack(batch) if pack is not None else batch
     finally:
         # don't block cancellation on fetches that haven't started
         pool.shutdown(wait=False, cancel_futures=True)
@@ -596,6 +627,10 @@ class ProgressiveLoader:
         if self._closed:
             return
         self._closed = True
+        with contextlib.suppress(Exception):
+            # kill any pending debounced trigger so no fetch pass can
+            # start after close
+            self._debounced_check.cancel()
         self._release_auto_level()
         self._cancel_active()
         if self._resident_worker is not None:
@@ -1062,11 +1097,23 @@ class ProgressiveLoader:
             vdata.set_offset(chunk_key, chunk)
             vdata.loaded_chunks.add(_chunk_id(chunk_key))
 
+        def pack(keys, vdata=vdata):
+            # worker thread: precompute the contiguous union-region block
+            # for the coalesced GPU upload, so the main thread never
+            # copies pixel data
+            return keys, _pack_upload_block(vdata, keys)
+
+        use_pack = (
+            self._texture_patching
+            and self._viewer.dims.ndisplay == 3
+            and vdata.ndim == 3
+        )
         worker = _fetch_chunks(
             vdata.array,
             queue,
             num_workers=self._fetch_workers,
             apply=apply,
+            pack=pack if use_pack else None,
         )
         worker.yielded.connect(
             lambda batch: self._on_chunks(generation, vdata, batch)
@@ -1182,6 +1229,9 @@ class ProgressiveLoader:
         """Handle a batch of fetched chunks (already applied off-thread)."""
         if generation != self._generation or self._closed:
             return
+        block = None
+        if isinstance(batch, tuple):
+            batch, block = batch
         self._chunks_done += len(batch)
         if self._pbar is not None:
             self._advance_progress(len(batch))
@@ -1196,7 +1246,7 @@ class ProgressiveLoader:
         # deferred to idle, after its end. Mid-pass full uploads were the
         # main remaining UI stalls on slow GL drivers.
         patched = self._texture_patching and self._patch_texture_batch(
-            vdata, batch
+            vdata, batch, block=block
         )
         if not patched:
             self._pass_all_patched = False
@@ -1239,7 +1289,9 @@ class ProgressiveLoader:
         high = [int(sl.stop) for sl in chunk_key]
         return self._patch_texture_region(vdata, low, high)
 
-    def _patch_texture_batch(self, vdata: VirtualData, batch) -> bool:
+    def _patch_texture_batch(
+        self, vdata: VirtualData, batch, block=None
+    ) -> bool:
         """Upload a batch of chunks as ONE coalesced texture update.
 
         Uploads the union bounding box of the batch from the hyperslice
@@ -1252,11 +1304,16 @@ class ProgressiveLoader:
             return True
         if self._viewer.dims.ndisplay != 3 or vdata.ndim != 3:
             return False
+        if block is not None:
+            low, high, data = block
+            return self._patch_texture_region(vdata, low, high, block=data)
         low = [min(int(key[d].start) for key in batch) for d in range(3)]
         high = [max(int(key[d].stop) for key in batch) for d in range(3)]
         return self._patch_texture_region(vdata, low, high)
 
-    def _patch_texture_region(self, vdata: VirtualData, low, high) -> bool:
+    def _patch_texture_region(
+        self, vdata: VirtualData, low, high, block=None
+    ) -> bool:
         """Write an absolute-coordinate region into the 3D GPU texture.
 
         A partial texture upload (glTexSubImage3D) is orders of magnitude
@@ -1290,21 +1347,40 @@ class ProgressiveLoader:
         ):
             # texture not (yet) synced to the current tile
             return False
+        region_low = list(low)
         low = [max(int(lo), mn) for lo, mn in zip(low, box_min, strict=True)]
         high = [min(int(h), mx) for h, mx in zip(high, box_max, strict=True)]
         if any(h <= lo for lo, h in zip(low, high, strict=True)):
             return False
-        # region in absolute coords -> hyperslice coords for the source,
-        # and corner-box coords for the texture offset
-        translate = vdata.translate
-        source = tuple(
-            slice(lo - tr, h - tr)
-            for lo, h, tr in zip(low, high, translate, strict=True)
-        )
         offset = tuple(lo - mn for lo, mn in zip(low, box_min, strict=True))
         try:
-            with vdata.lock:
-                sub = np.ascontiguousarray(vdata.hyperslice[source])
+            if block is not None:
+                # precomputed contiguous copy from the fetch worker: the
+                # main thread does no pixel copying at all
+                sub = block
+                expected = tuple(
+                    h - lo for lo, h in zip(low, high, strict=True)
+                )
+                if (
+                    tuple(low) != tuple(region_low)
+                    or tuple(block.shape) != expected
+                ):
+                    inner = tuple(
+                        slice(lo - rlo, h - rlo)
+                        for lo, h, rlo in zip(
+                            low, high, region_low, strict=True
+                        )
+                    )
+                    sub = np.ascontiguousarray(block[inner])
+            else:
+                # region in absolute coords -> hyperslice coords
+                translate = vdata.translate
+                source = tuple(
+                    slice(lo - tr, h - tr)
+                    for lo, h, tr in zip(low, high, translate, strict=True)
+                )
+                with vdata.lock:
+                    sub = np.ascontiguousarray(vdata.hyperslice[source])
             texture.set_data(sub, offset=offset)
         except Exception:  # noqa: BLE001 # pragma: no cover - GL mismatch
             return False
@@ -1651,4 +1727,7 @@ def add_progressive_loading_image(
         tile_max_bytes_3d=tile_max_bytes_3d,
     )
     layer.metadata['progressive_loader'] = loader
+    with contextlib.suppress(AttributeError):
+        # stop all background work when the window goes away
+        viewer.window._qt_window.destroyed.connect(loader.close)
     return layer
