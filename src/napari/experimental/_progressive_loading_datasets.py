@@ -43,6 +43,7 @@ def mandelbrot_dataset(
     tilesize: int = 512,
     maxiter: int = 255,
     cache_bytes: int = DEFAULT_CACHE_BYTES,
+    cpu_relief: float = 0.5,
 ):
     """Generate a multiscale 2D image of the Mandelbrot set.
 
@@ -70,7 +71,10 @@ def mandelbrot_dataset(
         'scale_levels', 'scale_factors', 'chunk_size', 'arrays']``.
     """
     store = MandelbrotStore(
-        levels=max_levels, tilesize=tilesize, maxiter=maxiter
+        levels=max_levels,
+        tilesize=tilesize,
+        maxiter=maxiter,
+        cpu_relief=cpu_relief,
     )
     arrays = _open_cached_multiscale(store, max_levels, cache_bytes)
     return {
@@ -89,6 +93,7 @@ def mandelbulb_dataset(
     maxiter: int = 255,
     order: int = 8,
     cache_bytes: int = DEFAULT_CACHE_BYTES,
+    cpu_relief: float = 0.5,
 ):
     """Generate a multiscale 3D image of a Mandelbulb.
 
@@ -112,7 +117,11 @@ def mandelbulb_dataset(
         'scale_levels', 'scale_factors', 'chunk_size', 'arrays']``.
     """
     store = MandelbulbStore(
-        levels=max_levels, tilesize=tilesize, maxiter=maxiter, order=order
+        levels=max_levels,
+        tilesize=tilesize,
+        maxiter=maxiter,
+        order=order,
+        cpu_relief=cpu_relief,
     )
     arrays = _open_cached_multiscale(store, max_levels, cache_bytes)
     return {

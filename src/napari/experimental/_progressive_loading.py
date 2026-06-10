@@ -409,8 +409,10 @@ class ProgressiveLoader:
         (more expensive) levels sooner when zooming in.
     fetch_workers : int, optional
         Number of threads fetching chunks concurrently within a pass
-        (default: up to 8, bounded by the CPU count). Completion order
-        stays close to priority order.
+        (default: up to 4, leaving at least two cores for the GUI).
+        Completion order stays close to priority order. Raise this for
+        high-latency remote data; lower it (or pace the store, see
+        ``GenerativeZarrStore.cpu_relief``) for compute-bound sources.
     """
 
     def __init__(
@@ -435,7 +437,14 @@ class ProgressiveLoader:
         self._auto_level_3d = auto_level_3d
         self._max_pixel_size_3d = float(max_pixel_size_3d)
         if fetch_workers is None:
-            fetch_workers = min(8, os.cpu_count() or 4)
+            # leave cores for the GUI event loop: saturating every core
+            # with chunk fetches makes the UI unresponsive on CPU-bound
+            # (e.g. generative) stores
+            try:
+                n_cpus = len(os.sched_getaffinity(0))
+            except AttributeError:  # pragma: no cover - macOS/Windows
+                n_cpus = os.cpu_count() or 3
+            fetch_workers = min(4, n_cpus - 2)
         self._fetch_workers = max(int(fetch_workers), 1)
         # Level we set through layer._locked_data_level for 3D auto mode
         # (None when we are not driving the level).

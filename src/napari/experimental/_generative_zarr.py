@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import numpy as np
 import zarr
@@ -193,16 +194,28 @@ class GenerativeZarrStore(MemoryStore):
         (``uint8`` if it fits, ``uint16`` otherwise).
     ndim : int
         Number of dimensions of the generated arrays.
+    cpu_relief : float
+        After computing a chunk, sleep for this fraction of the CPU time
+        the computation used. Chunk synthesis is pure compute, and many
+        parallel readers can otherwise saturate every core and starve the
+        GUI event loop. ``0`` disables pacing.
     """
 
     def __init__(
-        self, levels: int, tilesize: int, maxiter: int = 255, *, ndim: int
+        self,
+        levels: int,
+        tilesize: int,
+        maxiter: int = 255,
+        *,
+        ndim: int,
+        cpu_relief: float = 0.5,
     ):
         super().__init__()
         self.levels = levels
         self.tilesize = tilesize
         self.maxiter = maxiter
         self.ndim = ndim
+        self.cpu_relief = cpu_relief
         self.dtype = np.dtype(np.uint8 if maxiter < 256 else np.dtype('<u2'))
         self._init_metadata()
 
@@ -263,7 +276,16 @@ class GenerativeZarrStore(MemoryStore):
             return None
         # run the (GIL-releasing) chunk computation off the event loop so
         # concurrent reads synthesize chunks in parallel
-        chunk = await asyncio.to_thread(self.get_chunk, *parsed)
+
+        def compute() -> tuple[np.ndarray, float]:
+            cpu_start = time.thread_time()
+            result = self.get_chunk(*parsed)
+            return result, time.thread_time() - cpu_start
+
+        chunk, cpu_used = await asyncio.to_thread(compute)
+        if self.cpu_relief > 0 and cpu_used > 0:
+            # leave the GUI thread some CPU between compute bursts
+            await asyncio.sleep(cpu_used * self.cpu_relief)
         data = np.ascontiguousarray(chunk, dtype=self.dtype).tobytes()
         if prototype is None:
             prototype = default_buffer_prototype()
@@ -273,8 +295,10 @@ class GenerativeZarrStore(MemoryStore):
 class MandelbrotStore(GenerativeZarrStore):
     """A multiscale zarr store generating the Mandelbrot set on demand."""
 
-    def __init__(self, levels: int, tilesize: int, maxiter: int = 255):
-        super().__init__(levels, tilesize, maxiter, ndim=2)
+    def __init__(
+        self, levels: int, tilesize: int, maxiter: int = 255, **kwargs
+    ):
+        super().__init__(levels, tilesize, maxiter, ndim=2, **kwargs)
 
     def get_chunk(self, level: int, *coords: int) -> np.ndarray:
         y, x = coords
@@ -301,8 +325,9 @@ class MandelbulbStore(GenerativeZarrStore):
         tilesize: int,
         maxiter: int = 255,
         order: int = 8,
+        **kwargs,
     ):
-        super().__init__(levels, tilesize, maxiter, ndim=3)
+        super().__init__(levels, tilesize, maxiter, ndim=3, **kwargs)
         self.order = order
 
     def get_chunk(self, level: int, *coords: int) -> np.ndarray:
