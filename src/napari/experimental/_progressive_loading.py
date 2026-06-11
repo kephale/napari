@@ -710,14 +710,15 @@ class ProgressiveLoader:
         self._pbar = None
         self._resident_pbar = None
         # napari's Qt progress bar calls QApplication.processEvents() on
-        # every update, which re-enters event handling; these counters
-        # make progress updates reentrancy-safe (see _advance_progress)
+        # every update, which re-enters event handling *inside* the
+        # caller; chunk handlers therefore only accumulate counts here
+        # and a timer flushes them from the top of the event loop
+        # (see _advance_progress/_flush_progress)
         self._pbar_pending = 0
-        self._pbar_flushing = False
-        self._pbar_last_flush = 0.0
         self._resident_pbar_pending = 0
-        self._resident_pbar_flushing = False
-        self._resident_pbar_last_flush = 0.0
+        self._pbar_flushing = False
+        self._pbar_scheduled = False
+        self._pbar_last_flush = 0.0
         self._backdrop_pending = False
 
         self._resident_worker = None
@@ -1457,8 +1458,8 @@ class ProgressiveLoader:
 
         use_pack = (
             self._texture_patching
-            and self._viewer.dims.ndisplay == 3
-            and vdata.ndim == 3
+            and self._viewer.dims.ndisplay == vdata.ndim
+            and vdata.ndim in (2, 3)
         )
         self._limiter = self._make_limiter()
         worker = _fetch_chunks(
@@ -1527,50 +1528,55 @@ class ProgressiveLoader:
         count: int = 1,
         resident: bool = False,
     ) -> None:
-        """Reentrancy-safe progress bar increment.
+        """Accumulate progress for the timer-driven flush.
 
-        ``QtLabeledProgressBar.setValue`` runs ``processEvents()``, which
-        can deliver the next queued chunk *inside* the current handler;
-        unguarded per-chunk ``pbar.update`` calls then nest the stack one
-        level per pending chunk until ``RecursionError``. Nested calls
-        here only increment a counter; the outermost call flushes it.
+        ``QtLabeledProgressBar.setValue`` runs ``processEvents()``;
+        calling it from a chunk handler re-enters the event loop *inside*
+        that handler, nesting queued chunk deliveries and repaints there
+        (the dominant 2D streaming stall on slow GL stacks). Chunk
+        handlers only increment counters; the Qt update runs from a
+        timer at the top of the event loop.
         """
-        # each Qt progress update repaints the UI (processEvents), so
-        # flush at most ~5x per second
-        now = time.monotonic()
         if resident:
             self._resident_pbar_pending += count
-            if (
-                self._resident_pbar_flushing
-                or now - self._resident_pbar_last_flush < 0.2
-            ):
-                return
-            self._resident_pbar_last_flush = now
-            self._resident_pbar_flushing = True
-            try:
-                while self._resident_pbar_pending:
-                    count = self._resident_pbar_pending
-                    self._resident_pbar_pending = 0
-                    if self._resident_pbar is None:
-                        break
-                    self._resident_pbar.update(count)
-            finally:
-                self._resident_pbar_flushing = False
         else:
             self._pbar_pending += count
-            if self._pbar_flushing or now - self._pbar_last_flush < 0.2:
-                return
-            self._pbar_last_flush = now
-            self._pbar_flushing = True
-            try:
-                while self._pbar_pending:
-                    count = self._pbar_pending
-                    self._pbar_pending = 0
-                    if self._pbar is None:
-                        break
-                    self._pbar.update(count)
-            finally:
-                self._pbar_flushing = False
+        if self._closed or self._pbar_scheduled:
+            return
+        now = time.monotonic()
+        if now - self._pbar_last_flush < 0.2:
+            # ~5 flushes/s: the next batch after the window flushes,
+            # and the pass-end close covers the tail
+            return
+        self._pbar_last_flush = now
+        self._pbar_scheduled = True
+        try:
+            # zero-delay one-shot: fires on the next event-loop pass
+            # (outside any chunk handler) and self-disposes, so nothing
+            # outlives the loader
+            QTimer.singleShot(0, self._flush_progress)
+        except Exception:  # noqa: BLE001 # pragma: no cover - no Qt
+            self._pbar_scheduled = False
+
+    def _flush_progress(self) -> None:
+        """Deferred callback: push accumulated counts to the Qt bars."""
+        self._pbar_scheduled = False
+        if self._closed or self._pbar_flushing:
+            return
+        self._pbar_flushing = True
+        try:
+            for pbar, attr in (
+                (self._pbar, '_pbar_pending'),
+                (self._resident_pbar, '_resident_pbar_pending'),
+            ):
+                count = getattr(self, attr)
+                if count:
+                    setattr(self, attr, 0)
+                    if pbar is not None:
+                        with contextlib.suppress(Exception):
+                            pbar.update(count)
+        finally:
+            self._pbar_flushing = False
 
     def _make_limiter(self) -> _FetchRateLimiter:
         limiter = _FetchRateLimiter(self._max_bytes_per_second)
@@ -1652,17 +1658,22 @@ class ProgressiveLoader:
         self._worker = None
         self._maybe_restore_quality()
 
-    def _get_volume_node(self):
+    def _get_display_node(self, ndisplay: int | None = None):
         try:
             visual = self._viewer.window._qt_viewer.layer_to_visual[
                 self._layer
             ]
-            return visual._layer_node.get_node(3)
+            if ndisplay is None:
+                ndisplay = self._viewer.dims.ndisplay
+            return visual._layer_node.get_node(ndisplay)
         except (KeyError, AttributeError):  # pragma: no cover - headless
             return None
 
+    def _get_volume_node(self):
+        return self._get_display_node(3)
+
     def _patch_texture(self, vdata: VirtualData, chunk_key) -> bool:
-        """Write one chunk's region into the existing 3D GPU texture."""
+        """Write one chunk's region into the existing GPU texture."""
         low = [int(sl.start) for sl in chunk_key]
         high = [int(sl.stop) for sl in chunk_key]
         return self._patch_texture_region(vdata, low, high)
@@ -1683,13 +1694,14 @@ class ProgressiveLoader:
         """
         if not batch:
             return True
-        if self._viewer.dims.ndisplay != 3 or vdata.ndim != 3:
+        ndim = self._viewer.dims.ndisplay
+        if ndim not in (2, 3) or vdata.ndim != ndim:
             return False
         if block is not None:
             low, high, data = block
             return self._patch_texture_region(vdata, low, high, block=data)
-        low = [min(int(key[d].start) for key in batch) for d in range(3)]
-        high = [max(int(key[d].stop) for key in batch) for d in range(3)]
+        low = [min(int(key[d].start) for key in batch) for d in range(ndim)]
+        high = [max(int(key[d].stop) for key in batch) for d in range(ndim)]
         return self._patch_texture_region(vdata, low, high)
 
     def _patch_texture_region(
@@ -1699,14 +1711,16 @@ class ProgressiveLoader:
         high,
         block=None,
     ) -> bool:
-        """Write an absolute-coordinate region into the 3D GPU texture.
+        """Write an absolute-coordinate region into the GPU texture.
 
-        A partial texture upload (glTexSubImage3D) is orders of magnitude
-        cheaper than the re-slice plus whole-volume upload of a pipeline
-        refresh. Only used when the texture demonstrably matches the
-        current interval; any mismatch falls back to a normal refresh.
+        A partial texture upload (glTexSubImage2D/3D) is orders of
+        magnitude cheaper than the re-slice plus whole-texture upload of
+        a pipeline refresh. Only used when the texture demonstrably
+        matches the current interval; any mismatch falls back to a
+        normal refresh.
         """
-        if self._viewer.dims.ndisplay != 3 or vdata.ndim != 3:
+        ndim = self._viewer.dims.ndisplay
+        if ndim not in (2, 3) or vdata.ndim != ndim:
             return False
         displayed = list(self._layer._slice_input.displayed)
         if displayed != sorted(displayed):
@@ -1714,25 +1728,29 @@ class ProgressiveLoader:
             return False
         if vdata.interval is None:
             return False
-        node = self._get_volume_node()
+        node = self._get_display_node(ndim)
         if node is None:
             return False
         try:
             texture = node._texture
-            dbuf = self._ensure_dbuf(node) if self._double_buffer else None
+            dbuf = (
+                self._ensure_dbuf(node)
+                if self._double_buffer and ndim == 3
+                else None
+            )
             # during a pending reshape the bound texture still has the
             # old tile's shape while staged patches target the new one,
             # so validate against the pair's staging shape
             tex_shape = (
-                dbuf.shape if dbuf is not None else tuple(texture.shape[:3])
+                dbuf.shape if dbuf is not None else tuple(texture.shape[:ndim])
             )
         except (AttributeError, TypeError):  # pragma: no cover
             return False
         # The texture holds the corner-pixels crop of the level (the
         # rendered tile), which sits inside the chunk-aligned interval.
         corners = self._layer.corner_pixels
-        box_min = [int(corners[0, d]) for d in range(3)]
-        box_max = [int(corners[1, d]) + 1 for d in range(3)]
+        box_min = [int(corners[0, d]) for d in range(ndim)]
+        box_max = [int(corners[1, d]) + 1 for d in range(ndim)]
         if tex_shape != tuple(
             mx - mn for mn, mx in zip(box_min, box_max, strict=True)
         ):
@@ -1818,7 +1836,7 @@ class ProgressiveLoader:
         return dbuf
 
     def _update_node(self) -> None:
-        node = self._get_volume_node()
+        node = self._get_display_node()
         if node is not None:
             if self._dbuf is not None and self._dbuf.matches(node):
                 try:

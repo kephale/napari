@@ -818,6 +818,83 @@ def test_texture_patching_used_in_3d(
     )
 
 
+def test_texture_patching_used_in_2d(
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
+):
+    """2D chunk arrivals go to the GPU as partial texture updates rather
+    than full re-slice + re-upload refreshes.
+    """
+    # shown viewer: 2D patching writes into the visual's existing
+    # texture, and unshown canvases never draw, so the texture would
+    # stay an unbuilt placeholder and every patch would fall back
+    viewer = make_napari_viewer(show=True)
+    # paced fetch: the pass spans several batches, so some arrive after
+    # the first draw has built the 2D texture
+    layer = add_progressive_loading_image(
+        multiscale_arrays,
+        viewer=viewer,
+        max_bytes_per_second=100_000,
+    )
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    layer.locked_data_level = 0
+
+    def patched():
+        viewer.screenshot(canvas_only=True, flash=False)
+        return loader._texture_patches > 0
+
+    qtbot.waitUntil(patched, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+    # patched texture content still matches the source at the end (the
+    # final reconcile re-slices through the normal pipeline)
+    np.testing.assert_array_equal(
+        np.asarray(loader._data[0][0:256, 0:256]),
+        np.asarray(multiscale_arrays[0]),
+    )
+
+
+def test_progress_updates_deferred(
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
+):
+    """Chunk handlers never push Qt progress updates synchronously.
+
+    The Qt progress bar runs ``processEvents()`` on every update, which
+    would re-enter the event loop inside the chunk handler; updates must
+    accumulate and flush from a zero-delay timer instead.
+    """
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    class FakeBar:
+        def __init__(self):
+            self.count = 0
+
+        def update(self, n):
+            self.count += n
+
+        def close(self):
+            pass
+
+    bar = FakeBar()
+    loader._pbar = bar
+    loader._pbar_pending = 0  # drop counts left over from initial load
+    loader._pbar_last_flush = 0.0
+    loader._advance_progress(3)
+    # nothing flushed inside the caller
+    assert bar.count == 0
+    assert loader._pbar_pending == 3
+    qtbot.waitUntil(lambda: bar.count == 3, timeout=2000)
+    assert loader._pbar_pending == 0
+    loader._pbar = None
+
+
 # ---------- fetch rate limiting ----------
 
 
