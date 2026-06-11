@@ -40,7 +40,7 @@ import threading
 import time
 import weakref
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 from psygnal import debounced
@@ -422,6 +422,18 @@ class _FetchRateLimiter:
         self._go.set()  # wake paused workers; cancelled passes must exit
 
 
+class _StampedBatch(NamedTuple):
+    """A yielded chunk batch with its send time.
+
+    The receiving (main-thread) handler compares ``sent`` with the
+    current time: the difference is how long the batch sat in the event
+    queue, i.e. a direct measure of main-thread congestion.
+    """
+
+    payload: object
+    sent: float
+
+
 @thread_worker
 def _fetch_chunks(
     array,
@@ -466,6 +478,10 @@ def _fetch_chunks(
         )
         return chunk_key
 
+    def emit(batch):
+        payload = pack(batch) if pack is not None else batch
+        return _StampedBatch(payload, time.monotonic())
+
     if num_workers <= 1 or len(chunk_queue) <= 1:
         batch: list = []
         last_yield = time.monotonic()
@@ -474,10 +490,10 @@ def _fetch_chunks(
             now = time.monotonic()
             if now - last_yield >= batch_seconds:
                 last_yield = now
-                yield pack(batch) if pack is not None else batch
+                yield emit(batch)
                 batch = []
         if batch:
-            yield pack(batch) if pack is not None else batch
+            yield emit(batch)
         return
 
     pool = ThreadPoolExecutor(max_workers=num_workers)
@@ -503,10 +519,10 @@ def _fetch_chunks(
             now = time.monotonic()
             if batch and (now - last_yield >= batch_seconds):
                 last_yield = now
-                yield pack(batch) if pack is not None else batch
+                yield emit(batch)
                 batch = []
         if batch:
-            yield pack(batch) if pack is not None else batch
+            yield emit(batch)
     finally:
         # don't block cancellation on fetches that haven't started
         pool.shutdown(wait=False, cancel_futures=True)
@@ -641,6 +657,9 @@ class ProgressiveLoader:
         self._pass_all_patched = False
         self._needs_final_reconcile = False
         self._last_node_update = 0.0
+        env_workers = os.environ.get('NAPARI_PROGRESSIVE_FETCH_WORKERS')
+        if env_workers:
+            fetch_workers = int(env_workers)
         if fetch_workers is None:
             # leave cores for the GUI event loop: saturating every core
             # with chunk fetches makes the UI unresponsive on CPU-bound
@@ -651,6 +670,17 @@ class ProgressiveLoader:
                 n_cpus = os.cpu_count() or 3
             fetch_workers = min(4, n_cpus - 2)
         self._fetch_workers = max(int(fetch_workers), 1)
+        # Congestion brake: when a chunk batch waited longer than this
+        # in the event queue (main thread starved by draws/uploads/GIL),
+        # fetching pauses for a beat so input events get through.
+        # NAPARI_PROGRESSIVE_CONGESTION_MS overrides; 0 disables.
+        env_congestion = os.environ.get('NAPARI_PROGRESSIVE_CONGESTION_MS')
+        self._congestion_threshold_s = (
+            float(env_congestion) / 1000.0
+            if env_congestion is not None
+            else 0.2
+        )
+        self._congestion_hold_s = max(0.25, 1.5 * self._congestion_threshold_s)
         env_bps = os.environ.get('NAPARI_PROGRESSIVE_MAX_BPS')
         if env_bps:
             max_bytes_per_second = float(env_bps)
@@ -769,6 +799,20 @@ class ProgressiveLoader:
         for emitter, callback in self._connections:
             emitter.connect(callback)
         viewer.layers.events.removed.connect(self._on_layer_removed)
+        # engage the interaction hold on the raw pointer events too:
+        # a press/wheel precedes the first camera event by one event,
+        # so the fetch workers pause before the gesture needs the GIL
+        self._canvas_events = []
+        with contextlib.suppress(AttributeError):  # headless ViewerModel
+            canvas_events = viewer.window._qt_viewer.canvas.events
+            for name in ('mouse_press', 'mouse_wheel'):
+                emitter = getattr(canvas_events, name, None)
+                if emitter is not None:
+                    emitter.connect(self._on_interaction)
+                    # a click without camera motion must still resume
+                    # the paused workers once it settles
+                    emitter.connect(self._debounced_check)
+                    self._canvas_events.append(emitter)
 
         # 2D multiscale slicing caches a one-time materialization of the
         # thumbnail (coarsest) level, which would freeze this layer's
@@ -833,6 +877,12 @@ class ProgressiveLoader:
             with contextlib.suppress(ValueError, TypeError):
                 emitter.disconnect(callback)
         self._connections = []
+        for emitter in self._canvas_events:
+            with contextlib.suppress(Exception):
+                emitter.disconnect(self._on_interaction)
+            with contextlib.suppress(Exception):
+                emitter.disconnect(self._debounced_check)
+        self._canvas_events = []
         with contextlib.suppress(ValueError, TypeError):
             self._viewer.layers.events.removed.disconnect(
                 self._on_layer_removed,
@@ -1788,6 +1838,9 @@ class ProgressiveLoader:
         """Handle a batch of fetched chunks (already applied off-thread)."""
         if generation != self._generation or self._closed:
             return
+        if isinstance(batch, _StampedBatch):
+            self._congestion_brake(batch.sent)
+            batch = batch.payload
         if self._holding:
             # interaction in progress: no GPU patches, no refreshes, no
             # progress churn; _end_hold replays these once it settles
@@ -1835,6 +1888,35 @@ class ProgressiveLoader:
         ):
             self._last_node_update = now
             self._update_node()
+
+    def _congestion_brake(self, sent: float) -> None:
+        """Pause fetching briefly when the main thread is congested.
+
+        ``sent`` is when the worker yielded the batch; the difference to
+        now is how long the delivery sat in the event queue behind
+        draws, uploads and GIL contention. When it exceeds the
+        threshold, interactivity is starving: extend the interaction
+        hold (pausing the fetch workers at their next acquire) and let
+        the debounced check resume them — the same settle path a drag
+        uses. Fetch throughput yields to input latency.
+        """
+        if self._congestion_threshold_s <= 0 or self._closed:
+            return
+        latency = time.monotonic() - sent
+        if latency <= self._congestion_threshold_s:
+            return
+        LOGGER.debug(
+            'congestion brake: batch delivery took %.0fms',
+            latency * 1000,
+        )
+        self._hold_until = max(
+            self._hold_until,
+            time.monotonic() + self._congestion_hold_s,
+        )
+        for limiter in (self._limiter, self._resident_limiter):
+            if limiter is not None:
+                limiter.pause()
+        self._debounced_check()
 
     def _on_fetch_finished(self, generation: int) -> None:
         if generation != self._generation or self._closed:
@@ -2209,6 +2291,9 @@ class ProgressiveLoader:
         def on_chunk(batch, vdata=vdata):
             if self._closed or self._resident_worker is not worker:
                 return
+            if isinstance(batch, _StampedBatch):
+                self._congestion_brake(batch.sent)
+                batch = batch.payload
             if self._resident_pbar is not None:
                 self._advance_progress(len(batch), resident=True)
             if self._layer.data_level == self._resident_level:

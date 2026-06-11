@@ -904,6 +904,34 @@ def test_progress_updates_deferred(
     loader._pbar = None
 
 
+def test_congestion_brake_pauses_and_resumes(
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
+):
+    """A batch that sat in the event queue past the threshold pauses
+    the fetch workers; the debounced check resumes them once the main
+    thread breathes again.
+    """
+    import time as _time
+
+    from napari.experimental._progressive_loading import _FetchRateLimiter
+
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    loader._limiter = _FetchRateLimiter(None)
+    assert loader._limiter._go.is_set()
+    loader._congestion_brake(
+        _time.monotonic() - loader._congestion_threshold_s - 1.0,
+    )
+    assert not loader._limiter._go.is_set()
+    assert loader._holding
+    qtbot.waitUntil(lambda: loader._limiter._go.is_set(), timeout=3000)
+
+
 # ---------- fetch rate limiting ----------
 
 
@@ -978,7 +1006,8 @@ def test_fetch_chunks_respects_limiter(multiscale_arrays):
         ),
     )
     elapsed = _time.monotonic() - start
-    fetched = [key for batch in batches for key in batch]
+    # batches are stamped with their send time for congestion tracking
+    fetched = [key for batch in batches for key in batch.payload]
     assert sorted(map(str, fetched)) == sorted(map(str, keys))
     # 4 KB at 8 KB/s with the first chunk free -> >= ~0.375s
     assert elapsed >= 0.3
