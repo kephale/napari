@@ -723,6 +723,10 @@ class ProgressiveLoader:
         self._pbar_scheduled = False
         self._pbar_last_flush = 0.0
         self._backdrop_pending = False
+        # (level, min, max) of the last synchronous 2D backdrop, whose
+        # patches left the GPU texture equal to the hyperslice; lets the
+        # matching fetch pass skip its pass-start full-tile upload
+        self._synced_backdrop_key: tuple | None = None
 
         self._resident_worker = None
         self._repair_worker = None
@@ -1396,13 +1400,7 @@ class ProgressiveLoader:
         view_min, view_max = self._viewport_box_2d(level, min_coord, max_coord)
         try:
             self._data.set_interval(level, min_coord, max_coord)
-            src_level = self._backdrop_level(level, view_min, view_max)
-            if src_level is not None and src_level != level:
-                self._data.fill_unloaded_from(
-                    level,
-                    src_level,
-                    region=(view_min, view_max),
-                )
+            self._backdrop_fill_layered(level, view_min, view_max)
         except Exception:  # noqa: BLE001 # pragma: no cover - degenerate
             return False
         patched = self._patch_texture_region(
@@ -1420,9 +1418,67 @@ class ProgressiveLoader:
             # writes staged into the back texture; swap it in now so
             # the very next paint shows the backdrop, not the zeros
             self._update_node()
+            # the texture now equals the hyperslice; if the fetch pass
+            # starts on this same interval, its forced backdrop refresh
+            # may skip the redundant full-tile upload
+            self._synced_backdrop_key = (
+                level,
+                tuple(int(c) for c in min_coord),
+                tuple(int(c) for c in max_coord),
+            )
             # backfill the off-screen margin on a worker thread
             self._repair_backdrop()
         return patched
+
+    def _backdrop_fill_layered(self, level, lo, hi) -> bool:
+        """Fill unloaded regions of ``[lo, hi)`` from every level with
+        useful resident data, coarsest first so finer sources overwrite
+        their overlap.
+
+        Unlike :meth:`_backdrop_level` (which requires one fully
+        covering source), this reuses *partially* covering levels —
+        including levels finer than the target, so zooming back out
+        reuses already-fetched detail instead of restarting from the
+        coarsest level.
+        """
+        n_levels = len(self._data)
+        factors = self._data._scale_factors
+        ndim = self._data.ndim
+        wrote = False
+        # high index = coarse; iterate coarse -> fine, skipping target
+        for cand in range(n_levels - 1, -1, -1):
+            if cand == level:
+                continue
+            src = self._data[cand]
+            if not src.loaded_chunks:
+                continue
+            with src.lock:
+                if src._min_coord is None:
+                    continue
+                src_min = [int(c) for c in src._min_coord]
+                src_max = [int(c) for c in src._max_coord]
+            # source interval expressed in target-level coordinates
+            ratio = [factors[cand][d] / factors[level][d] for d in range(ndim)]
+            region_lo = [
+                max(int(lo[d]), int(np.ceil(src_min[d] * ratio[d])))
+                for d in range(ndim)
+            ]
+            region_hi = [
+                min(int(hi[d]), int(np.floor(src_max[d] * ratio[d])))
+                for d in range(ndim)
+            ]
+            if any(b <= a for a, b in zip(region_lo, region_hi, strict=True)):
+                continue
+            with contextlib.suppress(Exception):
+                wrote = (
+                    self._data.fill_unloaded_from(
+                        level,
+                        cand,
+                        region=(region_lo, region_hi),
+                    )
+                    or wrote
+                )
+        return wrote
 
     def _viewport_box_2d(self, level, min_coord, max_coord):
         """The visible (no-margin) region of ``level``, clamped to the
@@ -1558,6 +1614,17 @@ class ProgressiveLoader:
         # arrives so the canvas is never empty while fetching. This is
         # a full-tile texture upload: keep frames cheap while the GLIR
         # meter drains it (quality restores once the backlog is gone).
+        # When the synchronous backdrop already patched this exact
+        # interval, the GPU texture equals the hyperslice (patches and
+        # full refreshes both preserve that) — skip the redundant
+        # full-tile upload; the refresh still fixes slice state.
+        if self._dbuf is not None and self._synced_backdrop_key == (
+            level,
+            tuple(min_coord),
+            tuple(max_coord),
+        ):
+            self._dbuf.suppress_next_full_upload()
+        self._synced_backdrop_key = None
         self._degrade_render_quality()
         self._refresh(force=True)
 
@@ -2015,11 +2082,7 @@ class ProgressiveLoader:
 
         @thread_worker
         def repair():
-            return self._data.fill_unloaded_from(
-                level,
-                self._resident_level,
-                region=(min_coord, max_coord),
-            )
+            return self._backdrop_fill_layered(level, min_coord, max_coord)
 
         worker = repair()
 

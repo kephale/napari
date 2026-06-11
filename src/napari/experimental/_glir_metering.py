@@ -55,7 +55,7 @@ DEFAULT_SLAB_BYTES = _FACTORY_SLAB_BYTES
 #: sync the GPU pipeline, so the backlog drains a few per frame instead
 #: of all at once (env: NAPARI_GLIR_DELETES_PER_FLUSH).
 DELETE_DRAIN_PER_FLUSH = int(
-    os.environ.get('NAPARI_GLIR_DELETES_PER_FLUSH', 8),
+    os.environ.get('NAPARI_GLIR_DELETES_PER_FLUSH', 4),
 )
 #: 2D texture DATA at or above this size is metered like 3D uploads.
 #: Small 2D textures (colormap LUTs, interpolation kernels) MUST stay
