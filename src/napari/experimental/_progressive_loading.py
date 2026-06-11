@@ -1446,7 +1446,7 @@ class ProgressiveLoader:
         if self._viewer.dims.ndisplay != 2:
             return False
         vdata = self._data[level]
-        if vdata.ndim != 2:
+        if vdata.ndim < 2:
             return False
         # Only the on-screen region is prepared here — the slice (and
         # texture) extend a render margin beyond the viewport, and an
@@ -1538,42 +1538,50 @@ class ProgressiveLoader:
 
     def _viewport_box_2d(self, level, min_coord, max_coord):
         """The visible (no-margin) region of ``level``, clamped to the
-        given interval. Falls back to the full interval when no viewport
-        bbox has been recorded yet."""
+        given interval. Non-displayed dims keep the interval's bounds
+        (the current-step slab). Falls back to the full interval when no
+        viewport bbox has been recorded yet."""
+        lo = [int(c) for c in min_coord]
+        hi = [int(c) for c in max_coord]
         bbox = getattr(self._layer, '_last_data_bbox', None)
         displayed = tuple(self._layer._slice_input.displayed)
-        if bbox is None or bbox[0] != displayed:
-            return list(min_coord), list(max_coord)
+        if bbox is None or bbox[0] != displayed or len(displayed) != 2:
+            return lo, hi
         factors = np.take(
             np.asarray(self._data._scale_factors[level], dtype=float),
             list(displayed),
         )
         corners = np.asarray(bbox[1], dtype=float) / factors
-        view_min = [
-            int(max(np.floor(corners[0, d]), int(min_coord[d])))
-            for d in range(2)
-        ]
-        view_max = [
-            int(min(np.ceil(corners[1, d]) + 1, int(max_coord[d])))
-            for d in range(2)
-        ]
-        if any(hi <= lo for lo, hi in zip(view_min, view_max, strict=True)):
-            return list(min_coord), list(max_coord)
-        return view_min, view_max
+        for i, d in enumerate(displayed):
+            view_lo = int(max(np.floor(corners[0, i]), lo[d]))
+            view_hi = int(min(np.ceil(corners[1, i]) + 1, hi[d]))
+            if view_hi <= view_lo:
+                return [int(c) for c in min_coord], [int(c) for c in max_coord]
+            lo[d], hi[d] = view_lo, view_hi
+        return lo, hi
 
     def _set_node_data_from_hyperslice(self, vdata: VirtualData) -> bool:
-        """Replace the node's data with the current corner-pixels crop."""
+        """Replace the node's data with the current corner-pixels crop
+        (at the current step of every non-displayed dim)."""
         node = self._get_display_node(2)
         if node is None:
+            return False
+        plane = self._displayed_plane(int(self._layer.data_level))
+        if plane is None:
+            return False
+        displayed, steps = plane
+        if len(displayed) != 2:
             return False
         corners = self._layer.corner_pixels
         translate = vdata.translate
         src = tuple(
-            slice(
+            steps[d] - int(translate[d])
+            if d in steps
+            else slice(
                 int(corners[0, d]) - int(translate[d]),
                 int(corners[1, d]) + 1 - int(translate[d]),
             )
-            for d in range(2)
+            for d in range(vdata.ndim)
         )
         try:
             with vdata.lock:
@@ -1715,8 +1723,8 @@ class ProgressiveLoader:
 
         use_pack = (
             self._texture_patching
-            and self._viewer.dims.ndisplay == vdata.ndim
-            and vdata.ndim in (2, 3)
+            and self._viewer.dims.ndisplay in (2, 3)
+            and vdata.ndim >= self._viewer.dims.ndisplay
         )
         self._limiter = self._make_limiter()
         worker = _fetch_chunks(
@@ -1967,6 +1975,48 @@ class ProgressiveLoader:
         high = [int(sl.stop) for sl in chunk_key]
         return self._patch_texture_region(vdata, low, high)
 
+    def _displayed_plane(self, level: int):
+        """The displayed dims and the fixed level-coordinate steps of
+        every other dim for the current slice.
+
+        Returns ``(displayed, steps)`` where ``steps`` maps each
+        non-displayed dim to its integer position at ``level`` (the
+        same rounding the slicing pipeline applies), or ``None`` when
+        the rendered slice is not a plain single plane that patches can
+        represent: transposed display order, thick-slice projections,
+        or an unusable slice point.
+        """
+        layer = self._layer
+        displayed = list(layer._slice_input.displayed)
+        if displayed != sorted(displayed):
+            return None
+        ndim = self._data.ndim
+        try:
+            data_slice = layer._data_slice
+            factors = np.asarray(
+                layer.downsample_factors[level],
+                dtype=float,
+            )
+        except Exception:  # noqa: BLE001 # pragma: no cover - no slice yet
+            return None
+        steps: dict[int, int] = {}
+        for d in range(ndim):
+            if d in displayed:
+                continue
+            point = data_slice.point[d]
+            if not np.isfinite(point):
+                return None
+            for margin in (
+                data_slice.margin_left[d],
+                data_slice.margin_right[d],
+            ):
+                if np.isfinite(margin) and margin:
+                    # thick-slice projection: the rendered plane is a
+                    # reduction over a slab, not a copyable plane
+                    return None
+            steps[d] = int(np.round(float(point) / factors[d]))
+        return displayed, steps
+
     def _patch_texture_batch(
         self,
         vdata: VirtualData,
@@ -1983,12 +2033,13 @@ class ProgressiveLoader:
         """
         if not batch:
             return True
-        ndim = self._viewer.dims.ndisplay
-        if ndim not in (2, 3) or vdata.ndim != ndim:
+        ndisplay = self._viewer.dims.ndisplay
+        if ndisplay not in (2, 3) or vdata.ndim < ndisplay:
             return False
         if block is not None:
             low, high, data = block
             return self._patch_texture_region(vdata, low, high, block=data)
+        ndim = vdata.ndim
         low = [min(int(key[d].start) for key in batch) for d in range(ndim)]
         high = [max(int(key[d].stop) for key in batch) for d in range(ndim)]
         return self._patch_texture_region(vdata, low, high)
@@ -2004,20 +2055,33 @@ class ProgressiveLoader:
 
         A partial texture upload (glTexSubImage2D/3D) is orders of
         magnitude cheaper than the re-slice plus whole-texture upload of
-        a pipeline refresh. Only used when the texture demonstrably
-        matches the current interval; any mismatch falls back to a
-        normal refresh.
+        a pipeline refresh. Works for data of any dimensionality: the
+        texture holds the displayed dims' corner-pixels crop at the
+        current step of every other dim. Only used when the texture
+        demonstrably matches the current interval; any mismatch falls
+        back to a normal refresh.
         """
-        ndim = self._viewer.dims.ndisplay
-        if ndim not in (2, 3) or vdata.ndim != ndim:
+        ndisplay = self._viewer.dims.ndisplay
+        ndim = vdata.ndim
+        if (
+            ndisplay not in (2, 3)
+            or ndim < ndisplay
+            or len(low) != ndim
+            or vdata.interval is None
+        ):
             return False
-        displayed = list(self._layer._slice_input.displayed)
-        if displayed != sorted(displayed):
-            # transposed display order: let the slicing pipeline handle it
+        plane = self._displayed_plane(int(self._layer.data_level))
+        if plane is None:
             return False
-        if vdata.interval is None:
+        displayed, steps = plane
+        if len(displayed) != ndisplay:
             return False
-        node = self._get_display_node(ndim)
+        # regions that miss the displayed plane have nothing to upload —
+        # the hyperslice already holds them for other steps
+        for d, step in steps.items():
+            if not int(low[d]) <= step < int(high[d]):
+                return True
+        node = self._get_display_node(ndisplay)
         if node is None:
             return False
         try:
@@ -2027,54 +2091,52 @@ class ProgressiveLoader:
             # old tile's shape while staged patches target the new one,
             # so validate against the pair's staging shape
             tex_shape = (
-                dbuf.shape if dbuf is not None else tuple(texture.shape[:ndim])
+                dbuf.shape
+                if dbuf is not None
+                else tuple(texture.shape[:ndisplay])
             )
         except (AttributeError, TypeError):  # pragma: no cover
             return False
         # The texture holds the corner-pixels crop of the level (the
         # rendered tile), which sits inside the chunk-aligned interval.
         corners = self._layer.corner_pixels
-        box_min = [int(corners[0, d]) for d in range(ndim)]
-        box_max = [int(corners[1, d]) + 1 for d in range(ndim)]
-        if tex_shape != tuple(
-            mx - mn for mn, mx in zip(box_min, box_max, strict=True)
-        ):
+        box_min = {d: int(corners[0, d]) for d in displayed}
+        box_max = {d: int(corners[1, d]) + 1 for d in displayed}
+        if tex_shape != tuple(box_max[d] - box_min[d] for d in displayed):
             # texture not (yet) synced to the current tile
             return False
-        region_low = list(low)
-        low = [max(int(lo), mn) for lo, mn in zip(low, box_min, strict=True)]
-        high = [min(int(h), mx) for h, mx in zip(high, box_max, strict=True)]
-        if any(h <= lo for lo, h in zip(low, high, strict=True)):
+        region_low = [int(v) for v in low]
+        lo = {d: max(int(low[d]), box_min[d]) for d in displayed}
+        hi = {d: min(int(high[d]), box_max[d]) for d in displayed}
+        if any(hi[d] <= lo[d] for d in displayed):
             return False
-        offset = tuple(lo - mn for lo, mn in zip(low, box_min, strict=True))
+        offset = tuple(lo[d] - box_min[d] for d in displayed)
         try:
             if block is not None:
-                # precomputed contiguous copy from the fetch worker: the
-                # main thread does no pixel copying at all
-                sub = block
-                expected = tuple(
-                    h - lo for lo, h in zip(low, high, strict=True)
+                # precomputed contiguous copy from the fetch worker:
+                # index the displayed sub-box (and the plane of every
+                # other dim) out of it
+                inner = tuple(
+                    steps[d] - region_low[d]
+                    if d in steps
+                    else slice(lo[d] - region_low[d], hi[d] - region_low[d])
+                    for d in range(ndim)
                 )
-                if (
-                    tuple(low) != tuple(region_low)
-                    or tuple(block.shape) != expected
-                ):
-                    inner = tuple(
-                        slice(lo - rlo, h - rlo)
-                        for lo, h, rlo in zip(
-                            low,
-                            high,
-                            region_low,
-                            strict=True,
-                        )
-                    )
-                    sub = np.ascontiguousarray(block[inner])
+                sub = block[inner]
+                if tuple(sub.shape) != tuple(hi[d] - lo[d] for d in displayed):
+                    return False
+                sub = np.ascontiguousarray(sub)
             else:
                 # region in absolute coords -> hyperslice coords
                 translate = vdata.translate
                 source = tuple(
-                    slice(lo - tr, h - tr)
-                    for lo, h, tr in zip(low, high, translate, strict=True)
+                    steps[d] - int(translate[d])
+                    if d in steps
+                    else slice(
+                        lo[d] - int(translate[d]),
+                        hi[d] - int(translate[d]),
+                    )
+                    for d in range(ndim)
                 )
                 with vdata.lock:
                     sub = np.ascontiguousarray(vdata.hyperslice[source])

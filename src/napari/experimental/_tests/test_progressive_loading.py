@@ -865,6 +865,46 @@ def test_texture_patching_used_in_2d(
     )
 
 
+def test_texture_patching_used_for_nd_data_in_2d(
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+):
+    """2D slices of higher-dimensional data (e.g. z-stacks, timelapses)
+    patch the texture too: chunks intersecting the displayed plane
+    upload the plane's sub-box; others are absorbed without a refresh.
+    """
+    viewer = make_napari_viewer(show=True)
+    layer = add_progressive_loading_image(
+        multiscale_3d_arrays,
+        viewer=viewer,
+        max_bytes_per_second=200_000,
+    )
+    loader = layer.metadata['progressive_loader']
+    assert viewer.dims.ndisplay == 2
+    _wait_for_idle_loader(qtbot, loader)
+
+    layer.locked_data_level = 0
+
+    def patched():
+        viewer.screenshot(canvas_only=True, flash=False)
+        return loader._texture_patches > 0
+
+    qtbot.waitUntil(patched, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+    # the pass only fetches the current z slab (the interval restricts
+    # non-displayed dims); the rendered plane must match the source
+    z = int(
+        np.round(
+            layer._data_slice.point[0] / layer.downsample_factors[0][0],
+        ),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(loader._data[0][z, 0:64, 0:64]),
+        np.asarray(multiscale_3d_arrays[0][z]),
+    )
+
+
 def test_progress_updates_deferred(
     qtbot,
     make_napari_viewer,
