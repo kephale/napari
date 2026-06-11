@@ -848,6 +848,15 @@ def test_texture_patching_used_in_2d(
 
     qtbot.waitUntil(patched, timeout=10000)
     _wait_for_idle_loader(qtbot, loader)
+    # the 2D double buffer engaged: patches staged into the back
+    # texture, the shader samples the front, the pair is distinct
+    from napari.experimental._texture_swap import DoubleBufferedImageTexture
+
+    assert isinstance(loader._dbuf, DoubleBufferedImageTexture)
+    node = loader._get_display_node(2)
+    assert loader._dbuf.matches(node)
+    assert node._texture is loader._dbuf._front
+    assert loader._dbuf._front is not loader._dbuf._back
     # patched texture content still matches the source at the end (the
     # final reconcile re-slices through the normal pipeline)
     np.testing.assert_array_equal(

@@ -49,7 +49,10 @@ from superqt import ensure_main_thread
 
 # imported at module load: a lazy first-use import inside a fetch pass
 # costs seconds of main-thread time under fetch-thread GIL pressure
-from napari.experimental._texture_swap import DoubleBufferedVolumeTexture
+from napari.experimental._texture_swap import (
+    DoubleBufferedImageTexture,
+    DoubleBufferedVolumeTexture,
+)
 from napari.experimental._virtual_data import (
     MultiScaleVirtualData,
     VirtualData,
@@ -1196,7 +1199,7 @@ class ProgressiveLoader:
         if self._closed:
             return
         if self._dbuf is not None:
-            node = self._get_volume_node()
+            node = self._get_display_node()
             if (
                 node is not None
                 and self._dbuf.matches(node)
@@ -1428,8 +1431,8 @@ class ProgressiveLoader:
         # below, so the pass's first full-tile upload (and any tile
         # reallocation) is staged off the rendered path instead of
         # re-specifying the bound texture in place.
-        if self._double_buffer and self._viewer.dims.ndisplay == 3:
-            node = self._get_volume_node()
+        if self._double_buffer:
+            node = self._get_display_node()
             if (
                 node is not None
                 and getattr(node, '_texture', None) is not None
@@ -1733,11 +1736,7 @@ class ProgressiveLoader:
             return False
         try:
             texture = node._texture
-            dbuf = (
-                self._ensure_dbuf(node)
-                if self._double_buffer and ndim == 3
-                else None
-            )
+            dbuf = self._ensure_dbuf(node) if self._double_buffer else None
             # during a pending reshape the bound texture still has the
             # old tile's shape while staged patches target the new one,
             # so validate against the pair's staging shape
@@ -1806,20 +1805,27 @@ class ProgressiveLoader:
 
     def _ensure_dbuf(self, node):
         """(Re)build the double-buffered texture pair for ``node``."""
+        dbuf_cls = (
+            DoubleBufferedVolumeTexture
+            if self._viewer.dims.ndisplay == 3
+            else DoubleBufferedImageTexture
+        )
         dbuf = self._dbuf
-        if dbuf is not None and dbuf.matches(node):
+        if dbuf is not None and type(dbuf) is dbuf_cls and dbuf.matches(node):
             return dbuf
         pool = []
         if dbuf is not None:
             # carry the retired-texture pool across rebuilds (same GL
             # context): pooled textures stay reusable and rebuilds do
-            # not pay delete + reallocate GPU syncs
-            pool, dbuf._pool = dbuf._pool, []
+            # not pay delete + reallocate GPU syncs. Only between same
+            # texture classes — a 2D/3D switch closes the pool instead.
+            if type(dbuf) is dbuf_cls:
+                pool, dbuf._pool = dbuf._pool, []
             with contextlib.suppress(Exception):
                 dbuf.close()
             self._dbuf = None
         try:
-            dbuf = DoubleBufferedVolumeTexture(node, pool=pool)
+            dbuf = dbuf_cls(node, pool=pool)
             dbuf.attach_set_data()
         except Exception:  # noqa: BLE001 - unexpected texture class
             LOGGER.warning(

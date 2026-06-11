@@ -24,6 +24,11 @@ class FakeParser:
         self._objects[id_] = tex
         return tex
 
+    def add_texture2d(self, id_):
+        tex = glir.GlirTexture2D.__new__(glir.GlirTexture2D)
+        self._objects[id_] = tex
+        return tex
+
     def _parse(self, command):
         self.executed.append(command)
 
@@ -173,6 +178,32 @@ def test_unknown_object_data_unmetered(parser):
     leftover = gm._metered_parse(parser, [('DATA', 99, 0, big)], state)
     assert leftover == []
     assert parser.executed == [('DATA', 99, 0, big)]
+
+
+def test_large_2d_texture_metered(parser):
+    parser.add_texture2d(1)
+    # 4 MiB image upload, 256 KiB slabs, 1 MiB budget: 4 slabs run,
+    # the rest carries to the next frame
+    data = np.zeros((1024, 4096), dtype=np.uint8)
+    state = make_state(budget=2**20, slab=256 * 2**10)
+    leftover = gm._metered_parse(parser, [('DATA', 1, (0, 0), data)], state)
+    assert data_bytes(parser.executed) == 2**20
+    assert data_bytes(leftover) == data.nbytes - 2**20
+    # offsets advance along rows
+    assert [c[2][0] for c in parser.executed] == [64 * i for i in range(4)]
+
+
+def test_small_2d_texture_not_metered(parser):
+    # colormap-LUT-sized uploads must run synchronously even with an
+    # exhausted budget: a deferred LUT leaves the shader sampling an
+    # unwritten texture
+    parser.add_texture2d(1)
+    state = make_state(budget=2**20, slab=256 * 2**10)
+    state.budget_left = 0
+    lut = np.zeros((256, 4), dtype=np.float32)  # 4 KiB
+    leftover = gm._metered_parse(parser, [('DATA', 1, (0, 0), lut)], state)
+    assert leftover == []
+    assert parser.executed == [('DATA', 1, (0, 0), lut)]
 
 
 def test_install_uninstall_idempotent(monkeypatch):

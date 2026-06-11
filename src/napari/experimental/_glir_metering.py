@@ -28,6 +28,8 @@ napari is unaffected. Tunables (env vars override arguments):
 - ``NAPARI_GLIR_METERING=0`` disables installation entirely.
 - ``NAPARI_GLIR_TEX_BYTES_PER_FRAME`` per-frame upload budget (bytes).
 - ``NAPARI_GLIR_TEX_SLAB_BYTES`` maximum size of a single sub-upload.
+- ``NAPARI_GLIR_TEX2D_MIN_BYTES`` size floor above which 2D texture
+  uploads are metered too (0 disables 2D metering).
 
 Run ``python -m napari.experimental._glir_metering`` for a standalone
 vispy-only benchmark of draw time vs. texture upload size (no napari),
@@ -49,6 +51,14 @@ _FACTORY_FRAME_BUDGET_BYTES = 4 * 2**20
 _FACTORY_SLAB_BYTES = 1 * 2**20
 DEFAULT_FRAME_BUDGET_BYTES = _FACTORY_FRAME_BUDGET_BYTES
 DEFAULT_SLAB_BYTES = _FACTORY_SLAB_BYTES
+#: 2D texture DATA at or above this size is metered like 3D uploads.
+#: Small 2D textures (colormap LUTs, interpolation kernels) MUST stay
+#: synchronous: deferring them leaves a shader sampling an unwritten
+#: texture for however long the carry takes to drain. 0 disables 2D
+#: metering entirely.
+TEX2D_MIN_METERED_BYTES = int(
+    os.environ.get('NAPARI_GLIR_TEX2D_MIN_BYTES', 256 * 1024),
+)
 
 # Commands that operate on a specific GLIR object id and therefore must
 # stay ordered behind any deferred command for the same id.
@@ -199,15 +209,25 @@ def _state_for(parser) -> _ParserState:
     return state
 
 
-def _is_metered_texture(ob) -> bool:
+def _is_metered_texture(ob, data=None) -> bool:
     """Whether uploads to this GLIR object count against the budget.
 
-    Only 3D textures are metered: they are the pathological path on
-    macOS, and 2D texture uploads have profiled fine.
+    All 3D textures are metered (the pathological path on macOS). 2D
+    textures are metered only for payloads of at least
+    ``TEX2D_MIN_METERED_BYTES`` — image tiles, not colormap LUTs or
+    interpolation kernels, which must upload synchronously so shaders
+    never sample an unwritten texture.
     """
     from vispy.gloo import glir
 
-    return isinstance(ob, glir.GlirTexture3D)
+    if isinstance(ob, glir.GlirTexture3D):
+        return True
+    return (
+        TEX2D_MIN_METERED_BYTES > 0
+        and isinstance(ob, glir.GlirTexture2D)
+        and data is not None
+        and getattr(data, 'nbytes', 0) >= TEX2D_MIN_METERED_BYTES
+    )
 
 
 def _split_slabs(offset, data, slab_bytes):
@@ -300,7 +320,7 @@ def _metered_parse(parser, commands, state, force_defer=False):
             continue
         if cmd == 'DATA':
             ob = parser._objects.get(id_, None)
-            if _is_metered_texture(ob):
+            if _is_metered_texture(ob, command[3]):
                 offset, data = command[2], command[3]
                 executed_any = False
                 for sub_offset, sub in _split_slabs(

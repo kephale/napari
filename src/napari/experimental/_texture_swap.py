@@ -1,4 +1,4 @@
-"""Double-buffered 3D texture streaming for vispy Volume nodes.
+"""Double-buffered texture streaming for vispy Volume and Image nodes.
 
 Writing into a texture that the GPU is concurrently sampling is the
 pathological path on macOS GL-over-Metal (and many other drivers): the
@@ -426,6 +426,323 @@ class DoubleBufferedVolumeTexture:
 
         The node keeps rendering whatever is currently front.
         """
+        self.detach_set_data()
+        self._log = []
+        if self._back is not self._front:
+            with contextlib.suppress(Exception):  # pragma: no cover
+                self._back.delete()
+        for _key, tex in self._pool:
+            with contextlib.suppress(Exception):  # pragma: no cover
+                tex.delete()
+        self._pool = []
+
+
+class DoubleBufferedImageTexture:
+    """Manage front/back 2D textures for a vispy ``ImageVisual``.
+
+    Same rationale as :class:`DoubleBufferedVolumeTexture`: chunk
+    patches and full rewrites go to an unbound *back* texture and
+    :meth:`present` swaps the sampler binding, so the texture the GPU is
+    sampling is never written. One structural difference: a shape
+    change (level/tile switch) binds its freshly filled texture
+    *immediately* instead of waiting for uploads to drain — napari
+    updates the node transform synchronously with ``set_data``, so
+    keeping the old-shape front on screen would render the previous
+    tile under the new tile's transform (misplaced content). 2D tiles
+    are small enough that the staged-then-bound upload is the cheap
+    part; what matters is that it never re-specifies a bound texture.
+
+    Parameters
+    ----------
+    node : vispy.visuals.ImageVisual
+        The image node to manage. Its current texture becomes the
+        front texture; a sibling back texture of the same class,
+        format and interpolation is created for staging.
+    """
+
+    def __init__(self, node, pool: list | None = None):
+        self._node = node
+        self._front = node._texture
+        self._shape = tuple(self._front.shape[:2])
+        self._pool: list[tuple] = pool if pool is not None else []
+        env_pool = os.environ.get('NAPARI_PROGRESSIVE_TEXTURE_POOL')
+        self._pool_max = (
+            int(env_pool) if env_pool else DEFAULT_TEXTURE_POOL_SIZE
+        )
+        self._back = self._acquire(
+            self._shape,
+            getattr(self._front, '_data_dtype', None) or np.float32,
+            lambda: self._make_sibling(node, self._front),
+        )
+        self._log: list[tuple] = []
+        self._applied = {id(self._front): 0, id(self._back): 0}
+        self._wrapped_set_data = None
+        self._suppress_full = False
+
+    # -- construction helpers --
+
+    @staticmethod
+    def _make_sibling(node, front):
+        """Create a back texture matching the front's class and format."""
+        from vispy.visuals._scalable_textures import GPUScaledTextureMixin
+
+        if isinstance(front, GPUScaledTextureMixin):
+            texture_format = front.internalformat
+        else:  # pragma: no cover - napari uses GPU-scaled textures
+            texture_format = None
+        dtype = getattr(front, '_data_dtype', None) or np.float32
+        rep = np.zeros((1, 1), dtype=dtype)
+        back = node._init_texture(rep, texture_format)
+        back.resize(
+            tuple(front.shape),
+            internalformat=getattr(front, 'internalformat', None),
+        )
+        back._data_dtype = dtype
+        if front.clim is not None:
+            back.set_clim(front.clim)
+        if back.interpolation != front.interpolation:
+            back.interpolation = front.interpolation
+        return back
+
+    def _make_texture_like(self, node, data):
+        """Create a texture formatted for ``data`` (new shape/dtype)."""
+        from vispy.visuals._scalable_textures import GPUScaledTextureMixin
+
+        front = self._front
+        if isinstance(front, GPUScaledTextureMixin):
+            texture_format = front.internalformat
+        else:  # pragma: no cover - napari uses GPU-scaled textures
+            texture_format = None
+        rep = np.zeros((1, 1), dtype=data.dtype)
+        tex = node._init_texture(rep, texture_format)
+        tex.resize(tuple(data.shape[:2]))
+        tex._data_dtype = data.dtype
+        return self._sync_aux_state(tex)
+
+    def _sync_aux_state(self, tex):
+        front = self._front
+        if front.clim is not None:
+            with contextlib.suppress(Exception):
+                tex.set_clim(front.clim)
+        if tex.interpolation != front.interpolation:
+            tex.interpolation = front.interpolation
+        return tex
+
+    # -- retired-texture pool (2-tuple keys: never collide with 3D) --
+
+    @staticmethod
+    def _pool_key(shape, dtype) -> tuple:
+        return (tuple(shape)[:2], np.dtype(dtype).str)
+
+    def _acquire(self, shape, dtype, create):
+        key = self._pool_key(shape, dtype)
+        for i in range(len(self._pool) - 1, -1, -1):
+            if self._pool[i][0] == key:
+                _, tex = self._pool.pop(i)
+                return self._sync_aux_state(tex)
+        return create()
+
+    def _release(self, texture) -> None:
+        dtype = getattr(texture, '_data_dtype', None)
+        if self._pool_max <= 0 or dtype is None:
+            with contextlib.suppress(Exception):
+                texture.delete()
+            return
+        key = self._pool_key(texture.shape, dtype)
+        self._pool.append((key, texture))
+        while len(self._pool) > self._pool_max:
+            _, old = self._pool.pop(0)
+            with contextlib.suppress(Exception):
+                old.delete()
+
+    @property
+    def shape(self) -> tuple:
+        """The (rows, cols) shape staged content must have."""
+        return self._shape
+
+    def matches(self, node) -> bool:
+        """Whether this buffer still belongs to ``node``'s texture pair."""
+        return (
+            self._node is node
+            and node._texture in (self._front, self._back)
+            and tuple(node._texture.shape[:2]) == self._shape
+        )
+
+    # -- staging --
+
+    def stage(self, offset, data) -> None:
+        """Stage a sub-region update; uploaded to the back texture now."""
+        self._log.append((tuple(offset), data))
+        self._catch_up(self._back)
+
+    def stage_full(self, data) -> None:
+        """Stage a full-image rewrite (e.g. a pass-boundary backdrop)."""
+        self._log = [(None, data)]
+        for key in self._applied:
+            self._applied[key] = 0
+        self._catch_up(self._back)
+
+    def _catch_up(self, texture) -> None:
+        key = id(texture)
+        start = self._applied[key]
+        for offset, data in self._log[start:]:
+            if offset is None:
+                texture.check_data_format(data)
+                texture.scale_and_set_data(data)
+            else:
+                texture.set_data(data, offset=offset)
+        self._applied[key] = len(self._log)
+
+    # -- presentation --
+
+    @property
+    def dirty(self) -> bool:
+        """Whether the front texture is behind the staged content."""
+        return self._applied[id(self._front)] < len(self._log)
+
+    def present(self) -> bool:
+        """Swap the freshly written back texture into the shader."""
+        if not self.dirty:
+            return False
+        front, back = self._front, self._back
+        if front.clim is not None and back.clim != front.clim:
+            back.set_clim(front.clim)
+        if back.interpolation != front.interpolation:
+            back.interpolation = front.interpolation
+        self._catch_up(back)
+        self._bind(back)
+        self._front, self._back = back, front
+        self._catch_up(front)
+        self._trim_log()
+        return True
+
+    def _bind(self, texture) -> None:
+        """Point the shader at ``texture`` (one sampler rebind)."""
+        node = self._node
+        if node._data_lookup_fn is not None:
+            node._data_lookup_fn['texture'] = texture
+        # keep the clim uniform consistent with the bound texture (the
+        # color transform reads it at build time, not per draw); absent
+        # until the first _build_color_transform — then the build reads
+        # node._texture itself
+        with contextlib.suppress(Exception):
+            node.shared_program.frag['color_transform'][1]['clim'] = (
+                texture.clim_normalized
+            )
+        node._texture = texture
+
+    def _trim_log(self) -> None:
+        applied_min = min(self._applied.values())
+        if applied_min:
+            self._log = self._log[applied_min:]
+            for key in self._applied:
+                self._applied[key] -= applied_min
+
+    # -- full-refresh interception --
+
+    def attach_set_data(self) -> None:
+        """Route ``node.set_data`` calls through the staging textures.
+
+        Same-shape rewrites are staged into the back texture and
+        swapped in; shape changes (level/tile switches) fill a freshly
+        allocated (or pooled) texture off the rendered path and bind it
+        immediately. Non-array or multichannel payloads, and dtype or
+        format changes, fall back to the original path.
+        """
+        if self._wrapped_set_data is not None:
+            return
+        node = self._node
+        original = node.set_data
+
+        def set_data_staged(image, copy=False):
+            data = np.asarray(image)
+            if data.ndim != 2 or node._texture not in (
+                self._front,
+                self._back,
+            ):
+                # multichannel or externally rebound texture: fall
+                # back; the loader rebuilds this buffer on its next
+                # patch
+                self._suppress_full = False
+                self.detach_set_data()
+                return original(image, copy=copy)
+            same_shape = tuple(data.shape[:2]) == self._shape
+            if same_shape and self._suppress_full:
+                # caller asserts the GPU pair already matches the data
+                # (every chunk was patched): skip the redundant
+                # full-tile upload entirely
+                self._suppress_full = False
+                node._data = data
+                return None
+            self._suppress_full = False
+            try:
+                if same_shape:
+                    self.stage_full(data)
+                    self.present()
+                else:
+                    self._reshape_now(data)
+            except Exception:  # noqa: BLE001 - dtype/format change
+                self.detach_set_data()
+                return original(image, copy=copy)
+            node._data = data
+            # we uploaded the content ourselves; vispy must not re-run
+            # scale_and_set_data on the (now bound) front at next draw
+            node._need_texture_upload = False
+            return None
+
+        node.set_data = set_data_staged
+        self._wrapped_set_data = original
+
+    def _reshape_now(self, data) -> None:
+        """Fill a new-shape texture off the rendered path and bind it."""
+        node = self._node
+        new_front = self._acquire(
+            data.shape[:2],
+            data.dtype,
+            lambda: self._make_texture_like(node, data),
+        )
+        new_front.check_data_format(data)
+        new_front.scale_and_set_data(data)
+        old_front, old_back = self._front, self._back
+        self._bind(new_front)
+        self._front = new_front
+        self._shape = tuple(data.shape[:2])
+        if old_back is not old_front:
+            self._release(old_back)
+        self._release(old_front)
+        self._back = self._acquire(
+            self._shape,
+            getattr(new_front, '_data_dtype', None) or data.dtype,
+            lambda: self._make_sibling(node, new_front),
+        )
+        self._log = []
+        self._applied = {id(new_front): 0, id(self._back): 0}
+        # geometry follows the data shape
+        node._need_vertex_update = True
+        with contextlib.suppress(Exception):
+            node.shared_program['image_size'] = data.shape[:2][::-1]
+        if node._data_lookup_fn is not None:
+            with contextlib.suppress(Exception):
+                # kernel-based (e.g. cubic) lookups carry the texture
+                # shape as a shader parameter
+                if 'shape' in node._data_lookup_fn:
+                    node._data_lookup_fn['shape'] = data.shape[:2][::-1]
+
+    def suppress_next_full_upload(self) -> None:
+        """Skip the next same-shape full rewrite through ``set_data``.
+
+        One-shot; cleared by the next ``set_data`` whether suppressed
+        or not.
+        """
+        self._suppress_full = True
+
+    def detach_set_data(self) -> None:
+        if self._wrapped_set_data is not None:
+            self._node.set_data = self._wrapped_set_data
+            self._wrapped_set_data = None
+
+    def close(self) -> None:
+        """Restore the node and release the spare texture."""
         self.detach_set_data()
         self._log = []
         if self._back is not self._front:
