@@ -79,7 +79,11 @@ DEFAULT_MAX_CHUNKS_PER_PASS = 384
 #: Maximum size of a 3D sub-volume tile, in bytes. Full-tile GPU uploads
 #: (pass start/end) block the GUI for roughly size / 125 MB/s on slow GL
 #: drivers, so this is deliberately much smaller than the memory budget.
-DEFAULT_TILE_MAX_BYTES_3D = 32 * 1024**2
+#: Swept on macOS GL-over-Metal: 16e6 (251^3 tiles) vs 33e6 (322^3) gave
+#: 2.8x cheaper raycast draws (21.9 vs 61.5 ms/DRAW) and ~400ms vs
+#: ~700ms typical interaction stalls, at the cost of a wider tile-shape
+#: vocabulary (covered by the texture pool).
+DEFAULT_TILE_MAX_BYTES_3D = int(16e6)
 
 
 # ---------- chunk geometry ----------

@@ -39,8 +39,11 @@ LOGGER = logging.getLogger('napari.experimental._texture_swap')
 #: DELETE on busy macOS GL-over-Metal), and reallocation costs another
 #: sync — so zooming back and forth across two levels would otherwise
 #: pay 4 syncs per switch. Bounded GPU memory cost: at most this many
-#: spare tiles. NAPARI_PROGRESSIVE_TEXTURE_POOL overrides (0 disables).
-DEFAULT_TEXTURE_POOL_SIZE = 4
+#: spare tiles. Sized for the 16 MB default tile cap, whose quantized
+#: shape vocabulary spans ~5 sizes (96..251^3) — up to 4 retired
+#: front/back pairs alive at once, <= ~60 MB of spares.
+#: NAPARI_PROGRESSIVE_TEXTURE_POOL overrides (0 disables).
+DEFAULT_TEXTURE_POOL_SIZE = 8
 
 
 class DoubleBufferedVolumeTexture:
