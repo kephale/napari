@@ -670,15 +670,17 @@ class ProgressiveLoader:
                 n_cpus = os.cpu_count() or 3
             fetch_workers = min(4, n_cpus - 2)
         self._fetch_workers = max(int(fetch_workers), 1)
-        # Congestion brake: when a chunk batch waited longer than this
-        # in the event queue (main thread starved by draws/uploads/GIL),
-        # fetching pauses for a beat so input events get through.
-        # NAPARI_PROGRESSIVE_CONGESTION_MS overrides; 0 disables.
+        # Congestion brake (EXPERIMENTAL, off by default): when a chunk
+        # batch waited longer than this in the event queue (main thread
+        # starved by draws/uploads/GIL), fetching pauses for a beat so
+        # input events get through. NAPARI_PROGRESSIVE_CONGESTION_MS
+        # enables (e.g. 200). macOS profiling showed the pause/resume
+        # cycle can defer work that then flushes in bursts — worse
+        # spikes than steady streaming — so it must be opted into for
+        # interactive-feel experiments.
         env_congestion = os.environ.get('NAPARI_PROGRESSIVE_CONGESTION_MS')
         self._congestion_threshold_s = (
-            float(env_congestion) / 1000.0
-            if env_congestion is not None
-            else 0.2
+            float(env_congestion) / 1000.0 if env_congestion else 0.0
         )
         self._congestion_hold_s = max(0.25, 1.5 * self._congestion_threshold_s)
         env_bps = os.environ.get('NAPARI_PROGRESSIVE_MAX_BPS')

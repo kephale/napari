@@ -924,6 +924,11 @@ def test_congestion_brake_pauses_and_resumes(
 
     loader._limiter = _FetchRateLimiter(None)
     assert loader._limiter._go.is_set()
+    # off by default; the brake is opt-in
+    assert loader._congestion_threshold_s == 0.0
+    loader._congestion_brake(_time.monotonic() - 1.0)
+    assert loader._limiter._go.is_set()
+    loader._congestion_threshold_s = 0.2
     loader._congestion_brake(
         _time.monotonic() - loader._congestion_threshold_s - 1.0,
     )
