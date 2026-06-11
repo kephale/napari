@@ -782,6 +782,13 @@ class ProgressiveLoader:
         )
         layer._max_tile_extent_3d = self._tile_extent_3d
 
+        # 2D render margin: slice a region larger than the viewport so
+        # pans and zoom-outs stay inside rendered content instead of
+        # exposing void until the next re-slice + backdrop. 2.0 covers
+        # zoom-out exactly to the level switch of a factor-2 pyramid.
+        env_margin = os.environ.get('NAPARI_PROGRESSIVE_MARGIN_2D')
+        layer._render_margin_2d = float(env_margin) if env_margin else 2.0
+
         self._check()
 
     # -- lifecycle --
@@ -1356,8 +1363,84 @@ class ProgressiveLoader:
             return
         if self._data[level].covers(min_coord, max_coord):
             return
+        if self._sync_backdrop_2d(level, min_coord, max_coord):
+            return
         self._backdrop_pending = True
         QTimer.singleShot(0, self._prepare_backdrop)
+
+    def _sync_backdrop_2d(self, level, min_coord, max_coord) -> bool:
+        """Backdrop a just-sliced empty 2D level before it can paint.
+
+        A level switch slices the new level's VirtualData before any
+        pass has prepared its interval, so the node receives zeros; the
+        deferred ``_prepare_backdrop`` refresh races the paint event and
+        sometimes loses — a visible black flash between scales. Here,
+        still inside the ``set_data`` emission (so before any paint),
+        the interval is filled from a coarser level (a memory copy —
+        cheap for a 2D view region) and the texture is patched directly,
+        skipping the slicing pipeline, which must not re-enter. Returns
+        False (caller falls back to the deferred path) when the GPU
+        patch cannot be validated, e.g. in 3D where this path is not
+        used.
+        """
+        if self._viewer.dims.ndisplay != 2:
+            return False
+        vdata = self._data[level]
+        if vdata.ndim != 2:
+            return False
+        try:
+            self._data.set_interval(
+                level,
+                min_coord,
+                max_coord,
+                backdrop_level=self._backdrop_level(
+                    level,
+                    min_coord,
+                    max_coord,
+                ),
+            )
+        except Exception:  # noqa: BLE001 # pragma: no cover - degenerate
+            return False
+        patched = self._patch_texture_region(
+            vdata,
+            [int(c) for c in min_coord],
+            [int(c) for c in max_coord],
+        )
+        if not patched:
+            # validation failed (e.g. cold start: the node's texture
+            # re-spec is still deferred to its first draw, so shapes
+            # don't match) — push the backdrop crop through set_data,
+            # which handles the re-spec itself
+            patched = self._set_node_data_from_hyperslice(vdata)
+        if patched:
+            # writes staged into the back texture; swap it in now so
+            # the very next paint shows the backdrop, not the zeros
+            self._update_node()
+        return patched
+
+    def _set_node_data_from_hyperslice(self, vdata: VirtualData) -> bool:
+        """Replace the node's data with the current corner-pixels crop."""
+        node = self._get_display_node(2)
+        if node is None:
+            return False
+        corners = self._layer.corner_pixels
+        translate = vdata.translate
+        src = tuple(
+            slice(
+                int(corners[0, d]) - int(translate[d]),
+                int(corners[1, d]) + 1 - int(translate[d]),
+            )
+            for d in range(2)
+        )
+        try:
+            with vdata.lock:
+                crop = np.ascontiguousarray(vdata.hyperslice[src])
+            if crop.ndim != 2 or 0 in crop.shape:
+                return False
+            node.set_data(crop)
+        except Exception:  # noqa: BLE001 # pragma: no cover - GL mismatch
+            return False
+        return True
 
     def _prepare_backdrop(self) -> None:
         self._backdrop_pending = False

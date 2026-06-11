@@ -478,6 +478,19 @@ class DoubleBufferedImageTexture:
         self._applied = {id(self._front): 0, id(self._back): 0}
         self._wrapped_set_data = None
         self._suppress_full = False
+        # exempt the pair from upload metering: every write here targets
+        # an unbound texture and becomes visible only through an atomic
+        # swap — a deferred (carried) upload would present a partially
+        # written texture as a black flash. The pair is stable (reshape
+        # resizes in place), so the ids never change.
+        self._exempt_ids = set()
+        from napari.experimental import _glir_metering
+
+        for tex in (self._front, self._back):
+            glir_id = getattr(tex, 'id', None)
+            if glir_id is not None:
+                _glir_metering.add_unmetered_texture(glir_id)
+                self._exempt_ids.add(glir_id)
 
     # -- construction helpers --
 
@@ -503,21 +516,6 @@ class DoubleBufferedImageTexture:
         if back.interpolation != front.interpolation:
             back.interpolation = front.interpolation
         return back
-
-    def _make_texture_like(self, node, data):
-        """Create a texture formatted for ``data`` (new shape/dtype)."""
-        from vispy.visuals._scalable_textures import GPUScaledTextureMixin
-
-        front = self._front
-        if isinstance(front, GPUScaledTextureMixin):
-            texture_format = front.internalformat
-        else:  # pragma: no cover - napari uses GPU-scaled textures
-            texture_format = None
-        rep = np.zeros((1, 1), dtype=data.dtype)
-        tex = node._init_texture(rep, texture_format)
-        tex.resize(tuple(data.shape[:2]))
-        tex._data_dtype = data.dtype
-        return self._sync_aux_state(tex)
 
     def _sync_aux_state(self, tex):
         front = self._front
@@ -644,8 +642,8 @@ class DoubleBufferedImageTexture:
         """Route ``node.set_data`` calls through the staging textures.
 
         Same-shape rewrites are staged into the back texture and
-        swapped in; shape changes (level/tile switches) fill a freshly
-        allocated (or pooled) texture off the rendered path and bind it
+        swapped in; shape changes (level/tile switches) re-spec the
+        unbound back texture in place, fill it, and bind it
         immediately. Non-array or multichannel payloads, and dtype or
         format changes, fall back to the original path.
         """
@@ -694,29 +692,40 @@ class DoubleBufferedImageTexture:
         self._wrapped_set_data = original
 
     def _reshape_now(self, data) -> None:
-        """Fill a new-shape texture off the rendered path and bind it."""
+        """Re-spec the unbound back texture to the new shape and bind it.
+
+        2D tile shapes follow the corner-pixels crop, which varies
+        continuously with the camera — pooling by exact shape never
+        hits (the macOS profile showed ~2 creates + 2 deletes per
+        re-slice, and GL object deletion syncs the pipeline). Resizing
+        the existing pair instead is a SIZE re-spec on textures that
+        are unbound at the time, with no object churn at all.
+        """
         node = self._node
-        new_front = self._acquire(
-            data.shape[:2],
-            data.dtype,
-            lambda: self._make_texture_like(node, data),
-        )
-        new_front.check_data_format(data)
-        new_front.scale_and_set_data(data)
         old_front, old_back = self._front, self._back
-        self._bind(new_front)
-        self._front = new_front
-        self._shape = tuple(data.shape[:2])
-        if old_back is not old_front:
-            self._release(old_back)
-        self._release(old_front)
-        self._back = self._acquire(
-            self._shape,
-            getattr(new_front, '_data_dtype', None) or data.dtype,
-            lambda: self._make_sibling(node, new_front),
-        )
+        dtype = getattr(old_front, '_data_dtype', None)
+        if (
+            old_back is old_front
+            or dtype is None
+            or np.dtype(data.dtype) != np.dtype(dtype)
+        ):
+            # dtype/format change (or degenerate pair): a resized
+            # texture would no longer match the scaled format
+            raise ValueError('texture pair cannot absorb this reshape')
+        internalformat = getattr(old_back, 'internalformat', None)
+        new_shape = tuple(data.shape[:2])
+        # back is unbound: re-spec and fill it off the rendered path
+        old_back.resize(new_shape, internalformat=internalformat)
+        old_back.check_data_format(data)
+        old_back.scale_and_set_data(data)
+        self._bind(old_back)
+        self._front, self._back = old_back, old_front
+        self._shape = new_shape
+        # the old front is unbound now: re-spec it for future staging
+        # (allocation only, no pixel upload)
+        old_front.resize(new_shape, internalformat=internalformat)
         self._log = []
-        self._applied = {id(new_front): 0, id(self._back): 0}
+        self._applied = {id(self._front): 0, id(self._back): 0}
         # geometry follows the data shape
         node._need_vertex_update = True
         with contextlib.suppress(Exception):
@@ -743,6 +752,11 @@ class DoubleBufferedImageTexture:
 
     def close(self) -> None:
         """Restore the node and release the spare texture."""
+        from napari.experimental import _glir_metering
+
+        for glir_id in self._exempt_ids:
+            _glir_metering.discard_unmetered_texture(glir_id)
+        self._exempt_ids = set()
         self.detach_set_data()
         self._log = []
         if self._back is not self._front:

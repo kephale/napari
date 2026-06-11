@@ -559,6 +559,21 @@ class ScalarFieldBase(Layer, ABC):
                 shape_threshold,
                 self.downsample_factors[:, displayed_axes],
             )
+            margin = getattr(self, '_render_margin_2d', 1.0)
+            if margin > 1.0:
+                # Render a margin around the viewport so pans and
+                # zoom-outs stay inside already-sliced content instead
+                # of exposing unrendered void. A factor of 2 covers
+                # zoom-out exactly to the next level switch in a
+                # factor-2 pyramid. Set by progressive loading.
+                pad = (
+                    (scaled_corners[1] - scaled_corners[0])
+                    * (margin - 1.0)
+                    / 2.0
+                )
+                scaled_corners = np.stack(
+                    [scaled_corners[0] - pad, scaled_corners[1] + pad],
+                )
             corners = np.zeros((2, self.ndim), dtype=int)
             max_coords = np.take(self.data[level].shape, displayed_axes) - 1
             corners[:, displayed_axes] = np.clip(scaled_corners, 0, max_coords)

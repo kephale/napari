@@ -113,6 +113,23 @@ _hooked_canvases: weakref.WeakSet = weakref.WeakSet()
 # (interaction hold: see ProgressiveLoader._on_interaction)
 _upload_hold_until = 0.0
 
+# GLIR ids whose uploads are never metered. Double-buffered textures
+# register here: their writes always target an unbound texture and the
+# swap that makes them visible is atomic — deferring those uploads
+# would present a partially written texture (a black flash), the exact
+# artifact the buffering exists to prevent.
+_unmetered_ids: set = set()
+
+
+def add_unmetered_texture(glir_id) -> None:
+    """Exempt a texture's GLIR id from upload metering."""
+    _unmetered_ids.add(glir_id)
+
+
+def discard_unmetered_texture(glir_id) -> None:
+    """Remove a previously registered exemption (id may be absent)."""
+    _unmetered_ids.discard(glir_id)
+
 
 # weak callbacks invoked (on the GL/main thread) when a parser's upload
 # carry fully drains; used to restore interactive render LOD without a
@@ -320,7 +337,10 @@ def _metered_parse(parser, commands, state, force_defer=False):
             continue
         if cmd == 'DATA':
             ob = parser._objects.get(id_, None)
-            if _is_metered_texture(ob, command[3]):
+            if id_ not in _unmetered_ids and _is_metered_texture(
+                ob,
+                command[3],
+            ):
                 offset, data = command[2], command[3]
                 executed_any = False
                 for sub_offset, sub in _split_slabs(
