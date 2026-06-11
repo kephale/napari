@@ -905,6 +905,48 @@ def test_texture_patching_used_for_nd_data_in_2d(
     )
 
 
+@pytest.mark.parametrize('dtype', [np.float32, np.int16, np.uint16])
+def test_texture_patching_other_dtypes(
+    qtbot,
+    make_napari_viewer,
+    dtype,
+):
+    """Non-uint8 dtypes patch too. The double buffer must not be
+    permanently disabled by an early build against vispy's unresolved
+    placeholder texture, and patches must convert to the dtype napari
+    actually uploads (e.g. int16 -> float32).
+    """
+    base = (np.random.default_rng(0).random((256, 256)) * 100).astype(
+        dtype,
+    )
+    arrays = [
+        da.from_array(lv, chunks=(32, 32))
+        for lv in (base, base[::2, ::2].copy())
+    ]
+    viewer = make_napari_viewer(show=True)
+    layer = add_progressive_loading_image(
+        arrays,
+        viewer=viewer,
+        max_bytes_per_second=100_000,
+    )
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    layer.locked_data_level = 0
+
+    def patched():
+        viewer.screenshot(canvas_only=True, flash=False)
+        return loader._texture_patches > 0
+
+    qtbot.waitUntil(patched, timeout=10000)
+    assert loader._double_buffer, 'double buffering was disabled'
+    _wait_for_idle_loader(qtbot, loader)
+    np.testing.assert_array_equal(
+        np.asarray(loader._data[0][0:256, 0:256]),
+        base,
+    )
+
+
 def test_progress_updates_deferred(
     qtbot,
     make_napari_viewer,

@@ -1584,11 +1584,13 @@ class ProgressiveLoader:
             for d in range(vdata.ndim)
         )
         try:
+            from napari._vispy.utils.gl import fix_data_dtype
+
             with vdata.lock:
                 crop = np.ascontiguousarray(vdata.hyperslice[src])
             if crop.ndim != 2 or 0 in crop.shape:
                 return False
-            node.set_data(crop)
+            node.set_data(fix_data_dtype(crop))
         except Exception:  # noqa: BLE001 # pragma: no cover - GL mismatch
             return False
         return True
@@ -2140,6 +2142,11 @@ class ProgressiveLoader:
                 )
                 with vdata.lock:
                     sub = np.ascontiguousarray(vdata.hyperslice[source])
+            # napari uploads GL-incompatible dtypes (e.g. int16) as a
+            # converted type; patches must match the texture's dtype
+            tex_dtype = getattr(texture, '_data_dtype', None)
+            if tex_dtype is not None and sub.dtype != tex_dtype:
+                sub = sub.astype(tex_dtype)
             if dbuf is not None:
                 # stream into the back texture; draws keep sampling the
                 # untouched front texture until the next present()
@@ -2161,6 +2168,14 @@ class ProgressiveLoader:
         dbuf = self._dbuf
         if dbuf is not None and type(dbuf) is dbuf_cls and dbuf.matches(node):
             return dbuf
+        texture = getattr(node, '_texture', None)
+        if texture is None or getattr(texture, '_data_dtype', None) is None:
+            # the node still holds vispy's unresolved placeholder (e.g.
+            # the 10x10 RGBA checkerboard, internalformat unsettled):
+            # building a sibling from it raises a channel mismatch.
+            # Not an unsupported configuration — just too early; retry
+            # on a later patch, after the first real upload resolves it.
+            return None
         pool = []
         if dbuf is not None:
             # carry the retired-texture pool across rebuilds (same GL
