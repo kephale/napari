@@ -54,6 +54,13 @@ __all__ = ('ScalarFieldBase',)
 #: zooms do not thrash on tiny slices.
 _MIN_TILE_EXTENT_3D = 32
 
+#: 3D sub-volume tile extents are rounded up to a multiple of this, so
+#: consecutive camera poses produce tiles with repeating shapes. The
+#: viewport-derived extent otherwise jitters by a few voxels per pose,
+#: and every new texture shape costs a GPU (re)allocation — a pipeline
+#: synchronization on slow drivers — and defeats texture reuse/pooling.
+_TILE_EXTENT_QUANTUM_3D = 32
+
 
 def _make_level_materializer(
     data: MultiScaleData,
@@ -635,6 +642,14 @@ class ScalarFieldBase(Layer, ABC):
                 )
         else:
             center = shape_at_level / 2
+        # quantize so tile shapes repeat across camera poses (texture
+        # reuse); the stable caps (extent_cap, level shape) still apply
+        quantum = _TILE_EXTENT_QUANTUM_3D
+        tile_extent = np.asarray(tile_extent, dtype=np.int64)
+        tile_extent = np.minimum(
+            -(-tile_extent // quantum) * quantum,
+            np.minimum(shape_at_level, extent_cap),
+        )
         center = np.clip(center, 0, shape_at_level - 1)
         if np.all(tile_extent >= shape_at_level):
             return corners

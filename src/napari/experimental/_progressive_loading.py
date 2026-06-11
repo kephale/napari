@@ -1801,8 +1801,7 @@ class ProgressiveLoader:
                 dbuf.close()
             self._dbuf = None
         try:
-            dbuf = DoubleBufferedVolumeTexture(node)
-            dbuf._pool = pool
+            dbuf = DoubleBufferedVolumeTexture(node, pool=pool)
             dbuf.attach_set_data()
         except Exception:  # noqa: BLE001 - unexpected texture class
             LOGGER.warning(

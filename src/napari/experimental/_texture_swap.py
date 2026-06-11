@@ -55,14 +55,26 @@ class DoubleBufferedVolumeTexture:
 
     """
 
-    def __init__(self, node):
+    def __init__(self, node, pool: list | None = None):
         self._node = node
         self._front = node._texture
         # the shape the pair was built for: a later in-place resize of
         # the front (vispy reuses the texture object) must invalidate
         # the pair, so don't read front.shape live
         self._shape = tuple(self._front.shape[:3])
-        self._back = self._make_sibling(node, self._front)
+        # retired-texture pool: list of (key, texture), most recent
+        # last; reused by _acquire instead of delete + reallocate.
+        # Accepted from a predecessor pair so rebuilds reuse textures.
+        self._pool: list[tuple] = pool if pool is not None else []
+        env_pool = os.environ.get('NAPARI_PROGRESSIVE_TEXTURE_POOL')
+        self._pool_max = (
+            int(env_pool) if env_pool else DEFAULT_TEXTURE_POOL_SIZE
+        )
+        self._back = self._acquire(
+            self._front.shape,
+            getattr(self._front, '_data_dtype', None) or np.float32,
+            lambda: self._make_sibling(node, self._front),
+        )
         # patch log: list of (offset, data) staged since creation; each
         # texture tracks how much of the log it has applied. 'full'
         # entries reset the log (older patches are superseded).
@@ -75,13 +87,6 @@ class DoubleBufferedVolumeTexture:
         # the new texture's uploads have drained (or the deadline hits)
         self._reshape_pending = False
         self._reshape_deadline = 0.0
-        # retired-texture pool: list of (key, texture), most recent
-        # last; reused by _acquire instead of delete + reallocate
-        self._pool: list[tuple] = []
-        env_pool = os.environ.get('NAPARI_PROGRESSIVE_TEXTURE_POOL')
-        self._pool_max = (
-            int(env_pool) if env_pool else DEFAULT_TEXTURE_POOL_SIZE
-        )
 
     # -- construction helpers --
 

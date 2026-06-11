@@ -1484,3 +1484,29 @@ def test_reshape_reuses_pooled_textures(
     assert dbuf.shape == shape_b
     assert tuple(node._texture.shape[:3]) == shape_b
     loader.close()
+
+
+def test_tile_extent_quantized(qtbot, make_napari_viewer):
+    """Viewport-derived 3D tile extents are quantized so camera jitter
+    cannot produce a parade of slightly-different texture shapes."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    base = np.zeros((512, 512, 512), dtype=np.uint8)
+    levels = [base, base[::2, ::2, ::2].copy()]
+    layer = viewer.add_image(levels, multiscale=True)
+    layer._max_tile_extent_3d = 322  # like a 33MB uint8 cap
+
+    sizes = set()
+    for view_extent in (123, 124, 127, 96, 100, 130):
+        bbox = np.array(
+            [[0.0, 0.0, 0.0], [float(view_extent)] * 3], dtype=float
+        )
+        corners = layer._corners_for_locked_level(
+            0, [0, 1, 2], data_bbox_int=bbox
+        )
+        size = tuple(corners[1, [0, 1, 2]] - corners[0, [0, 1, 2]] + 1)
+        sizes.add(size)
+        # every axis extent is a multiple of 32 (or a stable cap)
+        assert all(s % 32 == 0 or s in (322, 512) for s in size)
+    # 123/124/127 collapse to one shape; 96/100/130 to two more
+    assert len(sizes) <= 3
