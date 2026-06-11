@@ -38,11 +38,9 @@ LOGGER = logging.getLogger('napari.experimental._texture_swap')
 #: deletion synchronizes with the GPU pipeline (profiled ~25ms per
 #: DELETE on busy macOS GL-over-Metal), and reallocation costs another
 #: sync — so zooming back and forth across two levels would otherwise
-#: pay 4 syncs per switch. Sized for three live tile shapes x 2
-#: textures (quantization keeps the shape vocabulary about that
-#: small). Bounded GPU memory cost: at most this many spare tiles.
-#: NAPARI_PROGRESSIVE_TEXTURE_POOL overrides (0 disables).
-DEFAULT_TEXTURE_POOL_SIZE = 6
+#: pay 4 syncs per switch. Bounded GPU memory cost: at most this many
+#: spare tiles. NAPARI_PROGRESSIVE_TEXTURE_POOL overrides (0 disables).
+DEFAULT_TEXTURE_POOL_SIZE = 4
 
 
 class DoubleBufferedVolumeTexture:
