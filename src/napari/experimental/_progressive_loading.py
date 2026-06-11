@@ -1388,23 +1388,27 @@ class ProgressiveLoader:
         vdata = self._data[level]
         if vdata.ndim != 2:
             return False
+        # Only the on-screen region is prepared here — the slice (and
+        # texture) extend a render margin beyond the viewport, and an
+        # upsampling gather plus pixel copy of the full margin-sized
+        # tile costs tens of ms on the main thread. The margin starts
+        # as (invisible) zeros and is repaired off-thread below.
+        view_min, view_max = self._viewport_box_2d(level, min_coord, max_coord)
         try:
-            self._data.set_interval(
-                level,
-                min_coord,
-                max_coord,
-                backdrop_level=self._backdrop_level(
+            self._data.set_interval(level, min_coord, max_coord)
+            src_level = self._backdrop_level(level, view_min, view_max)
+            if src_level is not None and src_level != level:
+                self._data.fill_unloaded_from(
                     level,
-                    min_coord,
-                    max_coord,
-                ),
-            )
+                    src_level,
+                    region=(view_min, view_max),
+                )
         except Exception:  # noqa: BLE001 # pragma: no cover - degenerate
             return False
         patched = self._patch_texture_region(
             vdata,
-            [int(c) for c in min_coord],
-            [int(c) for c in max_coord],
+            [int(c) for c in view_min],
+            [int(c) for c in view_max],
         )
         if not patched:
             # validation failed (e.g. cold start: the node's texture
@@ -1416,7 +1420,34 @@ class ProgressiveLoader:
             # writes staged into the back texture; swap it in now so
             # the very next paint shows the backdrop, not the zeros
             self._update_node()
+            # backfill the off-screen margin on a worker thread
+            self._repair_backdrop()
         return patched
+
+    def _viewport_box_2d(self, level, min_coord, max_coord):
+        """The visible (no-margin) region of ``level``, clamped to the
+        given interval. Falls back to the full interval when no viewport
+        bbox has been recorded yet."""
+        bbox = getattr(self._layer, '_last_data_bbox', None)
+        displayed = tuple(self._layer._slice_input.displayed)
+        if bbox is None or bbox[0] != displayed:
+            return list(min_coord), list(max_coord)
+        factors = np.take(
+            np.asarray(self._data._scale_factors[level], dtype=float),
+            list(displayed),
+        )
+        corners = np.asarray(bbox[1], dtype=float) / factors
+        view_min = [
+            int(max(np.floor(corners[0, d]), int(min_coord[d])))
+            for d in range(2)
+        ]
+        view_max = [
+            int(min(np.ceil(corners[1, d]) + 1, int(max_coord[d])))
+            for d in range(2)
+        ]
+        if any(hi <= lo for lo, hi in zip(view_min, view_max, strict=True)):
+            return list(min_coord), list(max_coord)
+        return view_min, view_max
 
     def _set_node_data_from_hyperslice(self, vdata: VirtualData) -> bool:
         """Replace the node's data with the current corner-pixels crop."""
