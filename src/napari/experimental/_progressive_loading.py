@@ -1607,12 +1607,29 @@ class ProgressiveLoader:
         self._cancel_active()
         vdata = self._data[level]
 
-        self._data.set_interval(
-            level,
-            min_coord,
-            max_coord,
-            backdrop_level=self._backdrop_level(level, min_coord, max_coord),
-        )
+        if self._viewer.dims.ndisplay == 3:
+            # 3D: the tile IS the viewport, so the backdrop upsample
+            # gather covers the whole (16 MB default) tile — too much
+            # main-thread time per level switch. Set the interval cheap
+            # (carry-over + zeros) and fill on the repair worker; the
+            # double buffer keeps rendering the previous tile until the
+            # filled content presents.
+            self._data.set_interval(level, min_coord, max_coord)
+            self._repair_backdrop()
+        else:
+            # 2D: newly exposed regions here are usually small — the
+            # level-switch case was already backdropped synchronously
+            # (viewport-only) by _sync_backdrop_2d
+            self._data.set_interval(
+                level,
+                min_coord,
+                max_coord,
+                backdrop_level=self._backdrop_level(
+                    level,
+                    min_coord,
+                    max_coord,
+                ),
+            )
         self._active = (level, tuple(min_coord), tuple(max_coord))
 
         interval = vdata.interval
