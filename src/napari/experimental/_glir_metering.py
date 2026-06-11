@@ -45,13 +45,15 @@ import numpy as np
 
 LOGGER = logging.getLogger('napari.experimental._glir_metering')
 
-DEFAULT_FRAME_BUDGET_BYTES = 4 * 2**20
-DEFAULT_SLAB_BYTES = 1 * 2**20
+_FACTORY_FRAME_BUDGET_BYTES = 4 * 2**20
+_FACTORY_SLAB_BYTES = 1 * 2**20
+DEFAULT_FRAME_BUDGET_BYTES = _FACTORY_FRAME_BUDGET_BYTES
+DEFAULT_SLAB_BYTES = _FACTORY_SLAB_BYTES
 
 # Commands that operate on a specific GLIR object id and therefore must
 # stay ordered behind any deferred command for the same id.
 _OBJECT_COMMANDS = frozenset(
-    {'DATA', 'SIZE', 'WRAPPING', 'INTERPOLATION', 'DELETE'}
+    {'DATA', 'SIZE', 'WRAPPING', 'INTERPOLATION', 'DELETE'},
 )
 
 _original_flush = None
@@ -229,7 +231,9 @@ def _metered_parse(parser, commands, state, force_defer=False):
                 offset, data = command[2], command[3]
                 executed_any = False
                 for sub_offset, sub in _split_slabs(
-                    offset, data, state.slab_bytes
+                    offset,
+                    data,
+                    state.slab_bytes,
                 ):
                     # always make progress: with a full budget, upload at
                     # least one slab even if it alone exceeds the budget
@@ -327,12 +331,13 @@ def install(
         os.environ.get(
             'NAPARI_GLIR_TEX_BYTES_PER_FRAME',
             frame_budget_bytes or DEFAULT_FRAME_BUDGET_BYTES,
-        )
+        ),
     )
     slab_bytes = int(
         os.environ.get(
-            'NAPARI_GLIR_TEX_SLAB_BYTES', slab_bytes or DEFAULT_SLAB_BYTES
-        )
+            'NAPARI_GLIR_TEX_SLAB_BYTES',
+            slab_bytes or DEFAULT_SLAB_BYTES,
+        ),
     )
 
     # re-parameterize existing states (and set defaults for new ones)
@@ -358,7 +363,9 @@ def install(
 
 def uninstall():
     """Remove the patch and flush any carried uploads on next draw."""
-    global _original_flush
+    global _original_flush, DEFAULT_FRAME_BUDGET_BYTES, DEFAULT_SLAB_BYTES
+    DEFAULT_FRAME_BUDGET_BYTES = _FACTORY_FRAME_BUDGET_BYTES
+    DEFAULT_SLAB_BYTES = _FACTORY_SLAB_BYTES
     if _original_flush is None:
         return
     from vispy.gloo import glir
@@ -391,7 +398,9 @@ def _benchmark():  # pragma: no cover - manual profiling tool
     parser_.add_argument('--size', type=int, default=512, help='volume edge')
     parser_.add_argument('--repeats', type=int, default=5)
     parser_.add_argument(
-        '--budget', type=int, default=DEFAULT_FRAME_BUDGET_BYTES
+        '--budget',
+        type=int,
+        default=DEFAULT_FRAME_BUDGET_BYTES,
     )
     parser_.add_argument('--slab', type=int, default=DEFAULT_SLAB_BYTES)
     args = parser_.parse_args()
@@ -449,7 +458,7 @@ def _benchmark():  # pragma: no cover - manual profiling tool
             print(  # noqa: T201
                 f'{mb:>4} MB sub-upload: worst single draw '
                 f'{worst * 1e3:7.1f} ms, total incl. drain '
-                f'{total * 1e3:7.1f} ms'
+                f'{total * 1e3:7.1f} ms',
             )
     app.process_events()
     canvas.close()

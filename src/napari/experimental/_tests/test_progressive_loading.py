@@ -16,7 +16,10 @@ from napari.experimental._virtual_data import VirtualData
 def multiscale_arrays():
     """A small in-memory multiscale pyramid backed by dask."""
     base = np.random.default_rng(0).integers(
-        1, 255, size=(256, 256), dtype=np.uint8
+        1,
+        255,
+        size=(256, 256),
+        dtype=np.uint8,
     )
     levels = [base, base[::2, ::2].copy(), base[::4, ::4].copy()]
     return [da.from_array(level, chunks=(32, 32)) for level in levels]
@@ -56,7 +59,7 @@ def test_chunk_priority_2d_center_first(multiscale_arrays):
     last_center = np.array([(sl.start + sl.stop) / 2 for sl in queue[-1]])
     view_center = np.array([128, 128])
     assert np.linalg.norm(first_center - view_center) <= np.linalg.norm(
-        last_center - view_center
+        last_center - view_center,
     )
 
 
@@ -97,7 +100,9 @@ def _wait_for_idle_loader(qtbot, loader, timeout=30000):
 
 
 def test_add_progressive_loading_image(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
@@ -114,12 +119,15 @@ def test_add_progressive_loading_image(
     # the coarsest level is fully resident with real data
     coarsest = loader._data[len(loader._data) - 1]
     np.testing.assert_array_equal(
-        coarsest.hyperslice, np.asarray(multiscale_arrays[-1])
+        coarsest.hyperslice,
+        np.asarray(multiscale_arrays[-1]),
     )
 
 
 def test_progressive_loading_data_matches_source(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
@@ -138,7 +146,9 @@ def test_progressive_loading_data_matches_source(
 
 
 def test_locked_data_level_is_loaded(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
@@ -152,12 +162,15 @@ def test_locked_data_level_is_loaded(
     assert vdata.interval is not None
     assert len(vdata.loaded_chunks) > 0
     np.testing.assert_array_equal(
-        np.asarray(vdata[0:256, 0:256]), np.asarray(multiscale_arrays[0])
+        np.asarray(vdata[0:256, 0:256]),
+        np.asarray(multiscale_arrays[0]),
     )
 
 
 def test_removing_layer_closes_loader(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
@@ -172,7 +185,9 @@ def test_removing_layer_closes_loader(
 
 
 def test_fetch_pass_is_cancelled_on_view_change(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
@@ -189,7 +204,9 @@ def test_fetch_pass_is_cancelled_on_view_change(
 
 
 def test_contrast_limits_estimated(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
@@ -200,14 +217,18 @@ def test_contrast_limits_estimated(
 
 
 def test_interval_clamped_to_memory_budget(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     from napari.experimental._virtual_data import MultiScaleVirtualData
 
     viewer = make_napari_viewer()
     data = MultiScaleVirtualData(multiscale_arrays)
     layer = viewer.add_image(
-        data._data, multiscale=True, contrast_limits=(0, 255)
+        data._data,
+        multiscale=True,
+        contrast_limits=(0, 255),
     )
     loader = ProgressiveLoader(viewer, layer, data, interval_max_bytes=4096)
     layer.metadata['progressive_loader'] = loader
@@ -223,14 +244,19 @@ def test_interval_clamped_to_memory_budget(
 @pytest.fixture
 def multiscale_3d_arrays():
     base = np.random.default_rng(0).integers(
-        1, 255, size=(64, 64, 64), dtype=np.uint8
+        1,
+        255,
+        size=(64, 64, 64),
+        dtype=np.uint8,
     )
     levels = [base, base[::2, ::2, ::2].copy(), base[::4, ::4, ::4].copy()]
     return [da.from_array(level, chunks=(16, 16, 16)) for level in levels]
 
 
 def test_auto_level_3d_follows_zoom(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
@@ -254,7 +280,9 @@ def test_auto_level_3d_follows_zoom(
 
 
 def test_auto_level_3d_respects_user_pin(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
@@ -278,7 +306,9 @@ def test_auto_level_3d_respects_user_pin(
 
 
 def test_auto_level_3d_released_in_2d(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
@@ -296,12 +326,16 @@ def test_auto_level_3d_released_in_2d(
 
 
 def test_auto_level_3d_can_be_disabled(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
     layer = add_progressive_loading_image(
-        multiscale_3d_arrays, viewer=viewer, auto_level_3d=False
+        multiscale_3d_arrays,
+        viewer=viewer,
+        auto_level_3d=False,
     )
     loader = layer.metadata['progressive_loader']
     viewer.camera.zoom = 50.0
@@ -312,7 +346,9 @@ def test_auto_level_3d_can_be_disabled(
 
 
 def test_zoom_target_level_respects_memory_budget(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
@@ -320,7 +356,9 @@ def test_zoom_target_level_respects_memory_budget(
 
     data = MultiScaleVirtualData(multiscale_3d_arrays)
     layer = viewer.add_image(
-        data._data, multiscale=True, contrast_limits=(0, 255)
+        data._data,
+        multiscale=True,
+        contrast_limits=(0, 255),
     )
     loader = ProgressiveLoader(viewer, layer, data, interval_max_bytes=20**3)
     layer.metadata['progressive_loader'] = loader
@@ -386,10 +424,13 @@ def test_chunk_priority_3d_degenerate_camera():
 
 
 def test_zoom_target_level_3d_uninitialized_camera(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     """A NaN/zero zoom (camera not yet initialized) selects the coarsest
-    level instead of falling through to the finest."""
+    level instead of falling through to the finest.
+    """
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
     layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
@@ -404,7 +445,8 @@ def test_zoom_target_level_3d_uninitialized_camera(
     real_viewer = loader._viewer
     for bad_zoom in (float('nan'), float('inf'), 0.0):
         loader._viewer = SimpleNamespace(
-            camera=SimpleNamespace(zoom=bad_zoom), dims=real_viewer.dims
+            camera=SimpleNamespace(zoom=bad_zoom),
+            dims=real_viewer.dims,
         )
         assert loader._zoom_target_level_3d() == coarsest
     loader._viewer = real_viewer
@@ -416,10 +458,13 @@ def test_zoom_target_level_3d_uninitialized_camera(
 
 
 def test_auto_level_3d_survives_selector_echo(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     """The resolution-selector widget may echo the auto-driven level back
-    through the public setter; this must not suspend auto mode."""
+    through the public setter; this must not suspend auto mode.
+    """
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
     layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
@@ -442,10 +487,13 @@ def test_auto_level_3d_survives_selector_echo(
 
 
 def test_backdrop_prefers_nearest_loaded_level(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     """A level switch should source its backdrop from the level that was
-    just displayed, not always the coarsest level."""
+    just displayed, not always the coarsest level.
+    """
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
     loader = layer.metadata['progressive_loader']
@@ -455,7 +503,8 @@ def test_backdrop_prefers_nearest_loaded_level(
     # starts after the debounced check fires)
     layer.locked_data_level = 1
     qtbot.waitUntil(
-        lambda: len(loader._data[1].loaded_chunks) > 0, timeout=10000
+        lambda: len(loader._data[1].loaded_chunks) > 0,
+        timeout=10000,
     )
     _wait_for_idle_loader(qtbot, loader)
 
@@ -465,11 +514,14 @@ def test_backdrop_prefers_nearest_loaded_level(
 
 
 def test_level_switch_keeps_canvas_filled(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     """Right after switching to a not-yet-fetched level, the level's data
     must already contain (upsampled) content from a previously displayed
-    level — the canvas is never empty while chunks stream in."""
+    level — the canvas is never empty while chunks stream in.
+    """
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
     loader = layer.metadata['progressive_loader']
@@ -480,7 +532,8 @@ def test_level_switch_keeps_canvas_filled(
     # fetch pass), it must be filled with backdrop content — without
     # waiting for the fetch to complete
     qtbot.waitUntil(
-        lambda: loader._data[0].interval is not None, timeout=10000
+        lambda: loader._data[0].interval is not None,
+        timeout=10000,
     )
     hyperslice = loader._data[0].hyperslice
     # source data has no zeros, so any zeros would be unfilled regions
@@ -492,14 +545,19 @@ def test_level_switch_keeps_canvas_filled(
 
 
 def test_corners_for_locked_level_subvolume(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     """With _max_tile_extent_3d set, a locked 3D level larger than the
-    extent renders a centered sub-volume tile instead of the full level."""
+    extent renders a centered sub-volume tile instead of the full level.
+    """
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
     layer = viewer.add_image(
-        list(multiscale_3d_arrays), multiscale=True, contrast_limits=(0, 255)
+        list(multiscale_3d_arrays),
+        multiscale=True,
+        contrast_limits=(0, 255),
     )
     displayed = layer._slice_input.displayed
 
@@ -521,12 +579,16 @@ def test_corners_for_locked_level_subvolume(
 
 
 def test_locked_tile_hysteresis(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
     layer = viewer.add_image(
-        list(multiscale_3d_arrays), multiscale=True, contrast_limits=(0, 255)
+        list(multiscale_3d_arrays),
+        multiscale=True,
+        contrast_limits=(0, 255),
     )
     layer._max_tile_extent_3d = 32
     displayed = layer._slice_input.displayed
@@ -536,21 +598,28 @@ def test_locked_tile_hysteresis(
 
     # small movement (< extent/4): no re-slice
     near = layer._corners_for_locked_level(
-        0, displayed, np.array([[36, 36, 36]] * 2)
+        0,
+        displayed,
+        np.array([[36, 36, 36]] * 2),
     )
     assert not layer._locked_tile_moved(near, displayed)
     # large movement: re-slice
     far = layer._corners_for_locked_level(
-        0, displayed, np.array([[60, 60, 60]] * 2)
+        0,
+        displayed,
+        np.array([[60, 60, 60]] * 2),
     )
     assert layer._locked_tile_moved(far, displayed)
 
 
 def test_progressive_loading_3d_subvolume_tile(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     """The finest level of a volume larger than the tile budget is
-    selectable and loads only the tile's chunks."""
+    selectable and loads only the tile's chunks.
+    """
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
     layer = add_progressive_loading_image(
@@ -566,7 +635,8 @@ def test_progressive_loading_3d_subvolume_tile(
 
     layer.locked_data_level = 0
     qtbot.waitUntil(
-        lambda: len(loader._data[0].loaded_chunks) > 0, timeout=10000
+        lambda: len(loader._data[0].loaded_chunks) > 0,
+        timeout=10000,
     )
     _wait_for_idle_loader(qtbot, loader)
 
@@ -587,7 +657,8 @@ def test_progressive_loading_3d_subvolume_tile(
 
 def test_chunk_priority_3d_closest_visible_first():
     """Among chunks at the same depth, on-axis chunks lead; across depths,
-    closer-to-viewer always wins."""
+    closer-to-viewer always wins.
+    """
     arr = da.zeros((64, 64, 64), chunks=(16, 16, 16), dtype=np.uint8)
     keys = chunk_slices(VirtualData(arr))
     queue = chunk_priority_3D(
@@ -605,7 +676,9 @@ def test_chunk_priority_3d_closest_visible_first():
 
 
 def test_auto_label_shows_current_level(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     """The resolution selector's Auto entry indicates the rendered level."""
     viewer = make_napari_viewer()
@@ -626,20 +699,29 @@ def test_auto_label_shows_current_level(
 
 
 def test_zoom_target_respects_chunk_budget(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     """Auto level selection coarsens until the viewport tile can be
-    fetched within max_chunks_per_pass."""
+    fetched within max_chunks_per_pass.
+    """
     from napari.experimental._virtual_data import MultiScaleVirtualData
 
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
     data = MultiScaleVirtualData(multiscale_3d_arrays)
     layer = viewer.add_image(
-        data._data, multiscale=True, contrast_limits=(0, 255)
+        data._data,
+        multiscale=True,
+        contrast_limits=(0, 255),
     )
     loader = ProgressiveLoader(
-        viewer, layer, data, max_chunks_per_pass=8, auto_level_3d=True
+        viewer,
+        layer,
+        data,
+        max_chunks_per_pass=8,
+        auto_level_3d=True,
     )
     layer.metadata['progressive_loader'] = loader
     _wait_for_idle_loader(qtbot, loader)
@@ -662,7 +744,7 @@ def test_fill_unloaded_from_repairs_backdrop():
         [
             da.from_array(base, chunks=(16, 16)),
             da.from_array(coarse, chunks=(16, 16)),
-        ]
+        ],
     )
     # resident coarse level fully loaded
     msvd[1].set_interval((0, 0), (32, 32))
@@ -685,18 +767,21 @@ def test_fill_unloaded_from_repairs_backdrop():
 
 def test_huge_world_auto_normalized(qtbot, make_napari_viewer):
     """Pyramids whose extent exceeds float32 rendering precision get a
-    normalizing layer scale (3D rendering goes blank past 2**22)."""
+    normalizing layer scale (3D rendering goes blank past 2**22).
+    """
     base_shape = 2**23
     levels = []
     size = base_shape
     while size >= 64:
         levels.append(
-            da.zeros((size, size), chunks=(min(size, 64),) * 2, dtype='u1')
+            da.zeros((size, size), chunks=(min(size, 64),) * 2, dtype='u1'),
         )
         size //= 2
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(
-        levels, viewer=viewer, contrast_limits=(0, 255)
+        levels,
+        viewer=viewer,
+        contrast_limits=(0, 255),
     )
     world_extent = base_shape * layer.scale[0]
     assert world_extent <= 2**21
@@ -705,10 +790,13 @@ def test_huge_world_auto_normalized(qtbot, make_napari_viewer):
 
 
 def test_texture_patching_used_in_3d(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     """3D chunk arrivals go to the GPU as partial texture updates rather
-    than full re-slice + re-upload refreshes."""
+    than full re-slice + re-upload refreshes.
+    """
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
     layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
@@ -717,7 +805,8 @@ def test_texture_patching_used_in_3d(
 
     layer.locked_data_level = 0
     qtbot.waitUntil(
-        lambda: len(loader._data[0].loaded_chunks) > 0, timeout=10000
+        lambda: len(loader._data[0].loaded_chunks) > 0,
+        timeout=10000,
     )
     _wait_for_idle_loader(qtbot, loader)
     assert loader._texture_patches > 0
@@ -796,8 +885,11 @@ def test_fetch_chunks_respects_limiter(multiscale_arrays):
     start = _time.monotonic()
     batches = list(
         _fetch_chunks.__wrapped__(
-            vdata.array, keys, num_workers=2, limiter=limiter
-        )
+            vdata.array,
+            keys,
+            num_workers=2,
+            limiter=limiter,
+        ),
     )
     elapsed = _time.monotonic() - start
     fetched = [key for batch in batches for key in batch]
@@ -807,7 +899,10 @@ def test_fetch_chunks_respects_limiter(multiscale_arrays):
 
 
 def test_loader_max_bytes_per_second_env_override(
-    qtbot, make_napari_viewer, multiscale_arrays, monkeypatch
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
+    monkeypatch,
 ):
     monkeypatch.setenv('NAPARI_PROGRESSIVE_MAX_BPS', '12500000')
     viewer = make_napari_viewer()
@@ -818,7 +913,9 @@ def test_loader_max_bytes_per_second_env_override(
 
 
 def test_loader_unlimited_by_default(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
@@ -865,7 +962,8 @@ def test_rate_limiter_cancel_releases_paused_worker():
     limiter.pause()
     passed = _threading.Event()
     t = _threading.Thread(
-        target=lambda: (limiter.acquire(1), passed.set()), daemon=True
+        target=lambda: (limiter.acquire(1), passed.set()),
+        daemon=True,
     )
     t.start()
     _time.sleep(0.05)
@@ -874,7 +972,9 @@ def test_rate_limiter_cancel_releases_paused_worker():
 
 
 def test_interaction_hold_buffers_batches_and_refreshes(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     import time as _time
 
@@ -913,7 +1013,10 @@ def test_interaction_hold_buffers_batches_and_refreshes(
 
 
 def test_interaction_hold_disabled_by_env(
-    qtbot, make_napari_viewer, multiscale_arrays, monkeypatch
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
+    monkeypatch,
 ):
     monkeypatch.setenv('NAPARI_PROGRESSIVE_HOLD', '0')
     viewer = make_napari_viewer()
@@ -925,7 +1028,9 @@ def test_interaction_hold_disabled_by_env(
 
 
 def test_interaction_hold_pauses_fetch_limiter(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
@@ -993,10 +1098,13 @@ def test_glir_hold_defers_all_uploads(monkeypatch):
 
 
 def test_double_buffer_swaps_and_content_correct(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     """Chunk patches stream into the back texture and present() swaps;
-    the rendered result still matches the source exactly."""
+    the rendered result still matches the source exactly.
+    """
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
     layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
@@ -1005,7 +1113,8 @@ def test_double_buffer_swaps_and_content_correct(
 
     layer.locked_data_level = 0
     qtbot.waitUntil(
-        lambda: len(loader._data[0].loaded_chunks) > 0, timeout=10000
+        lambda: len(loader._data[0].loaded_chunks) > 0,
+        timeout=10000,
     )
     _wait_for_idle_loader(qtbot, loader)
     assert loader._texture_patches > 0
@@ -1025,7 +1134,10 @@ def test_double_buffer_swaps_and_content_correct(
 
 
 def test_double_buffer_disabled_by_env(
-    qtbot, make_napari_viewer, multiscale_3d_arrays, monkeypatch
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+    monkeypatch,
 ):
     monkeypatch.setenv('NAPARI_PROGRESSIVE_DOUBLE_BUFFER', '0')
     viewer = make_napari_viewer()
@@ -1035,7 +1147,8 @@ def test_double_buffer_disabled_by_env(
     _wait_for_idle_loader(qtbot, loader)
     layer.locked_data_level = 0
     qtbot.waitUntil(
-        lambda: len(loader._data[0].loaded_chunks) > 0, timeout=10000
+        lambda: len(loader._data[0].loaded_chunks) > 0,
+        timeout=10000,
     )
     _wait_for_idle_loader(qtbot, loader)
     assert loader._texture_patches > 0
@@ -1046,7 +1159,9 @@ def test_double_buffer_disabled_by_env(
 
 
 def test_interactive_step_degrades_and_restores(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
@@ -1060,12 +1175,12 @@ def test_interactive_step_degrades_and_restores(
     loader._on_interaction()
     assert loader._saved_step is not None
     assert float(node.relative_step_size) == pytest.approx(
-        base_step * loader._interactive_step_rate
+        base_step * loader._interactive_step_rate,
     )
     # repeated interaction events do not compound the degradation
     loader._on_interaction()
     assert float(node.relative_step_size) == pytest.approx(
-        base_step * loader._interactive_step_rate
+        base_step * loader._interactive_step_rate,
     )
 
     loader._end_hold()
@@ -1075,7 +1190,10 @@ def test_interactive_step_degrades_and_restores(
 
 
 def test_interactive_step_disabled(
-    qtbot, make_napari_viewer, multiscale_3d_arrays, monkeypatch
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+    monkeypatch,
 ):
     monkeypatch.setenv('NAPARI_PROGRESSIVE_INTERACTIVE_STEP', '1')
     viewer = make_napari_viewer()
@@ -1094,7 +1212,9 @@ def test_interactive_step_disabled(
 
 
 def test_interactive_step_not_applied_in_2d(
-    qtbot, make_napari_viewer, multiscale_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
 ):
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
@@ -1110,7 +1230,10 @@ def test_interactive_step_not_applied_in_2d(
 
 
 def test_quality_stays_degraded_while_backlog_pending(
-    qtbot, make_napari_viewer, multiscale_3d_arrays, monkeypatch
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+    monkeypatch,
 ):
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
@@ -1123,7 +1246,11 @@ def test_quality_stays_degraded_while_backlog_pending(
     loader._on_interaction()
     assert loader._saved_step is not None
     # simulate a large pending GLIR carry: quality must NOT restore
-    monkeypatch.setattr(loader, '_upload_backlog_bytes', lambda: 64 * 2**20)
+    monkeypatch.setattr(
+        loader,
+        '_upload_backlog_bytes',
+        lambda: 512 * 2**20,
+    )
     loader._end_hold()
     assert loader._saved_step is not None
     assert float(node.relative_step_size) > base_step
@@ -1138,7 +1265,10 @@ def test_quality_stays_degraded_while_backlog_pending(
 
 
 def test_drain_callback_restores_quality(
-    qtbot, make_napari_viewer, multiscale_3d_arrays, monkeypatch
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+    monkeypatch,
 ):
     """The GLIR meter's carry-drained notification restores quality."""
     from napari.experimental import _glir_metering as gm
@@ -1161,7 +1291,9 @@ def test_drain_callback_restores_quality(
 
 
 def test_pass_start_degrades_quality(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
@@ -1191,7 +1323,9 @@ def test_pass_start_degrades_quality(
 
 
 def test_suppress_next_full_upload_one_shot(
-    qtbot, make_napari_viewer, multiscale_3d_arrays
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
 ):
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
@@ -1220,3 +1354,94 @@ def test_suppress_next_full_upload_one_shot(
     assert not dbuf._suppress_full
     node.set_data(np.ones(shape, dtype=np.uint8))  # next one stages
     assert len(staged) == 1
+
+
+# ---------- staged shape changes (level/tile switches) ----------
+
+
+def test_reshape_staged_and_swapped(
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+):
+    """A shape-changing set_data goes through the staging texture, not
+    the bound one; with no upload backlog it swaps immediately.
+    """
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    layer.locked_data_level = 1 if int(layer.data_level) == 0 else 0
+    qtbot.waitUntil(lambda: loader._dbuf is not None, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+    dbuf = loader._dbuf
+    node = loader._get_volume_node()
+    old_front = dbuf._front
+    new_shape = tuple(s // 2 for s in dbuf.shape)
+    vol = np.full(new_shape, 7, dtype=np.uint8)
+
+    node.set_data(vol)
+    # wrapper stays attached and the pair adopted the new shape
+    assert dbuf._wrapped_set_data is not None
+    assert dbuf.shape == new_shape
+    # no backlog on this driver: swapped already
+    assert not dbuf._reshape_pending
+    assert node._texture is dbuf._front
+    assert dbuf._front is not old_front
+    assert tuple(node._texture.shape[:3]) == new_shape
+    assert node._vol_shape == new_shape
+    assert node._need_vertex_update
+    assert dbuf.matches(node)
+    assert not dbuf.dirty
+    # break the wrapped-set_data closure cycle synchronously so the
+    # viewer is collectable by the leak-checking fixture
+    loader.close()
+
+
+def test_reshape_waits_for_backlog_drain(
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+    monkeypatch,
+):
+    """With a pending upload backlog, the old-shape front keeps
+    rendering until the drain; patches already target the new shape.
+    """
+    from napari.experimental import _glir_metering as gm
+
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    layer.locked_data_level = 1 if int(layer.data_level) == 0 else 0
+    qtbot.waitUntil(lambda: loader._dbuf is not None, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+    dbuf = loader._dbuf
+    node = loader._get_volume_node()
+    old_front = dbuf._front
+    old_shape = dbuf.shape
+    new_shape = tuple(s // 2 for s in dbuf.shape)
+    vol = np.full(new_shape, 7, dtype=np.uint8)
+
+    monkeypatch.setattr(gm, 'pending_upload_bytes', lambda: 32 * 2**20)
+    node.set_data(vol)
+    assert dbuf._reshape_pending
+    # the bound texture is still the old front at the old shape
+    assert node._texture is old_front
+    assert tuple(node._texture.shape[:3]) == old_shape
+    # but the pair (and patch validation) already uses the new shape
+    assert dbuf.shape == new_shape
+    assert dbuf.matches(node)
+    assert dbuf.dirty
+
+    # drain -> the next present swaps in the new-shape texture
+    monkeypatch.setattr(gm, 'pending_upload_bytes', lambda: 0)
+    assert dbuf.present()
+    assert not dbuf._reshape_pending
+    assert node._texture is dbuf._front
+    assert tuple(node._texture.shape[:3]) == new_shape
+    assert node._vol_shape == new_shape
+    assert not dbuf.dirty
+    loader.close()

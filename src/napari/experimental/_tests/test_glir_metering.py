@@ -205,7 +205,7 @@ def test_metered_flush_carries_and_drains(monkeypatch):
     parser.add_texture3d(1)
     try:
         assert gm.install(
-            frame_budget_bytes=512 * 2**10, slab_bytes=128 * 2**10
+            frame_budget_bytes=512 * 2**10, slab_bytes=128 * 2**10,
         )
         queue = glir.GlirQueue()
         data = np.zeros((16, 256, 256), dtype=np.uint8)  # 1 MiB
@@ -230,7 +230,7 @@ def test_metered_flush_new_size_cancels_carry(monkeypatch):
     parser.add_texture3d(1)
     try:
         assert gm.install(
-            frame_budget_bytes=512 * 2**10, slab_bytes=128 * 2**10
+            frame_budget_bytes=512 * 2**10, slab_bytes=128 * 2**10,
         )
         queue = glir.GlirQueue()
         data = np.zeros((16, 256, 256), dtype=np.uint8)  # 1 MiB

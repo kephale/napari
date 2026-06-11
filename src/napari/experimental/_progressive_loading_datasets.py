@@ -69,6 +69,7 @@ def mandelbrot_dataset(
     dict
         Multiscale metadata with keys ``['container', 'dataset',
         'scale_levels', 'scale_factors', 'chunk_size', 'arrays']``.
+
     """
     store = MandelbrotStore(
         levels=max_levels,
@@ -115,6 +116,7 @@ def mandelbulb_dataset(
     dict
         Multiscale metadata with keys ``['container', 'dataset',
         'scale_levels', 'scale_factors', 'chunk_size', 'arrays']``.
+
     """
     store = MandelbulbStore(
         levels=max_levels,
@@ -146,7 +148,7 @@ def openorganelle_mouse_kidney_em():
     except ModuleNotFoundError as e:  # pragma: no cover - optional dep
         raise ModuleNotFoundError(
             'openorganelle_mouse_kidney_em requires fibsem_tools: '
-            'pip install fibsem_tools'
+            'pip install fibsem_tools',
         ) from e
 
     large_image = {
@@ -183,7 +185,7 @@ def luethi_zenodo_7144919(cache_bytes: int = DEFAULT_CACHE_BYTES):
         import pooch
     except ModuleNotFoundError as e:  # pragma: no cover - optional dep
         raise ModuleNotFoundError(
-            'luethi_zenodo_7144919 requires pooch: pip install pooch'
+            'luethi_zenodo_7144919 requires pooch: pip install pooch',
         ) from e
 
     # Downloaded from https://zenodo.org/record/7144919

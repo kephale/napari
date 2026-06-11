@@ -25,7 +25,9 @@ only ever sample stable textures.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import time
 
 import numpy as np
 
@@ -41,6 +43,7 @@ class DoubleBufferedVolumeTexture:
         The volume node to manage. Its current texture becomes the
         front texture; a sibling back texture of the same class,
         format and interpolation is created for staging.
+
     """
 
     def __init__(self, node):
@@ -56,12 +59,13 @@ class DoubleBufferedVolumeTexture:
         # entries reset the log (older patches are superseded).
         self._log: list[tuple] = []
         self._applied = {id(self._front): 0, id(self._back): 0}
-        self._full_pending: dict[int, bool] = {
-            id(self._front): False,
-            id(self._back): False,
-        }
         self._wrapped_set_data = None
         self._suppress_full = False
+        # a staged shape change: the back texture already has the new
+        # shape/content while the old-shape front keeps rendering until
+        # the new texture's uploads have drained (or the deadline hits)
+        self._reshape_pending = False
+        self._reshape_deadline = 0.0
 
     # -- construction helpers --
 
@@ -89,16 +93,46 @@ class DoubleBufferedVolumeTexture:
             back.interpolation = front.interpolation
         return back
 
+    def _make_texture_like(self, node, vol):
+        """Create a texture formatted for ``vol`` (new shape and dtype)."""
+        texture_format = getattr(node, 'texture_format', None)
+        if texture_format is None:  # pragma: no cover - napari sets it
+            texture_format = self._front.internalformat
+        rep = np.zeros((1, 1, 1), dtype=vol.dtype)
+        tex = node._create_texture(texture_format, rep)
+        tex.resize(tuple(vol.shape[:3]))
+        tex._data_dtype = vol.dtype
+        front = self._front
+        if front.clim is not None:
+            with contextlib.suppress(Exception):
+                tex.set_clim(front.clim)
+        if tex.interpolation != front.interpolation:
+            tex.interpolation = front.interpolation
+        return tex
+
     @property
     def shape(self) -> tuple:
+        """The shape staged content must have (the pair's tile shape).
+
+        During a pending reshape this is already the NEW shape — the
+        old-shape front keeps rendering, but patches target the new
+        back texture.
+        """
         return self._shape
 
     def matches(self, node) -> bool:
         """Whether this buffer still belongs to ``node``'s texture pair."""
+        if self._node is not node or node._texture not in (
+            self._front,
+            self._back,
+        ):
+            return False
+        # a pending reshape legitimately renders the old-shape front;
+        # otherwise an in-place resize of the bound texture (vispy
+        # reuses the object) invalidates the pair
         return (
-            self._node is node
-            and node._texture in (self._front, self._back)
-            and tuple(node._texture.shape[:3]) == self._shape
+            self._reshape_pending
+            or tuple(node._texture.shape[:3]) == self._shape
         )
 
     # -- staging --
@@ -119,6 +153,31 @@ class DoubleBufferedVolumeTexture:
         for key in self._applied:
             self._applied[key] = 0
         self._catch_up(self._back)
+
+    def stage_reshape(self, vol, clim=None) -> None:
+        """Stage a full rewrite at a NEW tile shape.
+
+        A fresh texture is allocated and filled off the rendered path;
+        the old-shape front keeps rendering its (valid, previous-level)
+        content until :meth:`present` swaps — once the new texture's
+        uploads have drained, or after a deadline. This removes the
+        last write-to-bound-texture path: previously a shape change
+        fell through to vispy's set_data, which re-specifies and
+        re-uploads the texture the GPU is sampling.
+        """
+        node = self._node
+        new_back = self._make_texture_like(node, vol)
+        old_back = self._back
+        if old_back is not self._front:
+            with contextlib.suppress(Exception):
+                old_back.delete()
+        self._back = new_back
+        self._shape = tuple(vol.shape[:3])
+        self._log = [(None, vol, clim)]
+        self._applied = {id(self._front): 0, id(new_back): 0}
+        self._reshape_pending = True
+        self._reshape_deadline = time.monotonic() + 2.0
+        self._catch_up(new_back)
 
     def _catch_up(self, texture) -> None:
         key = id(texture)
@@ -151,7 +210,8 @@ class DoubleBufferedVolumeTexture:
         """
         if not self.dirty:
             return False
-        node = self._node
+        if self._reshape_pending:
+            return self._present_reshape()
         front, back = self._front, self._back
         # propagate authoritative front state (napari writes clims and
         # interpolation to node._texture, i.e. the front); clims staged
@@ -161,40 +221,86 @@ class DoubleBufferedVolumeTexture:
         if back.interpolation != front.interpolation:
             back.interpolation = front.interpolation
         self._catch_up(back)
-
-        # the swap: one sampler rebind plus bookkeeping uniforms
-        node.shared_program['u_volumetex'] = back
-        if getattr(node, '_data_lookup_fn', None) is not None:
-            # interpolation lookup samples through this binding; when it
-            # is None, vispy's lazy interpolation setup reads
-            # node._texture at the next draw instead
-            node._data_lookup_fn['texture'] = back
-        node.shared_program['clim'] = back.clim_normalized
-        node._texture = back
+        self._bind(back)
         self._front, self._back = back, front
 
         # catch the new back up too (off the rendered path), then drop
         # the fully-applied prefix of the log to release chunk memory
         self._catch_up(front)
+        self._trim_log()
+        return True
+
+    def _present_reshape(self) -> bool:
+        """Swap in the new-shape texture once its uploads have drained.
+
+        Swapping earlier would render a partially uploaded (black)
+        volume; until then the old-shape front keeps showing the
+        previous level. A deadline bounds the wait in case uploads
+        never fully settle (e.g. a steady chunk stream).
+        """
+        from napari.experimental import _glir_metering
+
+        if (
+            _glir_metering.is_installed()
+            and _glir_metering.pending_upload_bytes() > 0
+            and time.monotonic() < self._reshape_deadline
+        ):
+            return False
+        node = self._node
+        old_front, back = self._front, self._back
+        self._catch_up(back)
+        self._bind(back)
+        z, y, x = self._shape
+        node.shared_program['u_shape'] = (x, y, z)
+        node._vol_shape = self._shape
+        node._need_vertex_update = True
+        with contextlib.suppress(Exception):
+            old_front.delete()
+        self._front = back
+        self._reshape_pending = False
+        # rebuild the spare at the new shape and converge it
+        self._back = self._make_sibling(node, back)
+        self._applied = {
+            id(self._front): self._applied[id(back)],
+            id(self._back): 0,
+        }
+        self._catch_up(self._back)
+        self._trim_log()
+        node.update()
+        return True
+
+    def _bind(self, texture) -> None:
+        """Point the shader at ``texture`` (one sampler rebind)."""
+        node = self._node
+        node.shared_program['u_volumetex'] = texture
+        if getattr(node, '_data_lookup_fn', None) is not None:
+            # interpolation lookup samples through this binding; when it
+            # is None, vispy's lazy interpolation setup reads
+            # node._texture at the next draw instead
+            node._data_lookup_fn['texture'] = texture
+        node.shared_program['clim'] = texture.clim_normalized
+        node._texture = texture
+
+    def _trim_log(self) -> None:
         applied_min = min(self._applied.values())
         if applied_min:
             self._log = self._log[applied_min:]
             for key in self._applied:
                 self._applied[key] -= applied_min
-        return True
 
     # -- full-refresh interception --
 
     def attach_set_data(self) -> None:
-        """Route same-shape ``node.set_data`` calls through the staging
-        texture.
+        """Route ``node.set_data`` calls through the staging texture.
 
         napari's slicing pipeline rewrites the whole volume through
         ``node.set_data`` at pass boundaries — a multi-second
         write-to-sampled-texture stall on slow drivers. Same-shape
-        rewrites are staged and presented instead; shape changes fall
-        back to the original path (textures must be re-specified) and
-        the loader rebuilds this buffer afterwards.
+        rewrites are staged into the back texture; shape changes
+        (level/tile switches) are staged into a freshly allocated
+        texture and swapped in once uploaded (:meth:`stage_reshape`).
+        Only non-array payloads or external texture rebinds fall back
+        to the original path.
         """
         if self._wrapped_set_data is not None:
             return
@@ -202,30 +308,34 @@ class DoubleBufferedVolumeTexture:
         original = node.set_data
 
         def set_data_staged(vol, clim=None, copy=True):
-            same_shape = (
-                isinstance(vol, np.ndarray)
-                and vol.ndim == 3
-                and tuple(vol.shape[:3]) == self.shape
-            )
-            if not same_shape or node._texture not in (
-                self._front,
-                self._back,
+            if (
+                not isinstance(vol, np.ndarray)
+                or vol.ndim != 3
+                or node._texture not in (self._front, self._back)
             ):
-                # shape/format change: textures must be re-specified
-                # through the original path; the loader rebuilds this
-                # buffer on its next patch
+                # unexpected payload or someone rebound the texture:
+                # fall back; the loader rebuilds this buffer on its
+                # next patch
                 self._suppress_full = False
                 self.detach_set_data()
                 return original(vol, clim=clim, copy=copy)
-            if self._suppress_full:
+            same_shape = tuple(vol.shape[:3]) == self.shape
+            if same_shape and self._suppress_full:
                 # caller asserts the GPU pair already matches vol
                 # (every chunk was patched): skip the redundant
                 # full-tile upload entirely
                 self._suppress_full = False
                 node._last_data = vol
                 return None
+            self._suppress_full = False
             try:
-                self.stage_full(vol, clim=clim)
+                if same_shape:
+                    self.stage_full(vol, clim=clim)
+                else:
+                    # a level/tile switch: fill a new-shape texture off
+                    # the rendered path; the swap happens once its
+                    # uploads drain (the old level renders meanwhile)
+                    self.stage_reshape(vol, clim=clim)
                 self.present()
             except Exception:  # noqa: BLE001 - dtype/format change
                 self.detach_set_data()
@@ -256,9 +366,8 @@ class DoubleBufferedVolumeTexture:
 
         The node keeps rendering whatever is currently front.
         """
-        import contextlib
-
         self.detach_set_data()
         self._log = []
-        with contextlib.suppress(Exception):  # pragma: no cover - teardown
-            self._back.delete()
+        if self._back is not self._front:
+            with contextlib.suppress(Exception):  # pragma: no cover
+                self._back.delete()

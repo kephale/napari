@@ -98,6 +98,7 @@ def chunk_slices(data, interval: tuple | None = None) -> list[list[slice]]:
     list of list of slice
         For each dimension, the slices of every chunk along it. The full
         set of chunk keys is the cartesian product across dimensions.
+
     """
     if isinstance(data, VirtualData):
         boundaries = data._boundaries
@@ -117,7 +118,7 @@ def chunk_slices(data, interval: tuple | None = None) -> list[list[slice]]:
             [
                 slice(int(start), int(stop))
                 for start, stop in zip(starts, stops, strict=True)
-            ]
+            ],
         )
     return result
 
@@ -145,6 +146,7 @@ def visual_depth(points, camera) -> np.ndarray:
         Position of the points along the view vector of the camera. These
         can be negative (in front of the center) or positive (behind the
         center).
+
     """
     view_direction = camera.view_direction
     points_relative_to_camera = points - camera.center
@@ -171,6 +173,7 @@ def distance_from_camera_center_line(points, camera) -> np.ndarray:
     -------
     distances : (N,) array of float
         Distances from points to the center line of the camera.
+
     """
     view_direction = camera.view_direction
     projected_length = visual_depth(points, camera)
@@ -187,7 +190,9 @@ def _chunk_keys_product(
 
 
 def chunk_priority_2D(
-    chunk_keys: list[list[slice]], min_coord, max_coord
+    chunk_keys: list[list[slice]],
+    min_coord,
+    max_coord,
 ) -> list[tuple[slice, ...]]:
     """Order chunk keys by distance from the center of the view.
 
@@ -202,6 +207,7 @@ def chunk_priority_2D(
     -------
     list of tuple of slice
         Chunk keys sorted with the most central chunks first.
+
     """
     view_center = (np.asarray(min_coord) + np.asarray(max_coord)) / 2
     keys = _chunk_keys_product(chunk_keys)
@@ -258,6 +264,7 @@ def chunk_priority_3D(
     the arithmetic overflows — all of which can occur before the 3D
     camera is fully initialized — fall back to plain
     view-center-distance ordering instead of producing NaN priorities.
+
     """
     keys = _chunk_keys_product(chunk_keys)
     if not keys:
@@ -438,7 +445,6 @@ def _fetch_chunks(
     like numba and for remote IO); a bounded in-flight window keeps
     completion order close to the priority order of ``chunk_queue``.
     """
-
     itemsize = np.dtype(array.dtype).itemsize
 
     def fetch(chunk_key):
@@ -451,7 +457,9 @@ def _fetch_chunks(
         if apply is not None:
             apply(chunk_key, chunk)
         LOGGER.debug(
-            'fetched chunk %s in %.3fs', chunk_key, time.monotonic() - start
+            'fetched chunk %s in %.3fs',
+            chunk_key,
+            time.monotonic() - start,
         )
         return chunk_key
 
@@ -594,6 +602,7 @@ class ProgressiveLoader:
         the main thread in otherwise-innocent GL calls. 1.0 (or 0)
         disables. The ``NAPARI_PROGRESSIVE_INTERACTIVE_STEP``
         environment variable overrides.
+
     """
 
     def __init__(
@@ -721,7 +730,8 @@ class ProgressiveLoader:
         # Debounced so that continuous camera motion only triggers a fetch
         # pass once interaction settles.
         self._debounced_check = debounced(
-            ensure_main_thread(self._check), timeout=debounce_ms
+            ensure_main_thread(self._check),
+            timeout=debounce_ms,
         )
         self._connections = [
             # fast (non-debounced) path: suspend streaming work the
@@ -763,7 +773,8 @@ class ProgressiveLoader:
         # this size, so even the finest levels of huge volumes are usable
         # in 3D. Bounded by the memory budget and the GL 3D texture limit.
         self._tile_extent_3d = _tile_extent_3d_for(
-            data.dtype, min(interval_max_bytes, tile_max_bytes_3d)
+            data.dtype,
+            min(interval_max_bytes, tile_max_bytes_3d),
         )
         layer._max_tile_extent_3d = self._tile_extent_3d
 
@@ -788,7 +799,7 @@ class ProgressiveLoader:
         self._cancel_active()
         from napari.experimental import _glir_metering
 
-        _glir_metering.remove_drain_callback(self._maybe_restore_quality)
+        _glir_metering.remove_drain_callback(self._on_uploads_drained)
         self._restore_render_quality()
         if self._dbuf is not None:
             with contextlib.suppress(Exception):
@@ -809,7 +820,7 @@ class ProgressiveLoader:
         self._connections = []
         with contextlib.suppress(ValueError, TypeError):
             self._viewer.layers.events.removed.disconnect(
-                self._on_layer_removed
+                self._on_layer_removed,
             )
 
     # -- view tracking --
@@ -845,7 +856,11 @@ class ProgressiveLoader:
         return self._clamp_interval(vdata, min_coord, max_coord)
 
     def _restrict_to_current_step(
-        self, level: int, displayed: set, min_coord, max_coord
+        self,
+        level: int,
+        displayed: set,
+        min_coord,
+        max_coord,
     ) -> None:
         """Restrict non-displayed dims to the current dims step (in place)."""
         layer = self._layer
@@ -854,7 +869,8 @@ class ProgressiveLoader:
         factors = np.asarray(self._data._scale_factors[level])
         try:
             data_point = np.asarray(
-                layer.world_to_data(self._viewer.dims.point), dtype=float
+                layer.world_to_data(self._viewer.dims.point),
+                dtype=float,
             )
         except (ValueError, IndexError, TypeError):
             # pragma: no cover - layer/viewer dims mismatch fallback
@@ -869,7 +885,10 @@ class ProgressiveLoader:
                 max_coord[d] = point + 1
 
     def _clamp_interval(
-        self, vdata: VirtualData, min_coord, max_coord
+        self,
+        vdata: VirtualData,
+        min_coord,
+        max_coord,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Shrink an interval around its center to respect the memory cap."""
         min_coord = np.array(min_coord, dtype=np.int64)
@@ -945,14 +964,15 @@ class ProgressiveLoader:
         # screen pixels per level-0 data pixel (layer scale maps data to
         # world; zoom maps world to screen)
         layer_scale = float(
-            np.max(np.take(np.asarray(layer.scale), displayed))
+            np.max(np.take(np.asarray(layer.scale), displayed)),
         )
         data_zoom = zoom * layer_scale
 
         target = 0
         for level in range(n_levels - 1, -1, -1):
             factors = np.take(
-                np.asarray(self._data._scale_factors[level]), displayed
+                np.asarray(self._data._scale_factors[level]),
+                displayed,
             )
             pixel_size = data_zoom * float(np.max(factors))
             if pixel_size <= self._max_pixel_size_3d:
@@ -969,23 +989,27 @@ class ProgressiveLoader:
         for level in range(target, n_levels):
             vdata = self._data[level]
             extent = np.take(
-                np.asarray(vdata.shape, dtype=np.int64), displayed
+                np.asarray(vdata.shape, dtype=np.int64),
+                displayed,
             )
             extent = np.minimum(extent, self._tile_extent_3d)
             if bbox is not None:
                 downsample = np.take(
-                    np.asarray(self._data._scale_factors[level]), displayed
+                    np.asarray(self._data._scale_factors[level]),
+                    displayed,
                 )
                 view_extent = np.ceil((bbox[1] - bbox[0]) / downsample).astype(
-                    np.int64
+                    np.int64,
                 )
                 extent = np.minimum(extent, np.maximum(view_extent, 1))
             nbytes = np.prod(extent, dtype=np.int64) * vdata.dtype.itemsize
             chunk_shape = np.take(
-                np.asarray(vdata.chunk_shape, dtype=np.int64), displayed
+                np.asarray(vdata.chunk_shape, dtype=np.int64),
+                displayed,
             )
             n_chunks = np.prod(
-                -(-extent // chunk_shape), dtype=np.int64
+                -(-extent // chunk_shape),
+                dtype=np.int64,
             )  # ceil-div
             if (
                 nbytes <= self._interval_max_bytes
@@ -1011,7 +1035,8 @@ class ProgressiveLoader:
                 -len(displayed_axes) :
             ]
             data_point = np.asarray(
-                self._layer.world_to_data(world_point), dtype=float
+                self._layer.world_to_data(world_point),
+                dtype=float,
             )
         except Exception:  # pragma: no cover - dims mismatch  # noqa: BLE001
             return None
@@ -1027,7 +1052,8 @@ class ProgressiveLoader:
             return np.stack([center, center])
         # world units -> level-0 data units (per displayed axis)
         layer_scale = np.take(
-            np.asarray(self._layer.scale, dtype=float), list(displayed_axes)
+            np.asarray(self._layer.scale, dtype=float),
+            list(displayed_axes),
         )
         half_extent = (canvas_size / zoom) / 2 / np.maximum(layer_scale, 1e-12)
         return np.stack([center - half_extent, center + half_extent])
@@ -1062,7 +1088,9 @@ class ProgressiveLoader:
         # Mirror the corner_pixels update of the locked_data_level setter,
         # centering any sub-volume tile on the camera.
         layer.corner_pixels = layer._corners_for_locked_level(
-            target, displayed_axes, camera_bbox
+            target,
+            displayed_axes,
+            camera_bbox,
         )
         # Prepare the new level's interval with a backdrop from the level
         # that was just displayed BEFORE napari re-slices, so the previous
@@ -1074,7 +1102,9 @@ class ProgressiveLoader:
                 min_coord,
                 max_coord,
                 backdrop_level=self._backdrop_level(
-                    target, min_coord, max_coord
+                    target,
+                    min_coord,
+                    max_coord,
                 ),
             )
         layer.refresh(extent=False)
@@ -1158,7 +1188,22 @@ class ProgressiveLoader:
         # GLIR meter reports its carry fully drained
         from napari.experimental import _glir_metering
 
-        _glir_metering.add_drain_callback(self._maybe_restore_quality)
+        _glir_metering.add_drain_callback(self._on_uploads_drained)
+
+    def _on_uploads_drained(self) -> None:
+        """GLIR carry fully drained: swap pending textures, restore LOD."""
+        if self._closed:
+            return
+        if self._dbuf is not None:
+            node = self._get_volume_node()
+            if (
+                node is not None
+                and self._dbuf.matches(node)
+                and self._dbuf.dirty
+            ):
+                with contextlib.suppress(Exception):
+                    self._dbuf.present()
+        self._maybe_restore_quality()
 
     def _upload_backlog_bytes(self) -> int:
         from napari.experimental import _glir_metering
@@ -1269,16 +1314,16 @@ class ProgressiveLoader:
             cand_min = [
                 int(
                     np.floor(
-                        min_coord[d] * factors[level][d] / factors[cand][d]
-                    )
+                        min_coord[d] * factors[level][d] / factors[cand][d],
+                    ),
                 )
                 for d in range(ndim)
             ]
             cand_max = [
                 int(
                     np.ceil(
-                        max_coord[d] * factors[level][d] / factors[cand][d]
-                    )
+                        max_coord[d] * factors[level][d] / factors[cand][d],
+                    ),
                 )
                 for d in range(ndim)
             ]
@@ -1374,7 +1419,8 @@ class ProgressiveLoader:
             # matches" assertion from a previous reconcile
             self._dbuf._suppress_full = False
         self._pbar = self._make_progress(
-            len(queue), f'{self._layer.name}: loading level {level}'
+            len(queue),
+            f'{self._layer.name}: loading level {level}',
         )
 
         # Show carried-over and backdrop content before the first chunk
@@ -1411,7 +1457,7 @@ class ProgressiveLoader:
             limiter=self._limiter,
         )
         worker.yielded.connect(
-            lambda batch: self._on_chunks(generation, vdata, batch)
+            lambda batch: self._on_chunks(generation, vdata, batch),
         )
         worker.finished.connect(lambda: self._on_fetch_finished(generation))
         self._worker = worker
@@ -1425,7 +1471,8 @@ class ProgressiveLoader:
             # mid ndisplay transition: displayed dims not 3D yet
             return chunk_priority_2D(keys, interval[0], interval[1])
         layer_scale = np.take(
-            np.asarray(self._layer.scale, dtype=float), displayed
+            np.asarray(self._layer.scale, dtype=float),
+            displayed,
         )
         camera_center = np.asarray(camera.center, dtype=float) / (
             np.take(factors, displayed) * np.maximum(layer_scale, 1e-12)
@@ -1463,7 +1510,9 @@ class ProgressiveLoader:
                 pbar.close()
 
     def _advance_progress(
-        self, count: int = 1, resident: bool = False
+        self,
+        count: int = 1,
+        resident: bool = False,
     ) -> None:
         """Reentrancy-safe progress bar increment.
 
@@ -1558,7 +1607,9 @@ class ProgressiveLoader:
         # deferred to idle, after its end. Mid-pass full uploads were the
         # main remaining UI stalls on slow GL drivers.
         patched = self._texture_patching and self._patch_texture_batch(
-            vdata, batch, block=block
+            vdata,
+            batch,
+            block=block,
         )
         if not patched:
             self._pass_all_patched = False
@@ -1576,7 +1627,8 @@ class ProgressiveLoader:
             else:
                 self._refresh(final=True)
         elif now - self._last_node_update >= max(
-            self._refresh_interval_s, 0.05
+            self._refresh_interval_s,
+            0.05,
         ):
             self._last_node_update = now
             self._update_node()
@@ -1603,7 +1655,10 @@ class ProgressiveLoader:
         return self._patch_texture_region(vdata, low, high)
 
     def _patch_texture_batch(
-        self, vdata: VirtualData, batch, block=None
+        self,
+        vdata: VirtualData,
+        batch,
+        block=None,
     ) -> bool:
         """Upload a batch of chunks as ONE coalesced texture update.
 
@@ -1625,7 +1680,11 @@ class ProgressiveLoader:
         return self._patch_texture_region(vdata, low, high)
 
     def _patch_texture_region(
-        self, vdata: VirtualData, low, high, block=None
+        self,
+        vdata: VirtualData,
+        low,
+        high,
+        block=None,
     ) -> bool:
         """Write an absolute-coordinate region into the 3D GPU texture.
 
@@ -1647,7 +1706,13 @@ class ProgressiveLoader:
             return False
         try:
             texture = node._texture
-            tex_shape = tuple(texture.shape[:3])
+            dbuf = self._ensure_dbuf(node) if self._double_buffer else None
+            # during a pending reshape the bound texture still has the
+            # old tile's shape while staged patches target the new one,
+            # so validate against the pair's staging shape
+            tex_shape = (
+                dbuf.shape if dbuf is not None else tuple(texture.shape[:3])
+            )
         except (AttributeError, TypeError):  # pragma: no cover
             return False
         # The texture holds the corner-pixels crop of the level (the
@@ -1681,7 +1746,10 @@ class ProgressiveLoader:
                     inner = tuple(
                         slice(lo - rlo, h - rlo)
                         for lo, h, rlo in zip(
-                            low, high, region_low, strict=True
+                            low,
+                            high,
+                            region_low,
+                            strict=True,
                         )
                     )
                     sub = np.ascontiguousarray(block[inner])
@@ -1694,7 +1762,6 @@ class ProgressiveLoader:
                 )
                 with vdata.lock:
                     sub = np.ascontiguousarray(vdata.hyperslice[source])
-            dbuf = self._ensure_dbuf(node) if self._double_buffer else None
             if dbuf is not None:
                 # stream into the back texture; draws keep sampling the
                 # untouched front texture until the next present()
@@ -1709,8 +1776,7 @@ class ProgressiveLoader:
     def _ensure_dbuf(self, node):
         """(Re)build the double-buffered texture pair for ``node``."""
         dbuf = self._dbuf
-        tex_shape = tuple(node._texture.shape[:3])
-        if dbuf is not None and dbuf.matches(node) and dbuf.shape == tex_shape:
+        if dbuf is not None and dbuf.matches(node):
             return dbuf
         if dbuf is not None:
             with contextlib.suppress(Exception):
@@ -1762,7 +1828,8 @@ class ProgressiveLoader:
         # per refresh, so their interval backs off automatically.
         now = time.monotonic()
         min_interval = max(
-            self._refresh_interval_s, 2.0 * self._last_refresh_duration
+            self._refresh_interval_s,
+            2.0 * self._last_refresh_duration,
         )
         if not (final or force) and now - self._last_refresh < min_interval:
             return
@@ -1833,7 +1900,10 @@ class ProgressiveLoader:
         max_coord = np.asarray(vdata.shape, dtype=np.int64)
         displayed = set(self._layer._slice_input.displayed)
         self._restrict_to_current_step(
-            self._resident_level, displayed, min_coord, max_coord
+            self._resident_level,
+            displayed,
+            min_coord,
+            max_coord,
         )
         nbytes = np.prod(max_coord - min_coord, dtype=np.int64) * itemsize
         if nbytes > self._resident_max_bytes:
@@ -1897,7 +1967,8 @@ class ProgressiveLoader:
             return
 
         self._resident_pbar = self._make_progress(
-            len(queue), f'{self._layer.name}: loading overview'
+            len(queue),
+            f'{self._layer.name}: loading overview',
         )
 
         def apply(chunk_key, chunk, vdata=vdata):
@@ -2042,6 +2113,7 @@ def add_progressive_loading_image(
     napari.layers.Image
         The created layer. The active :class:`ProgressiveLoader` is stored
         in ``layer.metadata['progressive_loader']``.
+
     """
     if viewer is None:
         from napari import Viewer
@@ -2089,7 +2161,8 @@ def add_progressive_loading_image(
         **layer_kwargs,
     )
     layer._max_tile_extent_3d = _tile_extent_3d_for(
-        data.dtype, min(interval_max_bytes, tile_max_bytes_3d)
+        data.dtype,
+        min(interval_max_bytes, tile_max_bytes_3d),
     )
     viewer.layers.append(layer)
     # Slice off the main thread: refreshes materialize the visible tile

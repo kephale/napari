@@ -64,6 +64,7 @@ def tile_bounds(level, coords, max_level, min_coord=-2.5, max_coord=2.5):
         the minimum coordinate of all tiles
     max_coord : float
         the maximum coordinate of all tiles
+
     """
     max_width = max_coord - min_coord
     tile_width = max_width / 2 ** (max_level - level)
@@ -116,7 +117,7 @@ def mandelbrot(out, from_x, from_y, to_x, to_y, grid_size, maxiter):
 # Based on http://www.fractal.org/Formula-Mandelbulb.pdf
 @njit(nogil=True, fastmath=True, cache=True)
 def mandelbulb(
-    out, from_x, from_y, from_z, to_x, to_y, to_z, grid_size, maxiter, order
+    out, from_x, from_y, from_z, to_x, to_y, to_z, grid_size, maxiter, order,
 ):
     """Fill ``out`` with Mandelbulb escape iteration counts.
 
@@ -199,6 +200,7 @@ class GenerativeZarrStore(MemoryStore):
         the computation used. Chunk synthesis is pure compute, and many
         parallel readers can otherwise saturate every core and starve the
         GUI event loop. ``0`` disables pacing.
+
     """
 
     def __init__(
@@ -296,7 +298,7 @@ class MandelbrotStore(GenerativeZarrStore):
     """A multiscale zarr store generating the Mandelbrot set on demand."""
 
     def __init__(
-        self, levels: int, tilesize: int, maxiter: int = 255, **kwargs
+        self, levels: int, tilesize: int, maxiter: int = 255, **kwargs,
     ):
         super().__init__(levels, tilesize, maxiter, ndim=2, **kwargs)
 
@@ -333,10 +335,10 @@ class MandelbulbStore(GenerativeZarrStore):
     def get_chunk(self, level: int, *coords: int) -> np.ndarray:
         z, y, x = coords
         bounds = tile_bounds(
-            level, np.array([z, y, x]), self.levels, -1.25, 1.25
+            level, np.array([z, y, x]), self.levels, -1.25, 1.25,
         )
         out = np.zeros(
-            self.tilesize * self.tilesize * self.tilesize, dtype=self.dtype
+            self.tilesize * self.tilesize * self.tilesize, dtype=self.dtype,
         )
         tile = mandelbulb(
             out,
