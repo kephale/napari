@@ -1497,7 +1497,7 @@ def test_tile_extent_quantized(qtbot, make_napari_viewer):
     layer._max_tile_extent_3d = 322  # like a 33MB uint8 cap
 
     sizes = set()
-    for view_extent in (123, 124, 127, 96, 100, 130):
+    for view_extent in (123, 124, 127, 96, 100, 130, 60):
         bbox = np.array(
             [[0.0, 0.0, 0.0], [float(view_extent)] * 3], dtype=float
         )
@@ -1506,7 +1506,8 @@ def test_tile_extent_quantized(qtbot, make_napari_viewer):
         )
         size = tuple(corners[1, [0, 1, 2]] - corners[0, [0, 1, 2]] + 1)
         sizes.add(size)
-        # every axis extent is a multiple of 32 (or a stable cap)
-        assert all(s % 32 == 0 or s in (322, 512) for s in size)
-    # 123/124/127 collapse to one shape; 96/100/130 to two more
-    assert len(sizes) <= 3
+        # every axis extent comes from the quantized vocabulary (a
+        # multiple of 64, at least 128) or a stable cap
+        assert all((s % 64 == 0 and s >= 128) or s in (322, 512) for s in size)
+    # 60/96/100/123/124/127 all collapse to 128; 130 to 192
+    assert sizes == {(128, 128, 128), (192, 192, 192)}

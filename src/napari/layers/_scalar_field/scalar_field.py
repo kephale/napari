@@ -54,12 +54,18 @@ __all__ = ('ScalarFieldBase',)
 #: zooms do not thrash on tiny slices.
 _MIN_TILE_EXTENT_3D = 32
 
-#: 3D sub-volume tile extents are rounded up to a multiple of this, so
-#: consecutive camera poses produce tiles with repeating shapes. The
+#: 3D sub-volume tile extents are rounded up to a multiple of this (and
+#: to at least ``_MIN_QUANTIZED_TILE_EXTENT_3D``), so consecutive camera
+#: poses produce tiles from a small repeating shape vocabulary. The
 #: viewport-derived extent otherwise jitters by a few voxels per pose,
 #: and every new texture shape costs a GPU (re)allocation — a pipeline
 #: synchronization on slow drivers — and defeats texture reuse/pooling.
-_TILE_EXTENT_QUANTUM_3D = 32
+_TILE_EXTENT_QUANTUM_3D = 64
+
+#: Lower bound for *quantized* tile extents (bounded by the level shape
+#: and extent cap): a 128^3 uint8 tile is ~2 MB — cheap enough that
+#: smaller shape variants (e.g. 96) are not worth a distinct texture.
+_MIN_QUANTIZED_TILE_EXTENT_3D = 128
 
 
 def _make_level_materializer(
@@ -647,7 +653,10 @@ class ScalarFieldBase(Layer, ABC):
         quantum = _TILE_EXTENT_QUANTUM_3D
         tile_extent = np.asarray(tile_extent, dtype=np.int64)
         tile_extent = np.minimum(
-            -(-tile_extent // quantum) * quantum,
+            np.maximum(
+                -(-tile_extent // quantum) * quantum,
+                _MIN_QUANTIZED_TILE_EXTENT_3D,
+            ),
             np.minimum(shape_at_level, extent_cap),
         )
         center = np.clip(center, 0, shape_at_level - 1)
