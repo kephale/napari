@@ -1040,3 +1040,67 @@ def test_double_buffer_disabled_by_env(
     _wait_for_idle_loader(qtbot, loader)
     assert loader._texture_patches > 0
     assert loader._dbuf is None
+
+
+# ---------- interactive render quality (LOD) ----------
+
+
+def test_interactive_step_degrades_and_restores(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    node = loader._get_volume_node()
+    assert node is not None
+    base_step = float(node.relative_step_size)
+
+    loader._on_interaction()
+    assert loader._saved_step is not None
+    assert float(node.relative_step_size) == pytest.approx(
+        base_step * loader._interactive_step_rate
+    )
+    # repeated interaction events do not compound the degradation
+    loader._on_interaction()
+    assert float(node.relative_step_size) == pytest.approx(
+        base_step * loader._interactive_step_rate
+    )
+
+    loader._end_hold()
+    assert loader._saved_step is None
+    assert float(node.relative_step_size) == pytest.approx(base_step)
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_interactive_step_disabled(
+    qtbot, make_napari_viewer, multiscale_3d_arrays, monkeypatch
+):
+    monkeypatch.setenv('NAPARI_PROGRESSIVE_INTERACTIVE_STEP', '1')
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    node = loader._get_volume_node()
+    base_step = float(node.relative_step_size)
+    loader._on_interaction()
+    assert loader._interactive_step_rate is None
+    assert loader._saved_step is None
+    assert float(node.relative_step_size) == pytest.approx(base_step)
+    loader._end_hold()
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_interactive_step_not_applied_in_2d(
+    qtbot, make_napari_viewer, multiscale_arrays
+):
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    loader._on_interaction()
+    assert loader._saved_step is None
+    loader._end_hold()
+    _wait_for_idle_loader(qtbot, loader)

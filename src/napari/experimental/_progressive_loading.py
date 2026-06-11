@@ -38,6 +38,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING
 
@@ -46,6 +47,9 @@ from psygnal import debounced
 from qtpy.QtCore import QTimer
 from superqt import ensure_main_thread
 
+# imported at module load: a lazy first-use import inside a fetch pass
+# costs seconds of main-thread time under fetch-thread GIL pressure
+from napari.experimental._texture_swap import DoubleBufferedVolumeTexture
 from napari.experimental._virtual_data import (
     MultiScaleVirtualData,
     VirtualData,
@@ -580,6 +584,16 @@ class ProgressiveLoader:
         event cascades, and fetch-thread GIL pressure. The
         ``NAPARI_PROGRESSIVE_HOLD`` environment variable overrides
         (``0`` disables).
+    interactive_step_rate : float
+        Multiply the volume raycast step size by this factor while the
+        user interacts, restoring full quality when interaction
+        settles (interactive level-of-detail, as in ParaView/Slicer).
+        Raycast cost scales inversely with step size, so 4.0 means
+        roughly 4x cheaper GPU frames during drags — on saturated GPUs
+        the deep command queue behind expensive frames is what blocks
+        the main thread in otherwise-innocent GL calls. 1.0 (or 0)
+        disables. The ``NAPARI_PROGRESSIVE_INTERACTIVE_STEP``
+        environment variable overrides.
     """
 
     def __init__(
@@ -600,6 +614,7 @@ class ProgressiveLoader:
         tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
         max_bytes_per_second: float | None = None,
         interaction_hold: bool = True,
+        interactive_step_rate: float = 4.0,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -651,6 +666,17 @@ class ProgressiveLoader:
             else True
         )
         self._dbuf = None
+        env_step = os.environ.get('NAPARI_PROGRESSIVE_INTERACTIVE_STEP')
+        if env_step:
+            interactive_step_rate = float(env_step)
+        self._interactive_step_rate = (
+            float(interactive_step_rate)
+            if interactive_step_rate and float(interactive_step_rate) > 1.0
+            else None
+        )
+        # (weakref to volume node, saved relative_step_size) while the
+        # interactive quality reduction is applied
+        self._saved_step: tuple | None = None
         # interaction hold: extended by every camera/scrub event, ended
         # by the debounced _check once interaction settles
         self._hold_until = 0.0
@@ -760,6 +786,7 @@ class ProgressiveLoader:
             self._debounced_check.cancel()
         self._release_auto_level()
         self._cancel_active()
+        self._restore_render_quality()
         if self._dbuf is not None:
             with contextlib.suppress(Exception):
                 self._dbuf.close()
@@ -1091,13 +1118,49 @@ class ProgressiveLoader:
             for limiter in (self._limiter, self._resident_limiter):
                 if limiter is not None:
                     limiter.pause()
+            self._degrade_render_quality()
         from napari.experimental import _glir_metering
 
         if _glir_metering.is_installed():
             _glir_metering.hold_uploads_until(self._hold_until)
 
+    def _degrade_render_quality(self) -> None:
+        """Coarsen the raycast step while interacting (interactive LOD).
+
+        Raycast cost scales inversely with the step size; on a
+        saturated GPU the deep command queue behind expensive frames is
+        what blocks the main thread in otherwise-cheap GL calls
+        (glBufferSubData, glFlush). Quality is restored on settle.
+        """
+        if self._interactive_step_rate is None or self._saved_step is not None:
+            return
+        if self._viewer.dims.ndisplay != 3:
+            return
+        node = self._get_volume_node()
+        if node is None:
+            return
+        try:
+            saved = float(node.relative_step_size)
+            node.relative_step_size = saved * self._interactive_step_rate
+        except Exception:  # noqa: BLE001 # pragma: no cover - node variant
+            return
+        self._saved_step = (weakref.ref(node), saved)
+
+    def _restore_render_quality(self) -> None:
+        if self._saved_step is None:
+            return
+        node_ref, saved = self._saved_step
+        self._saved_step = None
+        node = node_ref()
+        if node is None:
+            return
+        with contextlib.suppress(Exception):  # pragma: no cover - GL
+            node.relative_step_size = saved
+            node.update()
+
     def _end_hold(self) -> None:
         self._hold_until = 0.0
+        self._restore_render_quality()
         for limiter in (self._limiter, self._resident_limiter):
             if limiter is not None:
                 limiter.resume()
@@ -1592,10 +1655,6 @@ class ProgressiveLoader:
 
     def _ensure_dbuf(self, node):
         """(Re)build the double-buffered texture pair for ``node``."""
-        from napari.experimental._texture_swap import (
-            DoubleBufferedVolumeTexture,
-        )
-
         dbuf = self._dbuf
         tex_shape = tuple(node._texture.shape[:3])
         if dbuf is not None and dbuf.matches(node) and dbuf.shape == tex_shape:
@@ -1866,6 +1925,7 @@ def add_progressive_loading_image(
     tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
     max_bytes_per_second: float | None = None,
     interaction_hold: bool = True,
+    interactive_step_rate: float = 4.0,
     **layer_kwargs,
 ):
     """Add a progressively loading multiscale image to a viewer.
@@ -1915,6 +1975,11 @@ def add_progressive_loading_image(
         Suspend all streaming work while the user interacts (see
         :class:`ProgressiveLoader`). ``NAPARI_PROGRESSIVE_HOLD=0``
         disables.
+    interactive_step_rate : float
+        Coarsen the volume raycast step by this factor during
+        interaction, restoring full quality on settle (see
+        :class:`ProgressiveLoader`). 1.0 disables;
+        ``NAPARI_PROGRESSIVE_INTERACTIVE_STEP`` overrides.
     **layer_kwargs
         Additional keyword arguments passed to ``viewer.add_image``.
 
@@ -1999,6 +2064,7 @@ def add_progressive_loading_image(
         tile_max_bytes_3d=tile_max_bytes_3d,
         max_bytes_per_second=max_bytes_per_second,
         interaction_hold=interaction_hold,
+        interactive_step_rate=interactive_step_rate,
     )
     layer.metadata['progressive_loader'] = loader
     with contextlib.suppress(AttributeError):
