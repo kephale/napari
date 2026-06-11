@@ -724,8 +724,11 @@ class DoubleBufferedImageTexture:
         # the old front is unbound now: re-spec it for future staging
         # (allocation only, no pixel upload)
         old_front.resize(new_shape, internalformat=internalformat)
-        self._log = []
-        self._applied = {id(self._front): 0, id(self._back): 0}
+        # keep the full rewrite in the log: the new back has undefined
+        # content after its re-spec and must replay it before the next
+        # present() may swap it in (the front already applied it above)
+        self._log = [(None, data)]
+        self._applied = {id(self._front): 1, id(self._back): 0}
         # geometry follows the data shape
         node._need_vertex_update = True
         with contextlib.suppress(Exception):

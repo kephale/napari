@@ -375,6 +375,51 @@ def test_deletes_deferred_to_quiet_flush(monkeypatch):
         gm.uninstall()
 
 
+def test_delete_drain_is_paced(monkeypatch):
+    """A big delete backlog drains a few per quiet flush, not all at
+    once — each deletion can sync the GPU pipeline, so a bulk drain is
+    itself a multi-second stall at pass end.
+    """
+    monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
+    parser = FakeParser()
+    parser.add_texture3d(1)
+    try:
+        assert gm.install(
+            frame_budget_bytes=512 * 2**10, slab_bytes=128 * 2**10
+        )
+        queue = glir.GlirQueue()
+        data = np.zeros((16, 256, 256), dtype=np.uint8)  # 1 MiB
+        queue.command('DATA', 1, (0, 0, 0), data)
+        n_deletes = gm.DELETE_DRAIN_PER_FLUSH * 2 + 3
+        for i in range(n_deletes):
+            queue.command('DELETE', 100 + i)
+        queue.flush(parser)  # busy: uploads spent, deletes held
+        state = gm._states[parser]
+        assert len(state.deferred_deletes) == n_deletes
+        # drain the upload carry
+        while state.carry:
+            state.reset_budget()
+            queue.flush(parser)
+        executed_deletes = lambda: sum(  # noqa: E731
+            c[0] == 'DELETE' for c in parser.executed
+        )
+        before = executed_deletes()
+        state.reset_budget()
+        queue.flush(parser)  # quiet: paced batch only
+        assert executed_deletes() - before == gm.DELETE_DRAIN_PER_FLUSH
+        assert len(state.deferred_deletes) == (
+            n_deletes - gm.DELETE_DRAIN_PER_FLUSH
+        )
+        # subsequent quiet flushes drain the rest
+        for _ in range(3):
+            state.reset_budget()
+            queue.flush(parser)
+        assert not state.deferred_deletes
+        assert executed_deletes() == n_deletes
+    finally:
+        gm.uninstall()
+
+
 def test_uninstall_flushes_deferred_deletes(monkeypatch):
     monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
     parser = FakeParser()

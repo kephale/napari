@@ -51,6 +51,12 @@ _FACTORY_FRAME_BUDGET_BYTES = 4 * 2**20
 _FACTORY_SLAB_BYTES = 1 * 2**20
 DEFAULT_FRAME_BUDGET_BYTES = _FACTORY_FRAME_BUDGET_BYTES
 DEFAULT_SLAB_BYTES = _FACTORY_SLAB_BYTES
+#: Deferred GL object deletions executed per quiet flush. Deletion can
+#: sync the GPU pipeline, so the backlog drains a few per frame instead
+#: of all at once (env: NAPARI_GLIR_DELETES_PER_FLUSH).
+DELETE_DRAIN_PER_FLUSH = int(
+    os.environ.get('NAPARI_GLIR_DELETES_PER_FLUSH', 8),
+)
 #: 2D texture DATA at or above this size is metered like 3D uploads.
 #: Small 2D textures (colormap LUTs, interpolation kernels) MUST stay
 #: synchronous: deferring them leaves a shader sampling an unwritten
@@ -433,10 +439,18 @@ def _metered_flush(self, parser):
         and state.budget_left >= state.frame_budget
     ):
         # a quiet flush (no uploads this frame, no interaction): run
-        # the held GL object deletions now, off the busy periods
-        deletes, state.deferred_deletes = state.deferred_deletes, []
+        # held GL object deletions now, off the busy periods. PACED:
+        # each delete can sync the GPU pipeline (~10-25ms on busy macOS
+        # GL-over-Metal), so draining hundreds in one flush is itself a
+        # multi-second stall — exactly at pass end, when the queue is
+        # deepest. The remainder drains over subsequent redraws.
+        n = DELETE_DRAIN_PER_FLUSH
+        deletes = state.deferred_deletes[:n]
+        state.deferred_deletes = state.deferred_deletes[n:]
         for command in deletes:
             parser._parse(command)
+        if state.deferred_deletes and canvas is not None:
+            canvas.update()
 
 
 def install(
