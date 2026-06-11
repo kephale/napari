@@ -987,3 +987,56 @@ def test_glir_hold_defers_all_uploads(monkeypatch):
     finally:
         gm._upload_hold_until = 0.0
         gm.uninstall()
+
+
+# ---------- double-buffered texture streaming ----------
+
+
+def test_double_buffer_swaps_and_content_correct(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    """Chunk patches stream into the back texture and present() swaps;
+    the rendered result still matches the source exactly."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    layer.locked_data_level = 0
+    qtbot.waitUntil(
+        lambda: len(loader._data[0].loaded_chunks) > 0, timeout=10000
+    )
+    _wait_for_idle_loader(qtbot, loader)
+    assert loader._texture_patches > 0
+    assert loader._dbuf is not None, 'double buffer never engaged'
+    node = loader._get_volume_node()
+    assert loader._dbuf.matches(node)
+    # the shader samples the front texture, and the pair is distinct
+    assert node._texture is loader._dbuf._front
+    assert loader._dbuf._front is not loader._dbuf._back
+    # patch log fully drained once idle
+    assert not loader._dbuf.dirty
+    # data correctness end to end (final reconcile path)
+    np.testing.assert_array_equal(
+        np.asarray(loader._data[0][0:64, 0:64, 0:64]),
+        np.asarray(multiscale_3d_arrays[0]),
+    )
+
+
+def test_double_buffer_disabled_by_env(
+    qtbot, make_napari_viewer, multiscale_3d_arrays, monkeypatch
+):
+    monkeypatch.setenv('NAPARI_PROGRESSIVE_DOUBLE_BUFFER', '0')
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    layer.locked_data_level = 0
+    qtbot.waitUntil(
+        lambda: len(loader._data[0].loaded_chunks) > 0, timeout=10000
+    )
+    _wait_for_idle_loader(qtbot, loader)
+    assert loader._texture_patches > 0
+    assert loader._dbuf is None

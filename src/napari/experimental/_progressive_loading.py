@@ -638,6 +638,19 @@ class ProgressiveLoader:
         if env_hold is not None:
             interaction_hold = env_hold not in ('0', 'false', '')
         self._interaction_hold = bool(interaction_hold)
+        # Double-buffered volume texture: chunks stream into a back
+        # texture while draws sample a stable front texture; presenting
+        # swaps the sampler binding. Writing to a texture the GPU is
+        # sampling forces driver sync/ghosting on macOS GL-over-Metal —
+        # the dominant draw() stall. NAPARI_PROGRESSIVE_DOUBLE_BUFFER=0
+        # disables for A/B profiling.
+        env_dbuf = os.environ.get('NAPARI_PROGRESSIVE_DOUBLE_BUFFER')
+        self._double_buffer = (
+            env_dbuf not in ('0', 'false', '')
+            if env_dbuf is not None
+            else True
+        )
+        self._dbuf = None
         # interaction hold: extended by every camera/scrub event, ended
         # by the debounced _check once interaction settles
         self._hold_until = 0.0
@@ -747,6 +760,10 @@ class ProgressiveLoader:
             self._debounced_check.cancel()
         self._release_auto_level()
         self._cancel_active()
+        if self._dbuf is not None:
+            with contextlib.suppress(Exception):
+                self._dbuf.close()
+            self._dbuf = None
         if self._resident_limiter is not None:
             self._resident_limiter.cancel()
             self._resident_limiter = None
@@ -1561,15 +1578,60 @@ class ProgressiveLoader:
                 )
                 with vdata.lock:
                     sub = np.ascontiguousarray(vdata.hyperslice[source])
-            texture.set_data(sub, offset=offset)
+            dbuf = self._ensure_dbuf(node) if self._double_buffer else None
+            if dbuf is not None:
+                # stream into the back texture; draws keep sampling the
+                # untouched front texture until the next present()
+                dbuf.stage(offset, sub)
+            else:
+                texture.set_data(sub, offset=offset)
         except Exception:  # noqa: BLE001 # pragma: no cover - GL mismatch
             return False
         self._texture_patches += 1
         return True
 
+    def _ensure_dbuf(self, node):
+        """(Re)build the double-buffered texture pair for ``node``."""
+        from napari.experimental._texture_swap import (
+            DoubleBufferedVolumeTexture,
+        )
+
+        dbuf = self._dbuf
+        tex_shape = tuple(node._texture.shape[:3])
+        if dbuf is not None and dbuf.matches(node) and dbuf.shape == tex_shape:
+            return dbuf
+        if dbuf is not None:
+            with contextlib.suppress(Exception):
+                dbuf.close()
+            self._dbuf = None
+        try:
+            dbuf = DoubleBufferedVolumeTexture(node)
+            dbuf.attach_set_data()
+        except Exception:  # noqa: BLE001 - unexpected texture class
+            LOGGER.warning(
+                'texture double buffering unavailable; falling back to '
+                'in-place texture patches',
+                exc_info=True,
+            )
+            self._double_buffer = False
+            return None
+        self._dbuf = dbuf
+        return dbuf
+
     def _update_node(self) -> None:
         node = self._get_volume_node()
         if node is not None:
+            if self._dbuf is not None and self._dbuf.matches(node):
+                try:
+                    self._dbuf.present()
+                except Exception:  # noqa: BLE001 # pragma: no cover - GL
+                    LOGGER.warning(
+                        'texture present failed; dropping double buffer',
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        self._dbuf.close()
+                    self._dbuf = None
             node.update()
 
     def _refresh(self, final: bool = False, force: bool = False) -> None:
