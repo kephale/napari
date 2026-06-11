@@ -27,11 +27,20 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import time
 
 import numpy as np
 
 LOGGER = logging.getLogger('napari.experimental._texture_swap')
+
+#: Retired textures kept for reuse instead of deleted. GL object
+#: deletion synchronizes with the GPU pipeline (profiled ~25ms per
+#: DELETE on busy macOS GL-over-Metal), and reallocation costs another
+#: sync — so zooming back and forth across two levels would otherwise
+#: pay 4 syncs per switch. Bounded GPU memory cost: at most this many
+#: spare tiles. NAPARI_PROGRESSIVE_TEXTURE_POOL overrides (0 disables).
+DEFAULT_TEXTURE_POOL_SIZE = 4
 
 
 class DoubleBufferedVolumeTexture:
@@ -66,6 +75,13 @@ class DoubleBufferedVolumeTexture:
         # the new texture's uploads have drained (or the deadline hits)
         self._reshape_pending = False
         self._reshape_deadline = 0.0
+        # retired-texture pool: list of (key, texture), most recent
+        # last; reused by _acquire instead of delete + reallocate
+        self._pool: list[tuple] = []
+        env_pool = os.environ.get('NAPARI_PROGRESSIVE_TEXTURE_POOL')
+        self._pool_max = (
+            int(env_pool) if env_pool else DEFAULT_TEXTURE_POOL_SIZE
+        )
 
     # -- construction helpers --
 
@@ -102,6 +118,9 @@ class DoubleBufferedVolumeTexture:
         tex = node._create_texture(texture_format, rep)
         tex.resize(tuple(vol.shape[:3]))
         tex._data_dtype = vol.dtype
+        return self._sync_aux_state(tex)
+
+    def _sync_aux_state(self, tex):
         front = self._front
         if front.clim is not None:
             with contextlib.suppress(Exception):
@@ -109,6 +128,35 @@ class DoubleBufferedVolumeTexture:
         if tex.interpolation != front.interpolation:
             tex.interpolation = front.interpolation
         return tex
+
+    # -- retired-texture pool --
+
+    @staticmethod
+    def _pool_key(shape, dtype) -> tuple:
+        return (tuple(shape)[:3], np.dtype(dtype).str)
+
+    def _acquire(self, shape, dtype, create):
+        """Reuse a retired texture of this shape/dtype, or create one."""
+        key = self._pool_key(shape, dtype)
+        for i in range(len(self._pool) - 1, -1, -1):
+            if self._pool[i][0] == key:
+                _, tex = self._pool.pop(i)
+                return self._sync_aux_state(tex)
+        return create()
+
+    def _release(self, texture) -> None:
+        """Retire a texture for reuse (delete only past the pool cap)."""
+        dtype = getattr(texture, '_data_dtype', None)
+        if self._pool_max <= 0 or dtype is None:
+            with contextlib.suppress(Exception):
+                texture.delete()
+            return
+        key = self._pool_key(texture.shape, dtype)
+        self._pool.append((key, texture))
+        while len(self._pool) > self._pool_max:
+            _, old = self._pool.pop(0)
+            with contextlib.suppress(Exception):
+                old.delete()
 
     @property
     def shape(self) -> tuple:
@@ -166,11 +214,14 @@ class DoubleBufferedVolumeTexture:
         re-uploads the texture the GPU is sampling.
         """
         node = self._node
-        new_back = self._make_texture_like(node, vol)
+        new_back = self._acquire(
+            vol.shape,
+            vol.dtype,
+            lambda: self._make_texture_like(node, vol),
+        )
         old_back = self._back
         if old_back is not self._front:
-            with contextlib.suppress(Exception):
-                old_back.delete()
+            self._release(old_back)
         self._back = new_back
         self._shape = tuple(vol.shape[:3])
         self._log = [(None, vol, clim)]
@@ -254,12 +305,16 @@ class DoubleBufferedVolumeTexture:
         node.shared_program['u_shape'] = (x, y, z)
         node._vol_shape = self._shape
         node._need_vertex_update = True
-        with contextlib.suppress(Exception):
-            old_front.delete()
         self._front = back
+        self._release(old_front)
         self._reshape_pending = False
-        # rebuild the spare at the new shape and converge it
-        self._back = self._make_sibling(node, back)
+        # rebuild the spare at the new shape and converge it (reusing a
+        # retired same-shape texture when available)
+        self._back = self._acquire(
+            back.shape,
+            getattr(back, '_data_dtype', np.float32),
+            lambda: self._make_sibling(node, back),
+        )
         self._applied = {
             id(self._front): self._applied[id(back)],
             id(self._back): 0,
@@ -371,3 +426,7 @@ class DoubleBufferedVolumeTexture:
         if self._back is not self._front:
             with contextlib.suppress(Exception):  # pragma: no cover
                 self._back.delete()
+        for _key, tex in self._pool:
+            with contextlib.suppress(Exception):  # pragma: no cover
+                tex.delete()
+        self._pool = []

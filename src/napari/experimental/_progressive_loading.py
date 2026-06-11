@@ -2120,6 +2120,13 @@ def add_progressive_loading_image(
 
         viewer = Viewer()
 
+    # env override so render-cost sweeps need no code changes: at 33MB
+    # a full-quality raycast frame profiled at ~69ms on Apple Silicon
+    # GL-over-Metal; an 8MB tile is ~4x cheaper per frame
+    env_tile = os.environ.get('NAPARI_PROGRESSIVE_TILE_MAX_BYTES_3D')
+    if env_tile:
+        tile_max_bytes_3d = int(float(env_tile))
+
     data = MultiScaleVirtualData(img)
 
     # vispy renders with float32: world extents beyond 2**24 lose pixel

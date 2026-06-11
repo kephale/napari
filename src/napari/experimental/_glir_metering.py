@@ -56,6 +56,40 @@ _OBJECT_COMMANDS = frozenset(
     {'DATA', 'SIZE', 'WRAPPING', 'INTERPOLATION', 'DELETE'},
 )
 
+# GL state setters that are idempotent: re-issuing the same call with
+# the same arguments is semantically a no-op, but on a busy GPU each
+# call can block on pipeline synchronization (profiled at ~6ms average
+# on macOS GL-over-Metal; 271 calls cost 1.6s in one short session).
+# Consecutive duplicates are skipped. glEnable/glDisable are handled
+# per capability. Deliberately NOT listed: glClear*, glViewport,
+# glScissor, glFinish, glFlush (must always run or are
+# framebuffer-dependent).
+_IDEMPOTENT_FUNCS = frozenset(
+    {
+        'glBlendFunc',
+        'glBlendFuncSeparate',
+        'glBlendEquation',
+        'glBlendEquationSeparate',
+        'glBlendColor',
+        'glDepthFunc',
+        'glDepthMask',
+        'glDepthRange',
+        'glCullFace',
+        'glFrontFace',
+        'glLineWidth',
+        'glPolygonOffset',
+        'glColorMask',
+        'glStencilFunc',
+        'glStencilFuncSeparate',
+        'glStencilMask',
+        'glStencilMaskSeparate',
+        'glStencilOp',
+        'glStencilOpSeparate',
+        'glHint',
+        'glSampleCoverage',
+    }
+)
+
 _original_flush = None
 _hooked_canvases: weakref.WeakSet = weakref.WeakSet()
 # while time.monotonic() < this, defer ALL metered texture uploads
@@ -131,6 +165,9 @@ class _ParserState:
         self.budget_left = self.frame_budget
         self.carry: list[tuple] = []
         self.last_reset = time.perf_counter()
+        # last-applied GL state for the redundant-FUNC filter; cleared
+        # whenever the context is made current
+        self.gl_state: dict = {}
 
     def reset_budget(self):
         self.budget_left = self.frame_budget
@@ -219,12 +256,30 @@ def _metered_parse(parser, commands, state, force_defer=False):
 
     deferred_ids = set()
     leftover = []
+    gl_state = state.gl_state
     for command in commands:
         cmd = command[0]
         id_ = command[1] if len(command) > 1 else None
         if id_ in deferred_ids and cmd in _OBJECT_COMMANDS:
             leftover.append(command)
             continue
+        if cmd == 'FUNC':
+            # skip GL state calls that match the last-applied state: on
+            # a busy GPU even redundant glEnable/glBlendFunc calls
+            # block on pipeline sync
+            if id_ in ('glEnable', 'glDisable') and len(command) == 3:
+                key = ('cap', command[2])
+                if gl_state.get(key) == id_:
+                    continue
+                gl_state[key] = id_
+            elif id_ in _IDEMPOTENT_FUNCS:
+                key = ('fn', id_)
+                if gl_state.get(key) == command[2:]:
+                    continue
+                gl_state[key] = command[2:]
+        elif cmd == 'CURRENT':
+            # context switch: cached GL state is no longer trustworthy
+            gl_state.clear()
         if cmd == 'DATA':
             ob = parser._objects.get(id_, None)
             if _is_metered_texture(ob):

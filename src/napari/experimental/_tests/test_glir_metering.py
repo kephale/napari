@@ -205,7 +205,8 @@ def test_metered_flush_carries_and_drains(monkeypatch):
     parser.add_texture3d(1)
     try:
         assert gm.install(
-            frame_budget_bytes=512 * 2**10, slab_bytes=128 * 2**10,
+            frame_budget_bytes=512 * 2**10,
+            slab_bytes=128 * 2**10,
         )
         queue = glir.GlirQueue()
         data = np.zeros((16, 256, 256), dtype=np.uint8)  # 1 MiB
@@ -230,7 +231,8 @@ def test_metered_flush_new_size_cancels_carry(monkeypatch):
     parser.add_texture3d(1)
     try:
         assert gm.install(
-            frame_budget_bytes=512 * 2**10, slab_bytes=128 * 2**10,
+            frame_budget_bytes=512 * 2**10,
+            slab_bytes=128 * 2**10,
         )
         queue = glir.GlirQueue()
         data = np.zeros((16, 256, 256), dtype=np.uint8)  # 1 MiB
@@ -252,3 +254,38 @@ def test_metered_flush_new_size_cancels_carry(monkeypatch):
         assert data_bytes(parser.executed) == 512 * 2**10 + small.nbytes
     finally:
         gm.uninstall()
+
+
+def test_redundant_gl_state_calls_skipped(parser):
+    state = make_state(budget=2**20, slab=2**20)
+    commands = [
+        ('FUNC', 'glEnable', 'blend'),
+        ('FUNC', 'glBlendFunc', 'src_alpha', 'one_minus_src_alpha'),
+        ('FUNC', 'glEnable', 'blend'),  # duplicate: skipped
+        ('FUNC', 'glBlendFunc', 'src_alpha', 'one_minus_src_alpha'),  # dup
+        ('FUNC', 'glEnable', 'depth_test'),  # different capability: kept
+        ('FUNC', 'glDisable', 'blend'),  # state transition: kept
+        ('FUNC', 'glEnable', 'blend'),  # transition back: kept
+        ('FUNC', 'glBlendFunc', 'one', 'one'),  # changed args: kept
+        ('FUNC', 'glClear', 17664),  # never cached
+        ('FUNC', 'glClear', 17664),
+    ]
+    leftover = gm._metered_parse(parser, commands, state)
+    assert leftover == []
+    executed = [c[1:] for c in parser.executed]
+    assert executed == [
+        ('glEnable', 'blend'),
+        ('glBlendFunc', 'src_alpha', 'one_minus_src_alpha'),
+        ('glEnable', 'depth_test'),
+        ('glDisable', 'blend'),
+        ('glEnable', 'blend'),
+        ('glBlendFunc', 'one', 'one'),
+        ('glClear', 17664),
+        ('glClear', 17664),
+    ]
+    # the cache persists across flushes (GL state is per-context)
+    leftover = gm._metered_parse(
+        parser, [('FUNC', 'glBlendFunc', 'one', 'one')], state
+    )
+    assert leftover == []
+    assert len(parser.executed) == 8

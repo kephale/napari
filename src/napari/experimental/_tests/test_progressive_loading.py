@@ -1445,3 +1445,42 @@ def test_reshape_waits_for_backlog_drain(
     assert node._vol_shape == new_shape
     assert not dbuf.dirty
     loader.close()
+
+
+def test_reshape_reuses_pooled_textures(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    """Zooming between two tile shapes reuses retired textures instead
+    of delete + reallocate (each costs a GPU sync on busy drivers)."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    layer.locked_data_level = 1 if int(layer.data_level) == 0 else 0
+    qtbot.waitUntil(lambda: loader._dbuf is not None, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+    dbuf = loader._dbuf
+    node = loader._get_volume_node()
+    shape_a = dbuf.shape
+    shape_b = tuple(s // 2 for s in shape_a)
+
+    created = []
+    orig_create = node._create_texture
+
+    def counting_create(*args, **kwargs):
+        tex = orig_create(*args, **kwargs)
+        created.append(tex)
+        return tex
+
+    node._create_texture = counting_create
+    node.set_data(np.zeros(shape_b, dtype=np.uint8))  # a -> b
+    assert not dbuf._reshape_pending
+    first_round = len(created)
+    assert first_round >= 1  # b-shaped textures had to be created
+    node.set_data(np.ones(shape_a, dtype=np.uint8))  # b -> a (pool hit)
+    node.set_data(np.ones(shape_b, dtype=np.uint8))  # a -> b (pool hit)
+    assert len(created) == first_round, 'pool miss: textures reallocated'
+    assert dbuf.shape == shape_b
+    assert tuple(node._texture.shape[:3]) == shape_b
+    loader.close()
