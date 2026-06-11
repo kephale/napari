@@ -61,6 +61,54 @@ _hooked_canvases: weakref.WeakSet = weakref.WeakSet()
 _upload_hold_until = 0.0
 
 
+# weak callbacks invoked (on the GL/main thread) when a parser's upload
+# carry fully drains; used to restore interactive render LOD without a
+# polling timer
+_drain_callbacks: list = []
+
+
+def add_drain_callback(method) -> None:
+    """Register a bound method to call when an upload carry drains."""
+    ref = weakref.WeakMethod(method)
+    if all(ref != existing for existing in _drain_callbacks):
+        _drain_callbacks.append(ref)
+
+
+def remove_drain_callback(method) -> None:
+    _drain_callbacks[:] = [
+        ref
+        for ref in _drain_callbacks
+        if ref() is not None and ref() != method
+    ]
+
+
+def _notify_drained() -> None:
+    alive = []
+    for ref in _drain_callbacks:
+        cb = ref()
+        if cb is None:
+            continue
+        alive.append(ref)
+        try:
+            cb()
+        except Exception:  # noqa: BLE001 # pragma: no cover - callback bug
+            LOGGER.warning('drain callback failed', exc_info=True)
+    _drain_callbacks[:] = alive
+
+
+def pending_upload_bytes() -> int:
+    """Total bytes of carried (not yet executed) texture uploads.
+
+    Lets callers couple behavior to the upload backlog — e.g. keep the
+    interactive render LOD degraded until a level switch's full-tile
+    upload has fully drained into the GPU.
+    """
+    return sum(
+        sum(c[3].nbytes for c in state.carry if c[0] == 'DATA')
+        for state in _states.values()
+    )
+
+
 def hold_uploads_until(deadline: float) -> None:
     """Defer all metered texture uploads until ``time.monotonic()`` >= deadline.
 
@@ -252,11 +300,14 @@ def _metered_flush(self, parser):
     carry = _drop_deleted_carry(carry, new_commands)
     commands = self._filter(carry + new_commands, parser)
     holding = time.monotonic() < _upload_hold_until
+    had_carry = bool(carry)
     state.carry = _metered_parse(parser, commands, state, force_defer=holding)
 
     if state.carry and canvas is not None:
         # keep draining even without interaction
         canvas.update()
+    elif had_carry and not state.carry:
+        _notify_drained()
 
 
 def install(

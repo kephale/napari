@@ -1104,3 +1104,119 @@ def test_interactive_step_not_applied_in_2d(
     assert loader._saved_step is None
     loader._end_hold()
     _wait_for_idle_loader(qtbot, loader)
+
+
+# ---------- LOD coupled to upload backlog ----------
+
+
+def test_quality_stays_degraded_while_backlog_pending(
+    qtbot, make_napari_viewer, multiscale_3d_arrays, monkeypatch
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    node = loader._get_volume_node()
+    base_step = float(node.relative_step_size)
+
+    loader._on_interaction()
+    assert loader._saved_step is not None
+    # simulate a large pending GLIR carry: quality must NOT restore
+    monkeypatch.setattr(loader, '_upload_backlog_bytes', lambda: 64 * 2**20)
+    loader._end_hold()
+    assert loader._saved_step is not None
+    assert float(node.relative_step_size) > base_step
+    # restore is event-driven: e.g. the GLIR meter's drain notification
+    # (here exercised directly) re-checks and restores once the backlog
+    # is gone
+    monkeypatch.setattr(loader, '_upload_backlog_bytes', lambda: 0)
+    loader._maybe_restore_quality()
+    assert loader._saved_step is None
+    assert float(node.relative_step_size) == pytest.approx(base_step)
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_drain_callback_restores_quality(
+    qtbot, make_napari_viewer, multiscale_3d_arrays, monkeypatch
+):
+    """The GLIR meter's carry-drained notification restores quality."""
+    from napari.experimental import _glir_metering as gm
+
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    node = loader._get_volume_node()
+    base_step = float(node.relative_step_size)
+
+    loader._degrade_render_quality()
+    assert loader._saved_step is not None
+    # not holding, no backlog: the drain notification restores
+    gm._notify_drained()
+    assert loader._saved_step is None
+    assert float(node.relative_step_size) == pytest.approx(base_step)
+    _wait_for_idle_loader(qtbot, loader)
+
+
+def test_pass_start_degrades_quality(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    node = loader._get_volume_node()
+    base_step = float(node.relative_step_size)
+
+    degraded_steps = []
+    orig_degrade = loader._degrade_render_quality
+
+    def spy():
+        orig_degrade()
+        degraded_steps.append(float(node.relative_step_size))
+
+    loader._degrade_render_quality = spy
+    # lock to a level other than the one already rendered, forcing a
+    # new pass (with its full backdrop upload)
+    layer.locked_data_level = 1 if int(layer.data_level) == 0 else 0
+    qtbot.waitUntil(lambda: len(degraded_steps) > 0, timeout=10000)
+    assert degraded_steps[0] > base_step
+    _wait_for_idle_loader(qtbot, loader)
+    # idle with no backlog -> the poll restored full quality
+    qtbot.waitUntil(lambda: loader._saved_step is None, timeout=5000)
+    assert float(node.relative_step_size) == pytest.approx(base_step)
+
+
+def test_suppress_next_full_upload_one_shot(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    layer.locked_data_level = 0
+    qtbot.waitUntil(lambda: loader._dbuf is not None, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+    dbuf = loader._dbuf
+    node = loader._get_volume_node()
+    shape = dbuf.shape
+    vol = np.zeros(shape, dtype=np.uint8)
+
+    staged = []
+    orig_stage_full = dbuf.stage_full
+
+    def spy_stage_full(data, clim=None):
+        staged.append(data)
+        return orig_stage_full(data, clim=clim)
+
+    dbuf.stage_full = spy_stage_full
+    dbuf.suppress_next_full_upload()
+    node.set_data(vol)  # suppressed: nothing staged
+    assert staged == []
+    assert not dbuf._suppress_full
+    node.set_data(np.ones(shape, dtype=np.uint8))  # next one stages
+    assert len(staged) == 1

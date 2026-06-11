@@ -61,6 +61,7 @@ class DoubleBufferedVolumeTexture:
             id(self._back): False,
         }
         self._wrapped_set_data = None
+        self._suppress_full = False
 
     # -- construction helpers --
 
@@ -213,8 +214,16 @@ class DoubleBufferedVolumeTexture:
                 # shape/format change: textures must be re-specified
                 # through the original path; the loader rebuilds this
                 # buffer on its next patch
+                self._suppress_full = False
                 self.detach_set_data()
                 return original(vol, clim=clim, copy=copy)
+            if self._suppress_full:
+                # caller asserts the GPU pair already matches vol
+                # (every chunk was patched): skip the redundant
+                # full-tile upload entirely
+                self._suppress_full = False
+                node._last_data = vol
+                return None
             try:
                 self.stage_full(vol, clim=clim)
                 self.present()
@@ -226,6 +235,16 @@ class DoubleBufferedVolumeTexture:
 
         node.set_data = set_data_staged
         self._wrapped_set_data = original
+
+    def suppress_next_full_upload(self) -> None:
+        """Skip the next same-shape full rewrite through ``set_data``.
+
+        For when the caller knows the GPU pair already holds exactly
+        the content the rewrite would upload (e.g. the deferred
+        end-of-pass reconcile after a fully-patched pass). One-shot;
+        cleared by the next ``set_data`` whether suppressed or not.
+        """
+        self._suppress_full = True
 
     def detach_set_data(self) -> None:
         if self._wrapped_set_data is not None:

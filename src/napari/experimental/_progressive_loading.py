@@ -786,6 +786,9 @@ class ProgressiveLoader:
             self._debounced_check.cancel()
         self._release_auto_level()
         self._cancel_active()
+        from napari.experimental import _glir_metering
+
+        _glir_metering.remove_drain_callback(self._maybe_restore_quality)
         self._restore_render_quality()
         if self._dbuf is not None:
             with contextlib.suppress(Exception):
@@ -1125,12 +1128,17 @@ class ProgressiveLoader:
             _glir_metering.hold_uploads_until(self._hold_until)
 
     def _degrade_render_quality(self) -> None:
-        """Coarsen the raycast step while interacting (interactive LOD).
+        """Coarsen the raycast step while frames must stay cheap.
 
         Raycast cost scales inversely with the step size; on a
         saturated GPU the deep command queue behind expensive frames is
         what blocks the main thread in otherwise-cheap GL calls
-        (glBufferSubData, glFlush). Quality is restored on settle.
+        (glBufferSubData, glFlush). Applied during interaction AND
+        while a texture upload backlog is draining (level switches
+        stage a full tile, which the GLIR meter spreads over many
+        frames — those frames must be cheap or the drain takes tens of
+        seconds). Quality is restored by :meth:`_maybe_restore_quality`
+        once interaction has settled and the backlog is gone.
         """
         if self._interactive_step_rate is None or self._saved_step is not None:
             return
@@ -1145,6 +1153,34 @@ class ProgressiveLoader:
         except Exception:  # noqa: BLE001 # pragma: no cover - node variant
             return
         self._saved_step = (weakref.ref(node), saved)
+        # restore is event-driven, not polled: checked at hold end, per
+        # delivered batch (_update_node), at pass end, and when the
+        # GLIR meter reports its carry fully drained
+        from napari.experimental import _glir_metering
+
+        _glir_metering.add_drain_callback(self._maybe_restore_quality)
+
+    def _upload_backlog_bytes(self) -> int:
+        from napari.experimental import _glir_metering
+
+        if not _glir_metering.is_installed():
+            return 0
+        return _glir_metering.pending_upload_bytes()
+
+    def _maybe_restore_quality(self) -> None:
+        """Restore full render quality once frames can afford it."""
+        if self._saved_step is None:
+            return
+        if self._holding and not self._closed:
+            return
+        from napari.experimental import _glir_metering
+
+        if not self._closed and (
+            self._upload_backlog_bytes()
+            > _glir_metering.DEFAULT_FRAME_BUDGET_BYTES
+        ):
+            return  # still draining a big upload; keep frames cheap
+        self._restore_render_quality()
 
     def _restore_render_quality(self) -> None:
         if self._saved_step is None:
@@ -1160,7 +1196,10 @@ class ProgressiveLoader:
 
     def _end_hold(self) -> None:
         self._hold_until = 0.0
-        self._restore_render_quality()
+        # quality restores via the poll once the upload backlog (e.g.
+        # batches buffered during the drag, or a level switch's full
+        # tile) has drained — not the instant the pointer stops
+        self._maybe_restore_quality()
         for limiter in (self._limiter, self._resident_limiter):
             if limiter is not None:
                 limiter.resume()
@@ -1196,6 +1235,12 @@ class ProgressiveLoader:
             # A pass for exactly this view is in flight or already done.
             if self._needs_final_reconcile and self._worker is None:
                 self._needs_final_reconcile = False
+                if self._dbuf is not None:
+                    # every chunk of the pass was patched, so the GPU
+                    # texture already matches what this refresh would
+                    # upload — skip the redundant full-tile upload and
+                    # let the refresh only fix slice state/thumbnail
+                    self._dbuf.suppress_next_full_upload()
                 self._refresh(final=True, force=True)
             return
         self._start_fetch(level, min_coord, max_coord)
@@ -1324,12 +1369,19 @@ class ProgressiveLoader:
         self._chunks_total = len(queue)
         self._pass_all_patched = True
         self._needs_final_reconcile = False
+        if self._dbuf is not None:
+            # a new pass invalidates any pending "texture already
+            # matches" assertion from a previous reconcile
+            self._dbuf._suppress_full = False
         self._pbar = self._make_progress(
             len(queue), f'{self._layer.name}: loading level {level}'
         )
 
         # Show carried-over and backdrop content before the first chunk
-        # arrives so the canvas is never empty while fetching.
+        # arrives so the canvas is never empty while fetching. This is
+        # a full-tile texture upload: keep frames cheap while the GLIR
+        # meter drains it (quality restores once the backlog is gone).
+        self._degrade_render_quality()
         self._refresh(force=True)
 
         def apply(chunk_key, chunk, vdata=vdata):
@@ -1533,6 +1585,7 @@ class ProgressiveLoader:
         if generation != self._generation or self._closed:
             return
         self._worker = None
+        self._maybe_restore_quality()
 
     def _get_volume_node(self):
         try:
@@ -1692,6 +1745,7 @@ class ProgressiveLoader:
                         self._dbuf.close()
                     self._dbuf = None
             node.update()
+        self._maybe_restore_quality()
 
     def _refresh(self, final: bool = False, force: bool = False) -> None:
         # During interaction, defer throttled refreshes entirely (the
