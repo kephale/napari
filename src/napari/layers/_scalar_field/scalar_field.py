@@ -646,9 +646,12 @@ class ScalarFieldBase(Layer, ABC):
             # Bound the tile by the visible extent so deep zooms slice
             # (and fetch) only what is on screen. The canvas-plane bbox is
             # degenerate along the view axis, so give every axis at least
-            # the largest on-screen extent (a view-sized cube).
+            # the largest on-screen extent (a view-sized cube). A margin
+            # (set by progressive loading) adds pan slack so small camera
+            # translations stay inside the tile instead of re-slicing.
             view_extent = bbox[1] - bbox[0]
             view_extent = np.maximum(view_extent, view_extent.max())
+            view_extent = view_extent * getattr(self, '_tile_margin_3d', 1.0)
             view_extent = np.ceil(view_extent).astype(np.int64)
             if np.all(view_extent > 0):
                 tile_extent = np.minimum(

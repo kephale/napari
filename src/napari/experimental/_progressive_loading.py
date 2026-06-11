@@ -842,6 +842,14 @@ class ProgressiveLoader:
         # zoom-out exactly to the level switch of a factor-2 pyramid.
         env_margin = os.environ.get('NAPARI_PROGRESSIVE_MARGIN_2D')
         layer._render_margin_2d = float(env_margin) if env_margin else 2.0
+        # 3D tile margin: pan slack around the visible footprint, so
+        # small camera translations stay inside the current tile
+        # instead of re-slicing (jitter) and exposing void at the
+        # edges. The auto level coarsens when footprint x margin would
+        # exceed the tile cap — coverage (and slack) beat sharpness.
+        env_margin3 = os.environ.get('NAPARI_PROGRESSIVE_TILE_MARGIN_3D')
+        self._tile_margin_3d = float(env_margin3) if env_margin3 else 1.25
+        layer._tile_margin_3d = self._tile_margin_3d
 
         self._check()
 
@@ -880,7 +888,9 @@ class ProgressiveLoader:
         self._resident_pbar = None
         self._resident_pbar_pending = 0
         for emitter, callback in self._connections:
-            with contextlib.suppress(ValueError, TypeError):
+            # RuntimeError: napari emitters can fail to normalize a
+            # callback while its owner is mid-teardown
+            with contextlib.suppress(ValueError, TypeError, RuntimeError):
                 emitter.disconnect(callback)
         self._connections = []
         for emitter in self._canvas_events:
@@ -889,7 +899,7 @@ class ProgressiveLoader:
             with contextlib.suppress(Exception):
                 emitter.disconnect(self._debounced_check)
         self._canvas_events = []
-        with contextlib.suppress(ValueError, TypeError):
+        with contextlib.suppress(ValueError, TypeError, RuntimeError):
             self._viewer.layers.events.removed.disconnect(
                 self._on_layer_removed,
             )
@@ -1059,11 +1069,11 @@ class ProgressiveLoader:
         # unlock progressively as zooming shrinks the viewport tile.
         for level in range(target, n_levels):
             vdata = self._data[level]
-            extent = np.take(
+            level_extent = np.take(
                 np.asarray(vdata.shape, dtype=np.int64),
                 displayed,
             )
-            extent = np.minimum(extent, self._tile_extent_3d)
+            extent = np.minimum(level_extent, self._tile_extent_3d)
             if bbox is not None:
                 downsample = np.take(
                     np.asarray(self._data._scale_factors[level]),
@@ -1072,7 +1082,22 @@ class ProgressiveLoader:
                 view_extent = np.ceil((bbox[1] - bbox[0]) / downsample).astype(
                     np.int64,
                 )
-                extent = np.minimum(extent, np.maximum(view_extent, 1))
+                visible = np.minimum(
+                    np.maximum(view_extent, 1),
+                    level_extent,
+                )
+                wanted = np.minimum(
+                    np.ceil(visible * self._tile_margin_3d),
+                    level_extent,
+                )
+                if np.any(wanted > self._tile_extent_3d):
+                    # the tile cap cannot cover the canvas (plus pan
+                    # slack) at this level: a finer-but-partial tile
+                    # reads as the volume shrinking while you zoom in —
+                    # coverage beats sharpness, prefer the next coarser
+                    # level
+                    continue
+                extent = np.minimum(extent, wanted.astype(np.int64))
             nbytes = np.prod(extent, dtype=np.int64) * vdata.dtype.itemsize
             chunk_shape = np.take(
                 np.asarray(vdata.chunk_shape, dtype=np.int64),
@@ -1192,7 +1217,15 @@ class ProgressiveLoader:
             layer._reset_data_level()
             # _reset_data_level cleared the lock state; preserve our flag
             self._auto_locked = None
-            layer.refresh(extent=False)
+            # the handover re-slice is a one-time full-pipeline refresh
+            # (~300ms on large 2D data): run it as its own event instead
+            # of inside whatever handler triggered the release
+            QTimer.singleShot(
+                0,
+                lambda: (
+                    None if self._closed else self._layer.refresh(extent=False)
+                ),
+            )
         else:
             self._auto_locked = None
 
@@ -1500,6 +1533,33 @@ class ProgressiveLoader:
         n_levels = len(self._data)
         factors = self._data._scale_factors
         ndim = self._data.ndim
+        # single-cover shortcut: when the closest-resolution source
+        # fully covers the region, one gather suffices — layering
+        # coarse->fine would run one gather per level with data, all
+        # but the last overwritten
+        full = self._backdrop_level(level, lo, hi)
+        if full is not None and full != level:
+            src = self._data[full]
+            cand_lo = [
+                int(np.floor(lo[d] * factors[level][d] / factors[full][d]))
+                for d in range(ndim)
+            ]
+            cand_hi = [
+                int(np.ceil(hi[d] * factors[level][d] / factors[full][d]))
+                for d in range(ndim)
+            ]
+            if src.covers(
+                np.clip(cand_lo, 0, src.shape),
+                np.clip(cand_hi, 0, src.shape),
+            ):
+                with contextlib.suppress(Exception):
+                    return bool(
+                        self._data.fill_unloaded_from(
+                            level,
+                            full,
+                            region=(list(lo), list(hi)),
+                        ),
+                    )
         wrote = False
         # high index = coarse; iterate coarse -> fine, skipping target
         for cand in range(n_levels - 1, -1, -1):
@@ -1617,29 +1677,25 @@ class ProgressiveLoader:
         self._cancel_active()
         vdata = self._data[level]
 
-        if self._viewer.dims.ndisplay == 3:
-            # 3D: the tile IS the viewport, so the backdrop upsample
-            # gather covers the whole (16 MB default) tile — too much
-            # main-thread time per level switch. Set the interval cheap
-            # (carry-over + zeros) and fill on the repair worker; the
-            # double buffer keeps rendering the previous tile until the
-            # filled content presents.
-            self._data.set_interval(level, min_coord, max_coord)
-            self._repair_backdrop()
-        else:
-            # 2D: newly exposed regions here are usually small — the
-            # level-switch case was already backdropped synchronously
-            # (viewport-only) by _sync_backdrop_2d
-            self._data.set_interval(
+        # Set the interval cheap (carry-over + zeros): the backdrop
+        # upsample gather is too much main-thread time at pass start
+        # (the whole 16 MB tile in 3D; interval-sized regions in 2D).
+        # 2D fills the visible region synchronously (bounded work, and
+        # usually already done by _sync_backdrop_2d — refilling skips
+        # nothing visible since fills are idempotent over unloaded
+        # chunks); everything else fills on the repair worker. In 3D
+        # the double buffer keeps rendering the previous tile until the
+        # filled content presents.
+        self._data.set_interval(level, min_coord, max_coord)
+        if self._viewer.dims.ndisplay == 2:
+            view_min, view_max = self._viewport_box_2d(
                 level,
                 min_coord,
                 max_coord,
-                backdrop_level=self._backdrop_level(
-                    level,
-                    min_coord,
-                    max_coord,
-                ),
             )
+            with contextlib.suppress(Exception):
+                self._backdrop_fill_layered(level, view_min, view_max)
+        self._repair_backdrop()
         self._active = (level, tuple(min_coord), tuple(max_coord))
 
         interval = vdata.interval
