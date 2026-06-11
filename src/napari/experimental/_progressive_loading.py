@@ -884,6 +884,10 @@ class ProgressiveLoader:
         if self._resident_worker is not None:
             self._resident_worker.quit()
             self._resident_worker = None
+        if self._repair_worker is not None:
+            with contextlib.suppress(Exception):
+                self._repair_worker.quit()
+            self._repair_worker = None
         self._close_progress(self._resident_pbar)
         self._resident_pbar = None
         self._resident_pbar_pending = 0
@@ -1665,12 +1669,24 @@ class ProgressiveLoader:
             return
         if self._data[level].covers(min_coord, max_coord):
             return
-        self._data.set_interval(
-            level,
-            min_coord,
-            max_coord,
-            backdrop_level=self._backdrop_level(level, min_coord, max_coord),
-        )
+        # Set the interval cheap (carry-over + zeros): the full-tile
+        # upsample gather scales with the tile cap (200ms+ on the main
+        # thread at 33 MB), and a fetch pass with this same shape
+        # usually follows anyway. 2D fills the visible region
+        # synchronously (bounded work; usually a no-op right after
+        # _sync_backdrop_2d); the off-screen margin fills on the repair
+        # worker. In 3D carried-over content plus the double buffer
+        # keep the canvas filled until repaired content presents.
+        self._data.set_interval(level, min_coord, max_coord)
+        if self._viewer.dims.ndisplay == 2:
+            view_min, view_max = self._viewport_box_2d(
+                level,
+                min_coord,
+                max_coord,
+            )
+            with contextlib.suppress(Exception):
+                self._backdrop_fill_layered(level, view_min, view_max)
+        self._repair_backdrop()
         self._refresh(force=True)
 
     def _start_fetch(self, level: int, min_coord, max_coord) -> None:
