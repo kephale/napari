@@ -289,3 +289,68 @@ def test_redundant_gl_state_calls_skipped(parser):
     )
     assert leftover == []
     assert len(parser.executed) == 8
+
+
+def test_viewport_and_clearcolor_deduped(parser):
+    state = make_state(budget=2**20, slab=2**20)
+    commands = [
+        ('FUNC', 'glViewport', 0, 0, 800, 600),
+        ('FUNC', 'glClearColor', 0.0, 0.0, 0.0, 1.0),
+        ('FUNC', 'glViewport', 0, 0, 800, 600),  # duplicate: skipped
+        ('FUNC', 'glClearColor', 0.0, 0.0, 0.0, 1.0),  # dup: skipped
+        ('FUNC', 'glViewport', 0, 0, 400, 300),  # changed: kept
+        ('FUNC', 'glViewport', 0, 0, 800, 600),  # changed back: kept
+    ]
+    leftover = gm._metered_parse(parser, commands, state)
+    assert leftover == []
+    assert [c[2:] for c in parser.executed if c[1] == 'glViewport'] == [
+        (0, 0, 800, 600),
+        (0, 0, 400, 300),
+        (0, 0, 800, 600),
+    ]
+    assert len([c for c in parser.executed if c[1] == 'glClearColor']) == 1
+
+
+def test_deletes_deferred_to_quiet_flush(monkeypatch):
+    monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
+    parser = FakeParser()
+    parser.add_texture3d(1)
+    try:
+        assert gm.install(
+            frame_budget_bytes=512 * 2**10, slab_bytes=128 * 2**10
+        )
+        queue = glir.GlirQueue()
+        data = np.zeros((16, 256, 256), dtype=np.uint8)  # 1 MiB
+        queue.command('DATA', 1, (0, 0, 0), data)
+        queue.command('DELETE', 7)  # unrelated object
+        queue.flush(parser)
+        state = gm._states[parser]
+        # busy flush (uploads executed, carry pending): delete held
+        assert state.carry
+        assert state.deferred_deletes == [('DELETE', 7)]
+        assert all(c[0] != 'DELETE' for c in parser.executed)
+        # drain the carry across quiet-less flushes
+        state.reset_budget()
+        queue.flush(parser)
+        assert not state.carry
+        # this flush still spent budget on uploads: delete still held
+        assert state.deferred_deletes == [('DELETE', 7)]
+        # a genuinely quiet flush executes it
+        state.reset_budget()
+        queue.flush(parser)
+        assert state.deferred_deletes == []
+        assert parser.executed[-1] == ('DELETE', 7)
+    finally:
+        gm.uninstall()
+
+
+def test_uninstall_flushes_deferred_deletes(monkeypatch):
+    monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
+    parser = FakeParser()
+    try:
+        assert gm.install()
+        state = gm._state_for(parser)
+        state.deferred_deletes.append(('DELETE', 3))
+    finally:
+        gm.uninstall()
+    assert parser.executed == [('DELETE', 3)]

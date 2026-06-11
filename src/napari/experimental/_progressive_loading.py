@@ -1423,6 +1423,19 @@ class ProgressiveLoader:
             f'{self._layer.name}: loading level {level}',
         )
 
+        # Attach the texture double buffer BEFORE the backdrop refresh
+        # below, so the pass's first full-tile upload (and any tile
+        # reallocation) is staged off the rendered path instead of
+        # re-specifying the bound texture in place.
+        if self._double_buffer and self._viewer.dims.ndisplay == 3:
+            node = self._get_volume_node()
+            if (
+                node is not None
+                and getattr(node, '_texture', None) is not None
+            ):
+                with contextlib.suppress(Exception):
+                    self._ensure_dbuf(node)
+
         # Show carried-over and backdrop content before the first chunk
         # arrives so the canvas is never empty while fetching. This is
         # a full-tile texture upload: keep frames cheap while the GLIR
@@ -1778,12 +1791,18 @@ class ProgressiveLoader:
         dbuf = self._dbuf
         if dbuf is not None and dbuf.matches(node):
             return dbuf
+        pool = []
         if dbuf is not None:
+            # carry the retired-texture pool across rebuilds (same GL
+            # context): pooled textures stay reusable and rebuilds do
+            # not pay delete + reallocate GPU syncs
+            pool, dbuf._pool = dbuf._pool, []
             with contextlib.suppress(Exception):
                 dbuf.close()
             self._dbuf = None
         try:
             dbuf = DoubleBufferedVolumeTexture(node)
+            dbuf._pool = pool
             dbuf.attach_set_data()
         except Exception:  # noqa: BLE001 - unexpected texture class
             LOGGER.warning(
@@ -1792,6 +1811,9 @@ class ProgressiveLoader:
                 exc_info=True,
             )
             self._double_buffer = False
+            for _key, tex in pool:
+                with contextlib.suppress(Exception):
+                    tex.delete()
             return None
         self._dbuf = dbuf
         return dbuf

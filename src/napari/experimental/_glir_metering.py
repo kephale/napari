@@ -87,6 +87,13 @@ _IDEMPOTENT_FUNCS = frozenset(
         'glStencilOpSeparate',
         'glHint',
         'glSampleCoverage',
+        # value-state setters: global GL state, idempotent by args.
+        # glClear itself must always run and is never cached.
+        'glViewport',
+        'glScissor',
+        'glClearColor',
+        'glClearDepth',
+        'glClearStencil',
     }
 )
 
@@ -168,6 +175,11 @@ class _ParserState:
         # last-applied GL state for the redundant-FUNC filter; cleared
         # whenever the context is made current
         self.gl_state: dict = {}
+        # DELETE commands held until a quiet flush: each delete
+        # synchronizes with pending GPU work (~25ms profiled), so they
+        # run only in flushes with no uploads and no interaction hold.
+        # Safe to defer arbitrarily: GLIR ids are never reused.
+        self.deferred_deletes: list[tuple] = []
 
     def reset_budget(self):
         self.budget_left = self.frame_budget
@@ -280,6 +292,12 @@ def _metered_parse(parser, commands, state, force_defer=False):
         elif cmd == 'CURRENT':
             # context switch: cached GL state is no longer trustworthy
             gl_state.clear()
+        elif cmd == 'DELETE':
+            # run deletes only in quiet flushes (see _ParserState):
+            # ordering is safe because anything queued for this id
+            # earlier either already executed or was dropped with it
+            state.deferred_deletes.append(command)
+            continue
         if cmd == 'DATA':
             ob = parser._objects.get(id_, None)
             if _is_metered_texture(ob):
@@ -368,6 +386,18 @@ def _metered_flush(self, parser):
     elif had_carry and not state.carry:
         _notify_drained()
 
+    if (
+        state.deferred_deletes
+        and not holding
+        and not state.carry
+        and state.budget_left >= state.frame_budget
+    ):
+        # a quiet flush (no uploads this frame, no interaction): run
+        # the held GL object deletions now, off the busy periods
+        deletes, state.deferred_deletes = state.deferred_deletes, []
+        for command in deletes:
+            parser._parse(command)
+
 
 def install(
     frame_budget_bytes: int | None = None,
@@ -427,10 +457,13 @@ def uninstall():
 
     glir._GlirQueueShare.flush = _original_flush
     _original_flush = None
-    # re-queue carried uploads so they are not lost
+    # re-queue carried uploads and held deletions so they are not lost
     for parser, state in list(_states.items()):
         if state.carry:
             commands, state.carry = state.carry, []
+            parser.parse(commands)
+        if state.deferred_deletes:
+            commands, state.deferred_deletes = state.deferred_deletes, []
             parser.parse(commands)
     _states.clear()
 
