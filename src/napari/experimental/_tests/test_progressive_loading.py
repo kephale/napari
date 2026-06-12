@@ -1414,7 +1414,7 @@ def test_transform_applied_at_swap_not_before(
     )
     # the swap applied the captured matrix atomically with the content
     assert np.array_equal(np.asarray(transform.matrix), new_matrix)
-    assert not dbuf._front_behind_full()
+    assert dbuf._held_matrix is None and dbuf._pending_matrix is None
 
 
 def test_full_rewrite_present_waits_for_upload_drain(

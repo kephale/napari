@@ -98,10 +98,14 @@ class DoubleBufferedVolumeTexture:
         # content and tile transform always change in the same frame.
         self._held_matrix = None
         self._pending_matrix = None
-        # same-shape full rewrites are drain-gated like reshapes: the
-        # staged upload is metered, so binding the back immediately
-        # would render its stale previous content for several frames
-        self._full_deadline = 0.0
+        # rolling drain deadline: EVERY staged write (patch, full,
+        # reshape, and the sibling replay after a reshape swap) is
+        # metered, so a swap before the drain renders whatever the back
+        # held before — stale/partial content for a frame or two. Every
+        # present waits for the meter to empty (deadline-bounded); the
+        # loader retries presents from the drain callback, so swaps
+        # naturally land the moment uploads settle.
+        self._stage_deadline = 0.0
         # loader veto: presents held while the staged interval has no
         # real content yet (zeros + carry-over ahead of the repair
         # worker); deadline-bounded so presents can never starve
@@ -123,6 +127,14 @@ class DoubleBufferedVolumeTexture:
         dtype = getattr(front, '_data_dtype', None) or np.float32
         rep = np.zeros((1, 1, 1), dtype=dtype)
         back = node._create_texture(texture_format, rep)
+        # Route the new texture's GLIR commands into the canvas's shared
+        # queue NOW. A fresh texture otherwise parks its allocation and
+        # every staged upload in its own local queue until the first
+        # bind merges them — bypassing the upload meter's pending
+        # accounting (the drain gate sees zero and swaps onto a
+        # partially uploaded texture: one-time garbage frames at first
+        # level switches) and landing as a single unmetered burst.
+        front.glir.associate(back.glir)
         # allocate at full size now (SIZE only, no pixel upload): offset
         # patches require an allocated texture
         back.resize(tuple(front.shape), internalformat=front.internalformat)
@@ -140,6 +152,8 @@ class DoubleBufferedVolumeTexture:
             texture_format = self._front.internalformat
         rep = np.zeros((1, 1, 1), dtype=vol.dtype)
         tex = node._create_texture(texture_format, rep)
+        # shared GLIR queue from birth — see _make_sibling for why
+        self._front.glir.associate(tex.glir)
         tex.resize(tuple(vol.shape[:3]))
         tex._data_dtype = vol.dtype
         return self._sync_aux_state(tex)
@@ -216,12 +230,15 @@ class DoubleBufferedVolumeTexture:
         log drains at each :meth:`present`).
         """
         self._log.append((tuple(offset), data, None))
+        self._stage_deadline = max(
+            self._stage_deadline, time.monotonic() + 0.75
+        )
         self._catch_up(self._back)
 
     def stage_full(self, data, clim=None) -> None:
         """Stage a full-volume rewrite (e.g. a pass-boundary backdrop)."""
         self._begin_transform_hold()
-        self._full_deadline = time.monotonic() + 2.0
+        self._stage_deadline = time.monotonic() + 2.0
         # a full write supersedes everything staged before it
         self._log = [(None, data, clim)]
         for key in self._applied:
@@ -293,12 +310,10 @@ class DoubleBufferedVolumeTexture:
             return False
         if self._reshape_pending:
             return self._present_reshape()
-        if self._front_behind_full() and not self._uploads_settled(
-            self._full_deadline
-        ):
-            # the staged full rewrite is still queued in the GLIR
-            # meter: binding the back now would render its stale
-            # previous content (the rotation flicker)
+        if not self._uploads_settled(self._stage_deadline):
+            # staged writes are still queued in the GLIR meter: binding
+            # the back now would render its stale or partially written
+            # previous content (the rotation flicker / one-frame jump)
             return False
         front, back = self._front, self._back
         # propagate authoritative front state (napari writes clims and
@@ -352,6 +367,11 @@ class DoubleBufferedVolumeTexture:
             id(self._back): 0,
         }
         self._catch_up(self._back)
+        # the sibling's full replay just went through the meter: the
+        # next (patch-only) present must not bind it before the replay
+        # drains — a fresh pool texture would show partial content for
+        # a frame (the one-time jump at first level switches)
+        self._stage_deadline = time.monotonic() + 2.0
         self._trim_log()
         self._apply_pending_transform()
         node.update()
@@ -375,13 +395,6 @@ class DoubleBufferedVolumeTexture:
             self._log = self._log[applied_min:]
             for key in self._applied:
                 self._applied[key] -= applied_min
-
-    def _front_behind_full(self) -> bool:
-        """Whether the front's unapplied log delta has a full rewrite."""
-        start = self._applied[id(self._front)]
-        return any(
-            offset is None for offset, _data, _clim in self._log[start:]
-        )
 
     @staticmethod
     def _uploads_settled(deadline: float) -> bool:

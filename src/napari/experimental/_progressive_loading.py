@@ -75,7 +75,13 @@ DEFAULT_INTERVAL_MAX_BYTES = 512 * 1024**2
 PROGRESS_MIN_CHUNKS = 16
 #: 3D auto level selection coarsens until the viewport tile needs at most
 #: this many chunks, so a pass completes in seconds rather than minutes.
-DEFAULT_MAX_CHUNKS_PER_PASS = 384
+#: Sized so the BYTE cap (TILE_MAX_BYTES_3D) is the binding constraint
+#: for ordinary chunkings: a 16e6 tile (251^3) of 32^3 chunks is 512
+#: chunks; a 33e6 tile (320^3) is 1000. The old default (384) silently
+#: vetoed the level the byte cap was tuned to allow — resolution arrived
+#: a full level late. The guard still protects against pathological
+#: chunkings (deep pyramids with tiny chunks).
+DEFAULT_MAX_CHUNKS_PER_PASS = 1024
 #: Maximum size of a 3D sub-volume tile, in bytes. Full-tile GPU uploads
 #: (pass start/end) block the GUI for roughly size / 125 MB/s on slow GL
 #: drivers, so this is deliberately much smaller than the memory budget.
@@ -1090,17 +1096,22 @@ class ProgressiveLoader:
                     np.maximum(view_extent, 1),
                     level_extent,
                 )
+                if np.any(visible > self._tile_extent_3d):
+                    # the tile cap cannot cover the canvas at this
+                    # level: a finer-but-partial tile reads as the
+                    # volume shrinking while you zoom in — coverage
+                    # beats sharpness, prefer the next coarser level.
+                    # NOTE feasibility uses the bare visible footprint:
+                    # requiring the pan-slack margin too held levels
+                    # back a full step (resolution arrived ~2x late);
+                    # instead the slack below shrinks to whatever fits
+                    # under the cap near the switch boundary and grows
+                    # back as zooming shrinks the footprint
+                    continue
                 wanted = np.minimum(
                     np.ceil(visible * self._tile_margin_3d),
                     level_extent,
                 )
-                if np.any(wanted > self._tile_extent_3d):
-                    # the tile cap cannot cover the canvas (plus pan
-                    # slack) at this level: a finer-but-partial tile
-                    # reads as the volume shrinking while you zoom in —
-                    # coverage beats sharpness, prefer the next coarser
-                    # level
-                    continue
                 extent = np.minimum(extent, wanted.astype(np.int64))
             nbytes = np.prod(extent, dtype=np.int64) * vdata.dtype.itemsize
             chunk_shape = np.take(
@@ -1207,6 +1218,19 @@ class ProgressiveLoader:
                     max_coord,
                 ),
             )
+        # Attach the double buffer BEFORE the level-switch re-slice: the
+        # FIRST switch of a session otherwise goes through vanilla
+        # set_data, where the node matrix applies instantly while the
+        # metered content upload lands frames later — old content under
+        # the new transform, a one-time visible jump.
+        if self._double_buffer and self._viewer.dims.ndisplay == 3:
+            node = self._get_display_node()
+            if (
+                node is not None
+                and getattr(node, '_texture', None) is not None
+            ):
+                with contextlib.suppress(Exception):
+                    self._ensure_dbuf(node)
         layer.refresh(extent=False)
 
     def _release_auto_level(self) -> None:
