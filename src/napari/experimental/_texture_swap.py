@@ -90,6 +90,22 @@ class DoubleBufferedVolumeTexture:
         # the new texture's uploads have drained (or the deadline hits)
         self._reshape_pending = False
         self._reshape_deadline = 0.0
+        # transform coordination: while a full rewrite/reshape is
+        # staged, the node matrix matching the still-rendered FRONT
+        # content is held; the matrix napari applies for the staged
+        # tile (its origin/scale change in the same set_data emission)
+        # is captured by the loader and applied at the swap, so texture
+        # content and tile transform always change in the same frame.
+        self._held_matrix = None
+        self._pending_matrix = None
+        # same-shape full rewrites are drain-gated like reshapes: the
+        # staged upload is metered, so binding the back immediately
+        # would render its stale previous content for several frames
+        self._full_deadline = 0.0
+        # loader veto: presents held while the staged interval has no
+        # real content yet (zeros + carry-over ahead of the repair
+        # worker); deadline-bounded so presents can never starve
+        self._present_hold_until = 0.0
 
     # -- construction helpers --
 
@@ -204,6 +220,8 @@ class DoubleBufferedVolumeTexture:
 
     def stage_full(self, data, clim=None) -> None:
         """Stage a full-volume rewrite (e.g. a pass-boundary backdrop)."""
+        self._begin_transform_hold()
+        self._full_deadline = time.monotonic() + 2.0
         # a full write supersedes everything staged before it
         self._log = [(None, data, clim)]
         for key in self._applied:
@@ -222,6 +240,7 @@ class DoubleBufferedVolumeTexture:
         re-uploads the texture the GPU is sampling.
         """
         node = self._node
+        self._begin_transform_hold()
         new_back = self._acquire(
             vol.shape,
             vol.dtype,
@@ -269,8 +288,18 @@ class DoubleBufferedVolumeTexture:
         """
         if not self.dirty:
             return False
+        if time.monotonic() < self._present_hold_until:
+            # loader veto: the staged interval has no real content yet
+            return False
         if self._reshape_pending:
             return self._present_reshape()
+        if self._front_behind_full() and not self._uploads_settled(
+            self._full_deadline
+        ):
+            # the staged full rewrite is still queued in the GLIR
+            # meter: binding the back now would render its stale
+            # previous content (the rotation flicker)
+            return False
         front, back = self._front, self._back
         # propagate authoritative front state (napari writes clims and
         # interpolation to node._texture, i.e. the front); clims staged
@@ -287,6 +316,7 @@ class DoubleBufferedVolumeTexture:
         # the fully-applied prefix of the log to release chunk memory
         self._catch_up(front)
         self._trim_log()
+        self._apply_pending_transform()
         return True
 
     def _present_reshape(self) -> bool:
@@ -297,13 +327,7 @@ class DoubleBufferedVolumeTexture:
         previous level. A deadline bounds the wait in case uploads
         never fully settle (e.g. a steady chunk stream).
         """
-        from napari.experimental import _glir_metering
-
-        if (
-            _glir_metering.is_installed()
-            and _glir_metering.pending_upload_bytes() > 0
-            and time.monotonic() < self._reshape_deadline
-        ):
+        if not self._uploads_settled(self._reshape_deadline):
             return False
         node = self._node
         old_front, back = self._front, self._back
@@ -329,6 +353,7 @@ class DoubleBufferedVolumeTexture:
         }
         self._catch_up(self._back)
         self._trim_log()
+        self._apply_pending_transform()
         node.update()
         return True
 
@@ -350,6 +375,111 @@ class DoubleBufferedVolumeTexture:
             self._log = self._log[applied_min:]
             for key in self._applied:
                 self._applied[key] -= applied_min
+
+    def _front_behind_full(self) -> bool:
+        """Whether the front's unapplied log delta has a full rewrite."""
+        start = self._applied[id(self._front)]
+        return any(
+            offset is None for offset, _data, _clim in self._log[start:]
+        )
+
+    @staticmethod
+    def _uploads_settled(deadline: float) -> bool:
+        """Whether staged uploads have reached the GPU (deadline-bounded).
+
+        The GLIR meter defers texture uploads across frames; a swap
+        before the drain renders whatever the back texture held before.
+        The deadline bounds the wait under a sustained upload stream.
+        """
+        from napari.experimental import _glir_metering
+
+        return (
+            not _glir_metering.is_installed()
+            or _glir_metering.pending_upload_bytes() <= 0
+            or time.monotonic() >= deadline
+        )
+
+    # -- transform coordination --
+
+    def _node_matrix_transform(self):
+        transform = getattr(self._node, 'transform', None)
+        return transform if hasattr(transform, 'matrix') else None
+
+    def _begin_transform_hold(self) -> None:
+        """Snapshot the node matrix matching the front's content.
+
+        Called when a full rewrite/reshape is staged, BEFORE napari
+        updates the node matrix for the new tile (vispy layers call
+        ``node.set_data`` first, ``_on_matrix_change`` right after).
+        Idempotent while already holding: the front content does not
+        change between holds, so the first snapshot stays authoritative.
+        """
+        if self._held_matrix is not None:
+            return
+        transform = self._node_matrix_transform()
+        if transform is not None:
+            self._held_matrix = np.array(transform.matrix, copy=True)
+
+    def capture_transform(self) -> None:
+        """Capture napari's new matrix; keep the front-matching one.
+
+        Called by the loader inside the ``set_data`` event emission —
+        after the vispy layer applied the staged tile's matrix, before
+        anything could draw. The new matrix becomes pending (applied at
+        the swap) and the matrix matching the still-rendered front
+        content is restored, so the old tile never renders misplaced.
+        """
+        if self._held_matrix is None:
+            return
+        transform = self._node_matrix_transform()
+        if transform is None:
+            return
+        current = np.asarray(transform.matrix)
+        if np.array_equal(current, self._held_matrix):
+            return
+        self._pending_matrix = np.array(current, copy=True)
+        transform.matrix = self._held_matrix
+
+    def _apply_pending_transform(self) -> None:
+        """Apply the captured matrix at the swap (content now matches).
+
+        Skipped when something other than the captured ``set_data``
+        emission changed the matrix while holding — the external
+        change stands.
+        """
+        transform = self._node_matrix_transform()
+        if (
+            transform is not None
+            and self._pending_matrix is not None
+            and self._held_matrix is not None
+            and np.array_equal(
+                np.asarray(transform.matrix), self._held_matrix
+            )
+        ):
+            transform.matrix = self._pending_matrix
+        self._pending_matrix = None
+        self._held_matrix = None
+
+    def _drop_transform_hold(self) -> None:
+        """Forget the hold without touching the node (fallback paths)."""
+        self._pending_matrix = None
+        self._held_matrix = None
+
+    # -- loader present veto --
+
+    def hold_presents(self, timeout: float = 1.5) -> None:
+        """Veto presents while staged content is known to be junk.
+
+        The loader holds when a refresh stages an interval that has no
+        real content yet (zeros + carry-over ahead of the repair
+        worker) and releases when the repair lands or the pass ends;
+        the front keeps rendering meanwhile. Deadline-bounded so a lost
+        release can never starve presents.
+        """
+        self._present_hold_until = time.monotonic() + timeout
+
+    def release_presents(self) -> None:
+        self._present_hold_until = 0.0
 
     # -- full-refresh interception --
 
@@ -380,6 +510,7 @@ class DoubleBufferedVolumeTexture:
                 # fall back; the loader rebuilds this buffer on its
                 # next patch
                 self._suppress_full = False
+                self._drop_transform_hold()
                 self.detach_set_data()
                 return original(vol, clim=clim, copy=copy)
             same_shape = tuple(vol.shape[:3]) == self.shape
@@ -392,6 +523,10 @@ class DoubleBufferedVolumeTexture:
                 return None
             self._suppress_full = False
             try:
+                # presents happen on the loader's cadence (and on the
+                # upload-drain callback), never here: the staged upload
+                # is metered, so an immediate bind would render the
+                # back texture's stale previous content
                 if same_shape:
                     self.stage_full(vol, clim=clim)
                 else:
@@ -399,8 +534,8 @@ class DoubleBufferedVolumeTexture:
                     # the rendered path; the swap happens once its
                     # uploads drain (the old level renders meanwhile)
                     self.stage_reshape(vol, clim=clim)
-                self.present()
             except Exception:  # noqa: BLE001 - dtype/format change
+                self._drop_transform_hold()
                 self.detach_set_data()
                 return original(vol, clim=clim, copy=copy)
             node._last_data = vol
@@ -427,9 +562,15 @@ class DoubleBufferedVolumeTexture:
     def close(self) -> None:
         """Restore the node and release the spare texture.
 
-        The node keeps rendering whatever is currently front.
+        The node keeps rendering whatever is currently front. Any
+        matrix captured for an unpresented rewrite is applied — going
+        forward napari writes the texture directly, so its latest
+        matrix is the right one.
         """
         self.detach_set_data()
+        with contextlib.suppress(Exception):
+            self._apply_pending_transform()
+        self.release_presents()
         self._log = []
         if self._back is not self._front:
             with contextlib.suppress(Exception):  # pragma: no cover

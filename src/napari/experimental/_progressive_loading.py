@@ -1452,7 +1452,17 @@ class ProgressiveLoader:
         backdrop (outside the event emission stack) so at most one blank
         frame is shown.
         """
-        if self._closed or self._backdrop_pending or not self._layer.visible:
+        if self._closed or not self._layer.visible:
+            return
+        dbuf = self._dbuf3d()
+        if dbuf is not None:
+            # napari's vispy layer (connected before this handler) just
+            # staged the new tile AND applied its matrix; capture the
+            # matrix as pending and restore the front-matching one so
+            # the still-rendered old tile never draws misplaced. Runs
+            # inside the emission — nothing can paint in between.
+            dbuf.capture_transform()
+        if self._backdrop_pending:
             return
         level = int(self._layer.data_level)
         min_coord, max_coord = self._level_interval(level)
@@ -1686,6 +1696,11 @@ class ProgressiveLoader:
             )
             with contextlib.suppress(Exception):
                 self._backdrop_fill_layered(level, view_min, view_max)
+        dbuf = self._dbuf3d()
+        if dbuf is not None:
+            # the refresh below stages zeros + carry-over; keep the
+            # front on screen until the repair worker lands content
+            dbuf.hold_presents()
         self._repair_backdrop()
         self._refresh(force=True)
 
@@ -1780,6 +1795,13 @@ class ProgressiveLoader:
         ):
             self._dbuf.suppress_next_full_upload()
         self._synced_backdrop_key = None
+        dbuf = self._dbuf3d()
+        if dbuf is not None:
+            # this pass-start rewrite is zeros + carry-over until the
+            # repair worker lands its backdrop; the front (previous
+            # tile, correctly placed via the transform hold) renders
+            # meanwhile
+            dbuf.hold_presents()
         self._degrade_render_quality()
         self._refresh(force=True)
 
@@ -2027,6 +2049,13 @@ class ProgressiveLoader:
         if generation != self._generation or self._closed:
             return
         self._worker = None
+        dbuf = self._dbuf3d()
+        if dbuf is not None:
+            # belt for the present veto: the pass is over, so whatever
+            # is staged (chunks, backdrop) is the best content there is
+            dbuf.release_presents()
+            with contextlib.suppress(Exception):
+                dbuf.present()
         self._maybe_restore_quality()
 
     def _get_display_node(self, ndisplay: int | None = None):
@@ -2042,6 +2071,13 @@ class ProgressiveLoader:
 
     def _get_volume_node(self):
         return self._get_display_node(3)
+
+    def _dbuf3d(self) -> DoubleBufferedVolumeTexture | None:
+        """The 3D double buffer, when that is what is attached."""
+        dbuf = self._dbuf
+        if isinstance(dbuf, DoubleBufferedVolumeTexture):
+            return dbuf
+        return None
 
     def _patch_texture(self, vdata: VirtualData, chunk_key) -> bool:
         """Write one chunk's region into the existing GPU texture."""
@@ -2343,8 +2379,18 @@ class ProgressiveLoader:
         def on_done(wrote):
             if self._repair_worker is worker:
                 self._repair_worker = None
-            if wrote and not self._closed:
+            if self._closed:
+                return
+            dbuf = self._dbuf3d()
+            if dbuf is not None:
+                dbuf.release_presents()
+            if wrote:
                 self._refresh(force=True)
+            elif dbuf is not None:
+                # nothing to fill (fully carried over): present whatever
+                # is staged now that the veto is lifted
+                with contextlib.suppress(Exception):
+                    dbuf.present()
 
         worker.returned.connect(on_done)
         worker.errored.connect(lambda _e: on_done(False))  # pragma: no cover

@@ -1326,7 +1326,13 @@ def test_double_buffer_swaps_and_content_correct(
     # the shader samples the front texture, and the pair is distinct
     assert node._texture is loader._dbuf._front
     assert loader._dbuf._front is not loader._dbuf._back
-    # patch log fully drained once idle
+    # patch log fully drained once idle (presents are drain-gated now,
+    # and an unshown viewer has no draw events to spend the upload
+    # budget — poll the present like the drain callback would)
+    qtbot.waitUntil(
+        lambda: bool(loader._dbuf.present() or not loader._dbuf.dirty),
+        timeout=5000,
+    )
     assert not loader._dbuf.dirty
     # data correctness end to end (final reconcile path)
     np.testing.assert_array_equal(
@@ -1355,6 +1361,120 @@ def test_double_buffer_disabled_by_env(
     _wait_for_idle_loader(qtbot, loader)
     assert loader._texture_patches > 0
     assert loader._dbuf is None
+
+
+def _engaged_3d_dbuf(qtbot, make_napari_viewer, arrays):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    layer.locked_data_level = 0
+    qtbot.waitUntil(lambda: loader._dbuf is not None, timeout=10000)
+    _wait_for_idle_loader(qtbot, loader)
+    return viewer, layer, loader
+
+
+def test_transform_applied_at_swap_not_before(
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+):
+    """A full rewrite's matrix change rides along with the texture swap.
+
+    Mimics what a moved-tile re-slice does: ``node.set_data`` (staged
+    into the back texture) followed by the vispy layer's matrix update
+    in the same emission. Until the swap, the node must keep the matrix
+    matching the still-rendered front content; at the swap the captured
+    matrix applies.
+    """
+    viewer, layer, loader = _engaged_3d_dbuf(
+        qtbot, make_napari_viewer, multiscale_3d_arrays
+    )
+    dbuf = loader._dbuf
+    node = loader._get_volume_node()
+    transform = node.transform
+    old_matrix = np.array(transform.matrix, copy=True)
+
+    vol = np.full(dbuf.shape, 7, dtype=np.uint8)
+    node.set_data(vol)  # staged full rewrite; transform hold begins
+    new_matrix = old_matrix.copy()
+    new_matrix[-1, 0] += 50  # the new tile origin napari would apply
+    transform.matrix = new_matrix
+    loader._on_set_data()  # capture runs inside the emission
+
+    # front still renders: matrix restored to match its content
+    assert np.array_equal(np.asarray(transform.matrix), old_matrix)
+    assert dbuf.dirty
+
+    qtbot.waitUntil(
+        lambda: dbuf.present()
+        or np.array_equal(np.asarray(transform.matrix), new_matrix),
+        timeout=5000,
+    )
+    # the swap applied the captured matrix atomically with the content
+    assert np.array_equal(np.asarray(transform.matrix), new_matrix)
+    assert not dbuf._front_behind_full()
+
+
+def test_full_rewrite_present_waits_for_upload_drain(
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+    monkeypatch,
+):
+    """No swap while the staged full rewrite is still queued in the
+    GLIR meter — binding the back early would render stale content."""
+    from napari.experimental import _glir_metering as gm
+
+    viewer, layer, loader = _engaged_3d_dbuf(
+        qtbot, make_napari_viewer, multiscale_3d_arrays
+    )
+    dbuf = loader._dbuf
+    node = loader._get_volume_node()
+    front_before = dbuf._front
+
+    monkeypatch.setattr(gm, 'pending_upload_bytes', lambda: 123456)
+    vol = np.full(dbuf.shape, 9, dtype=np.uint8)
+    node.set_data(vol)
+    assert dbuf.dirty
+    assert not dbuf.present()
+    assert dbuf._front is front_before
+
+    monkeypatch.setattr(gm, 'pending_upload_bytes', lambda: 0)
+    # the loader's own present cadence may beat the direct call
+    assert dbuf.present() or dbuf._front is not front_before
+    assert dbuf._front is not front_before
+    assert node._texture is dbuf._front
+
+
+def test_hold_presents_vetoes_until_released(
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+):
+    """The loader veto blocks presents (front keeps rendering) until
+    released — the no-black-on-unprepared-interval mechanism."""
+    viewer, layer, loader = _engaged_3d_dbuf(
+        qtbot, make_napari_viewer, multiscale_3d_arrays
+    )
+    dbuf = loader._dbuf
+    node = loader._get_volume_node()
+    front_before = dbuf._front
+
+    dbuf.hold_presents(timeout=30.0)
+    vol = np.zeros(dbuf.shape, dtype=np.uint8)
+    node.set_data(vol)
+    assert dbuf.dirty
+    assert not dbuf.present()
+    assert dbuf._front is front_before
+
+    dbuf.release_presents()
+    qtbot.waitUntil(
+        lambda: dbuf.present() or dbuf._front is not front_before,
+        timeout=5000,
+    )
+    assert dbuf._front is not front_before
 
 
 # ---------- interactive render quality (LOD) ----------
@@ -1567,7 +1687,7 @@ def test_reshape_staged_and_swapped(
     multiscale_3d_arrays,
 ):
     """A shape-changing set_data goes through the staging texture, not
-    the bound one; with no upload backlog it swaps immediately.
+    the bound one; the next present (with no upload backlog) swaps.
     """
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
@@ -1587,7 +1707,13 @@ def test_reshape_staged_and_swapped(
     # wrapper stays attached and the pair adopted the new shape
     assert dbuf._wrapped_set_data is not None
     assert dbuf.shape == new_shape
-    # no backlog on this driver: swapped already
+    # staging never binds inside set_data; the swap happens on the
+    # present cadence (no backlog on this driver: first call swaps)
+    assert dbuf._reshape_pending
+    qtbot.waitUntil(
+        lambda: dbuf.present() or not dbuf._reshape_pending,
+        timeout=5000,
+    )
     assert not dbuf._reshape_pending
     assert node._texture is dbuf._front
     assert dbuf._front is not old_front
@@ -1675,13 +1801,22 @@ def test_reshape_reuses_pooled_textures(
         created.append(tex)
         return tex
 
+    def swap(vol):
+        # stage the reshape, then complete it on the present cadence
+        # (set_data never binds; presents finish the cycle)
+        node.set_data(vol)
+        qtbot.waitUntil(
+            lambda: dbuf.present() or not dbuf._reshape_pending,
+            timeout=5000,
+        )
+
     node._create_texture = counting_create
-    node.set_data(np.zeros(shape_b, dtype=np.uint8))  # a -> b
+    swap(np.zeros(shape_b, dtype=np.uint8))  # a -> b
     assert not dbuf._reshape_pending
     first_round = len(created)
     assert first_round >= 1  # b-shaped textures had to be created
-    node.set_data(np.ones(shape_a, dtype=np.uint8))  # b -> a (pool hit)
-    node.set_data(np.ones(shape_b, dtype=np.uint8))  # a -> b (pool hit)
+    swap(np.ones(shape_a, dtype=np.uint8))  # b -> a (pool hit)
+    swap(np.ones(shape_b, dtype=np.uint8))  # a -> b (pool hit)
     assert len(created) == first_round, 'pool miss: textures reallocated'
     assert dbuf.shape == shape_b
     assert tuple(node._texture.shape[:3]) == shape_b
