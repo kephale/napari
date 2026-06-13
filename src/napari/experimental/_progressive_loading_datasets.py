@@ -15,10 +15,12 @@ their docstrings and are imported lazily.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
+import numpy as np
 import zarr
 from zarr.experimental.cache_store import CacheStore
-from zarr.storage import MemoryStore
+from zarr.storage import LocalStore, MemoryStore
 
 from napari.experimental._generative_zarr import (
     MandelbrotStore,
@@ -134,6 +136,147 @@ def mandelbulb_dataset(
             (2**level, 2**level, 2**level) for level in range(max_levels)
         ],
         'chunk_size': (tilesize, tilesize, tilesize),
+        'arrays': arrays,
+    }
+
+
+def build_multiscale_zarr(
+    path: str | Path,
+    max_levels: int = 4,
+    tilesize: int = 32,
+    maxiter: int = 64,
+    order: int = 8,
+    overwrite: bool = False,
+) -> Path:
+    """Materialize a multiscale mandelbulb zarr to disk.
+
+    Generates a 3D mandelbulb pyramid and writes it chunk-by-chunk to a
+    local zarr store. With the defaults (4 levels, tilesize 32) the
+    result is ~150 MB on disk (512**3 + 256**3 + ... uint8).
+
+    Parameters
+    ----------
+    path : str or Path
+        Directory to write the zarr store into.
+    max_levels : int
+        Number of pyramid levels (level 0 = tilesize * 2**max_levels
+        voxels per side).
+    tilesize : int
+        Chunk edge length.
+    maxiter : int
+        Mandelbulb escape iterations (determines intensity range).
+    order : int
+        Order of the mandelbulb equation.
+    overwrite : bool
+        If *True*, remove an existing store at *path* first.
+
+    Returns
+    -------
+    Path
+        The store directory (same as *path*).
+    """
+    path = Path(path)
+    if path.exists() and not overwrite:
+        LOGGER.info('Zarr already exists at %s, skipping build', path)
+        return path
+
+    gen = MandelbulbStore(
+        levels=max_levels,
+        tilesize=tilesize,
+        maxiter=maxiter,
+        order=order,
+        cpu_relief=0,
+    )
+
+    store = LocalStore(path)
+    root = zarr.create_group(store=store, zarr_format=3, overwrite=overwrite)
+    datasets = [{'path': str(lvl)} for lvl in range(max_levels)]
+    root.attrs['multiscales'] = [{'datasets': datasets, 'version': '0.1'}]
+
+    base_width = tilesize * 2**max_levels
+    for level in range(max_levels):
+        width = base_width // 2**level
+        n_chunks = width // tilesize
+        arr = root.create_array(
+            name=str(level),
+            shape=(width, width, width),
+            chunks=(tilesize, tilesize, tilesize),
+            dtype=np.uint8 if maxiter < 256 else np.dtype('<u2'),
+            compressors=None,
+            fill_value=0,
+            overwrite=overwrite,
+        )
+        total = n_chunks**3
+        for zi in range(n_chunks):
+            for yi in range(n_chunks):
+                for xi in range(n_chunks):
+                    chunk = gen.get_chunk(level, zi, yi, xi)
+                    s = np.s_[
+                        zi * tilesize : (zi + 1) * tilesize,
+                        yi * tilesize : (yi + 1) * tilesize,
+                        xi * tilesize : (xi + 1) * tilesize,
+                    ]
+                    arr[s] = chunk
+                    done = zi * n_chunks * n_chunks + yi * n_chunks + xi + 1
+                    if done % max(1, total // 10) == 0 or done == total:
+                        LOGGER.info(
+                            'Level %d: %d/%d chunks', level, done, total
+                        )
+    LOGGER.info('Wrote %s', path)
+    return path
+
+
+def local_zarr_dataset(
+    path: str | Path,
+    cache_bytes: int = DEFAULT_CACHE_BYTES,
+):
+    """Open a local multiscale zarr for progressive loading.
+
+    If the zarr does not exist yet, builds a default mandelbulb first
+    via :func:`build_multiscale_zarr`.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the zarr store directory.
+    cache_bytes : int
+        Size of the in-memory chunk cache.
+
+    Returns
+    -------
+    dict
+        Multiscale metadata with ``'arrays'`` ready for
+        :func:`add_progressive_loading_image`.
+    """
+    path = Path(path)
+    if not path.exists():
+        build_multiscale_zarr(path)
+
+    store = CacheStore(
+        LocalStore(path),
+        cache_store=MemoryStore(),
+        max_size=cache_bytes,
+    )
+    group = zarr.open_group(store, mode='r')
+    multiscales = group.attrs.get('multiscales', [{}])
+    level_paths = [d['path'] for d in multiscales[0].get('datasets', [])]
+    if not level_paths:
+        level_paths = sorted(
+            k for k in group.keys() if k.isdigit()
+        )
+
+    arrays = [group[p] for p in level_paths]
+    ndim = arrays[0].ndim
+    scale_factors = [
+        tuple(2**level for _ in range(ndim))
+        for level in range(len(arrays))
+    ]
+    return {
+        'container': str(path),
+        'dataset': '',
+        'scale_levels': len(arrays),
+        'scale_factors': scale_factors,
+        'chunk_size': arrays[0].chunks,
         'arrays': arrays,
     }
 
