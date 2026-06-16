@@ -652,7 +652,7 @@ class ProgressiveLoader:
         tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
         max_bytes_per_second: float | None = None,
         interaction_hold: bool = True,
-        interactive_step_rate: float = 4.0,
+        interactive_step_rate: float = 2.0,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -728,8 +728,8 @@ class ProgressiveLoader:
             if interactive_step_rate and float(interactive_step_rate) > 1.0
             else None
         )
-        # (weakref to volume node, saved relative_step_size, saved
-        # attenuation) while the interactive quality reduction is applied
+        # (weakref to volume node, saved relative_step_size) while the
+        # interactive quality reduction is applied
         self._saved_step: tuple | None = None
         # interaction hold: extended by every camera/scrub event, ended
         # by the debounced _check once interaction settles
@@ -1310,16 +1310,11 @@ class ProgressiveLoader:
         if node is None:
             return
         try:
-            saved_step = float(node.relative_step_size)
-            saved_atten = float(node.attenuation)
-            node.relative_step_size = saved_step * self._interactive_step_rate
-            # Compensate attenuation so brightness roughly matches:
-            # coarser sampling with the same attenuation darkens sparse
-            # structures because the exponential falloff is nonlinear.
-            node.attenuation = saved_atten / self._interactive_step_rate
+            saved = float(node.relative_step_size)
+            node.relative_step_size = saved * self._interactive_step_rate
         except Exception:  # noqa: BLE001 # pragma: no cover - node variant
             return
-        self._saved_step = (weakref.ref(node), saved_step, saved_atten)
+        self._saved_step = (weakref.ref(node), saved)
         # restore is event-driven, not polled: checked at hold end, per
         # delivered batch (_update_node), at pass end, and when the
         # GLIR meter reports its carry fully drained
@@ -1367,14 +1362,13 @@ class ProgressiveLoader:
     def _restore_render_quality(self) -> None:
         if self._saved_step is None:
             return
-        node_ref, saved_step, saved_atten = self._saved_step
+        node_ref, saved = self._saved_step
         self._saved_step = None
         node = node_ref()
         if node is None:
             return
         with contextlib.suppress(Exception):  # pragma: no cover - GL
-            node.relative_step_size = saved_step
-            node.attenuation = saved_atten
+            node.relative_step_size = saved
             node.update()
 
     def _end_hold(self) -> None:
