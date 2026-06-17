@@ -23,13 +23,7 @@ queue filtering.
 
 The patch is installed lazily by progressive loading
 (:func:`napari.experimental.add_progressive_loading_image`); vanilla
-napari is unaffected. Tunables (env vars override arguments):
-
-- ``NAPARI_GLIR_METERING=0`` disables installation entirely.
-- ``NAPARI_GLIR_TEX_BYTES_PER_FRAME`` per-frame upload budget (bytes).
-- ``NAPARI_GLIR_TEX_SLAB_BYTES`` maximum size of a single sub-upload.
-- ``NAPARI_GLIR_TEX2D_MIN_BYTES`` size floor above which 2D texture
-  uploads are metered too (0 disables 2D metering).
+napari is unaffected.
 
 Run ``python -m napari.experimental._glir_metering`` for a standalone
 vispy-only benchmark of draw time vs. texture upload size (no napari),
@@ -53,18 +47,13 @@ DEFAULT_FRAME_BUDGET_BYTES = _FACTORY_FRAME_BUDGET_BYTES
 DEFAULT_SLAB_BYTES = _FACTORY_SLAB_BYTES
 #: Deferred GL object deletions executed per quiet flush. Deletion can
 #: sync the GPU pipeline, so the backlog drains a few per frame instead
-#: of all at once (env: NAPARI_GLIR_DELETES_PER_FLUSH).
-DELETE_DRAIN_PER_FLUSH = int(
-    os.environ.get('NAPARI_GLIR_DELETES_PER_FLUSH', 4),
-)
+#: of all at once.
+DELETE_DRAIN_PER_FLUSH = 4
 #: 2D texture DATA at or above this size is metered like 3D uploads.
 #: Small 2D textures (colormap LUTs, interpolation kernels) MUST stay
 #: synchronous: deferring them leaves a shader sampling an unwritten
-#: texture for however long the carry takes to drain. 0 disables 2D
-#: metering entirely.
-TEX2D_MIN_METERED_BYTES = int(
-    os.environ.get('NAPARI_GLIR_TEX2D_MIN_BYTES', 256 * 1024),
-)
+#: texture for however long the carry takes to drain.
+TEX2D_MIN_METERED_BYTES = 256 * 1024
 
 # Commands that operate on a specific GLIR object id and therefore must
 # stay ordered behind any deferred command for the same id.
@@ -463,21 +452,8 @@ def install(
     """
     global _original_flush, DEFAULT_FRAME_BUDGET_BYTES, DEFAULT_SLAB_BYTES
 
-    if os.environ.get('NAPARI_GLIR_METERING', '1') in ('0', 'false', ''):
-        return False
-
-    frame_budget_bytes = int(
-        os.environ.get(
-            'NAPARI_GLIR_TEX_BYTES_PER_FRAME',
-            frame_budget_bytes or DEFAULT_FRAME_BUDGET_BYTES,
-        ),
-    )
-    slab_bytes = int(
-        os.environ.get(
-            'NAPARI_GLIR_TEX_SLAB_BYTES',
-            slab_bytes or DEFAULT_SLAB_BYTES,
-        ),
-    )
+    frame_budget_bytes = int(frame_budget_bytes or DEFAULT_FRAME_BUDGET_BYTES)
+    slab_bytes = int(slab_bytes or DEFAULT_SLAB_BYTES)
 
     # re-parameterize existing states (and set defaults for new ones)
     DEFAULT_FRAME_BUDGET_BYTES = frame_budget_bytes

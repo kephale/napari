@@ -40,7 +40,7 @@ import threading
 import time
 import weakref
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING
 
 import numpy as np
 from psygnal import debounced
@@ -432,18 +432,6 @@ class _FetchRateLimiter:
         self._go.set()  # wake paused workers; cancelled passes must exit
 
 
-class _StampedBatch(NamedTuple):
-    """A yielded chunk batch with its send time.
-
-    The receiving (main-thread) handler compares ``sent`` with the
-    current time: the difference is how long the batch sat in the event
-    queue, i.e. a direct measure of main-thread congestion.
-    """
-
-    payload: object
-    sent: float
-
-
 @thread_worker
 def _fetch_chunks(
     array,
@@ -489,8 +477,7 @@ def _fetch_chunks(
         return chunk_key
 
     def emit(batch):
-        payload = pack(batch) if pack is not None else batch
-        return _StampedBatch(payload, time.monotonic())
+        return pack(batch) if pack is not None else batch
 
     if num_workers <= 1 or len(chunk_queue) <= 1:
         batch: list = []
@@ -608,9 +595,7 @@ class ProgressiveLoader:
         knob: fetch compute (GIL pressure), slice/refresh event
         cascades, and GPU upload traffic. Loading takes proportionally
         longer; interaction stays smooth. ``None`` (default) is
-        unlimited. The ``NAPARI_PROGRESSIVE_MAX_BPS`` environment
-        variable overrides this (e.g. ``8e6`` for 8 MB/s; 0 or unset
-        means unlimited), handy for sweeps without code changes.
+        unlimited.
     interaction_hold : bool
         Suspend all streaming work while the user interacts (camera
         motion, slider scrubbing): fetch workers pause, arriving chunk
@@ -618,19 +603,14 @@ class ProgressiveLoader:
         are deferred, and metered GLIR texture uploads hold. Everything
         resumes when interaction settles (the debounced check). This
         keeps interaction frames free of upload work, slice-completion
-        event cascades, and fetch-thread GIL pressure. The
-        ``NAPARI_PROGRESSIVE_HOLD`` environment variable overrides
-        (``0`` disables).
+        event cascades, and fetch-thread GIL pressure.
     interactive_step_rate : float
         Multiply the volume raycast step size by this factor while the
         user interacts, restoring full quality when interaction
         settles (interactive level-of-detail, as in ParaView/Slicer).
-        Raycast cost scales inversely with step size, so 4.0 means
-        roughly 4x cheaper GPU frames during drags — on saturated GPUs
-        the deep command queue behind expensive frames is what blocks
-        the main thread in otherwise-innocent GL calls. 1.0 (or 0)
-        disables. The ``NAPARI_PROGRESSIVE_INTERACTIVE_STEP``
-        environment variable overrides.
+        Raycast cost scales inversely with step size, so 2.0 means
+        roughly 2x cheaper GPU frames during drags. 1.0 (or 0)
+        disables.
 
     """
 
@@ -680,49 +660,16 @@ class ProgressiveLoader:
                 n_cpus = os.cpu_count() or 3
             fetch_workers = min(4, n_cpus - 2)
         self._fetch_workers = max(int(fetch_workers), 1)
-        # Congestion brake (EXPERIMENTAL, off by default): when a chunk
-        # batch waited longer than this in the event queue (main thread
-        # starved by draws/uploads/GIL), fetching pauses for a beat so
-        # input events get through. NAPARI_PROGRESSIVE_CONGESTION_MS
-        # enables (e.g. 200). macOS profiling showed the pause/resume
-        # cycle can defer work that then flushes in bursts — worse
-        # spikes than steady streaming — so it must be opted into for
-        # interactive-feel experiments.
-        env_congestion = os.environ.get('NAPARI_PROGRESSIVE_CONGESTION_MS')
-        self._congestion_threshold_s = (
-            float(env_congestion) / 1000.0 if env_congestion else 0.0
-        )
-        self._congestion_hold_s = max(0.25, 1.5 * self._congestion_threshold_s)
-        env_bps = os.environ.get('NAPARI_PROGRESSIVE_MAX_BPS')
-        if env_bps:
-            max_bytes_per_second = float(env_bps)
         self._max_bytes_per_second = (
             float(max_bytes_per_second)
             if max_bytes_per_second
-            else None  # 0/None = unlimited
+            else None
         )
         self._limiter: _FetchRateLimiter | None = None
         self._resident_limiter: _FetchRateLimiter | None = None
-        env_hold = os.environ.get('NAPARI_PROGRESSIVE_HOLD')
-        if env_hold is not None:
-            interaction_hold = env_hold not in ('0', 'false', '')
         self._interaction_hold = bool(interaction_hold)
-        # Double-buffered volume texture: chunks stream into a back
-        # texture while draws sample a stable front texture; presenting
-        # swaps the sampler binding. Writing to a texture the GPU is
-        # sampling forces driver sync/ghosting on macOS GL-over-Metal —
-        # the dominant draw() stall. NAPARI_PROGRESSIVE_DOUBLE_BUFFER=0
-        # disables for A/B profiling.
-        env_dbuf = os.environ.get('NAPARI_PROGRESSIVE_DOUBLE_BUFFER')
-        self._double_buffer = (
-            env_dbuf not in ('0', 'false', '')
-            if env_dbuf is not None
-            else True
-        )
+        self._double_buffer = True
         self._dbuf = None
-        env_step = os.environ.get('NAPARI_PROGRESSIVE_INTERACTIVE_STEP')
-        if env_step:
-            interactive_step_rate = float(env_step)
         self._interactive_step_rate = (
             float(interactive_step_rate)
             if interactive_step_rate and float(interactive_step_rate) > 1.0
@@ -842,19 +789,8 @@ class ProgressiveLoader:
         )
         layer._max_tile_extent_3d = self._tile_extent_3d
 
-        # 2D render margin: slice a region larger than the viewport so
-        # pans and zoom-outs stay inside rendered content instead of
-        # exposing void until the next re-slice + backdrop. 2.0 covers
-        # zoom-out exactly to the level switch of a factor-2 pyramid.
-        env_margin = os.environ.get('NAPARI_PROGRESSIVE_MARGIN_2D')
-        layer._render_margin_2d = float(env_margin) if env_margin else 2.0
-        # 3D tile margin: pan slack around the visible footprint, so
-        # small camera translations stay inside the current tile
-        # instead of re-slicing (jitter) and exposing void at the
-        # edges. The auto level coarsens when footprint x margin would
-        # exceed the tile cap — coverage (and slack) beat sharpness.
-        env_margin3 = os.environ.get('NAPARI_PROGRESSIVE_TILE_MARGIN_3D')
-        self._tile_margin_3d = float(env_margin3) if env_margin3 else 1.25
+        layer._render_margin_2d = 2.0
+        self._tile_margin_3d = 1.25
         layer._tile_margin_3d = self._tile_margin_3d
 
         self._check()
@@ -1989,9 +1925,6 @@ class ProgressiveLoader:
         """Handle a batch of fetched chunks (already applied off-thread)."""
         if generation != self._generation or self._closed:
             return
-        if isinstance(batch, _StampedBatch):
-            self._congestion_brake(batch.sent)
-            batch = batch.payload
         if self._holding:
             # interaction in progress: no GPU patches, no refreshes, no
             # progress churn; _end_hold replays these once it settles
@@ -2039,35 +1972,6 @@ class ProgressiveLoader:
         ):
             self._last_node_update = now
             self._update_node()
-
-    def _congestion_brake(self, sent: float) -> None:
-        """Pause fetching briefly when the main thread is congested.
-
-        ``sent`` is when the worker yielded the batch; the difference to
-        now is how long the delivery sat in the event queue behind
-        draws, uploads and GIL contention. When it exceeds the
-        threshold, interactivity is starving: extend the interaction
-        hold (pausing the fetch workers at their next acquire) and let
-        the debounced check resume them — the same settle path a drag
-        uses. Fetch throughput yields to input latency.
-        """
-        if self._congestion_threshold_s <= 0 or self._closed:
-            return
-        latency = time.monotonic() - sent
-        if latency <= self._congestion_threshold_s:
-            return
-        LOGGER.debug(
-            'congestion brake: batch delivery took %.0fms',
-            latency * 1000,
-        )
-        self._hold_until = max(
-            self._hold_until,
-            time.monotonic() + self._congestion_hold_s,
-        )
-        for limiter in (self._limiter, self._resident_limiter):
-            if limiter is not None:
-                limiter.pause()
-        self._debounced_check()
 
     def _on_fetch_finished(self, generation: int) -> None:
         if generation != self._generation or self._closed:
@@ -2533,9 +2437,6 @@ class ProgressiveLoader:
         def on_chunk(batch, vdata=vdata):
             if self._closed or self._resident_worker is not worker:
                 return
-            if isinstance(batch, _StampedBatch):
-                self._congestion_brake(batch.sent)
-                batch = batch.payload
             if self._resident_pbar is not None:
                 self._advance_progress(len(batch), resident=True)
             if self._layer.data_level == self._resident_level:
@@ -2643,17 +2544,14 @@ def add_progressive_loading_image(
         size / 125 MB/s of GUI blocking on slow GL drivers).
     max_bytes_per_second : float, optional
         Rate-limit chunk loading (see
-        :class:`ProgressiveLoader`). ``None`` = unlimited; the
-        ``NAPARI_PROGRESSIVE_MAX_BPS`` environment variable overrides.
+        :class:`ProgressiveLoader`). ``None`` = unlimited.
     interaction_hold : bool
         Suspend all streaming work while the user interacts (see
-        :class:`ProgressiveLoader`). ``NAPARI_PROGRESSIVE_HOLD=0``
-        disables.
+        :class:`ProgressiveLoader`).
     interactive_step_rate : float
         Coarsen the volume raycast step by this factor during
         interaction, restoring full quality on settle (see
-        :class:`ProgressiveLoader`). 1.0 disables;
-        ``NAPARI_PROGRESSIVE_INTERACTIVE_STEP`` overrides.
+        :class:`ProgressiveLoader`). 1.0 disables.
     **layer_kwargs
         Additional keyword arguments passed to ``viewer.add_image``.
 
@@ -2669,9 +2567,6 @@ def add_progressive_loading_image(
 
         viewer = Viewer()
 
-    # env override so render-cost sweeps need no code changes: at 33MB
-    # a full-quality raycast frame profiled at ~69ms on Apple Silicon
-    # GL-over-Metal; an 8MB tile is ~4x cheaper per frame
     env_tile = os.environ.get('NAPARI_PROGRESSIVE_TILE_MAX_BYTES_3D')
     if env_tile:
         tile_max_bytes_3d = int(float(env_tile))
@@ -2733,7 +2628,7 @@ def add_progressive_loading_image(
     # Meter GLIR 3D texture uploads: without this, vispy drains every
     # queued glTexSubImage3D inside the next draw — including interaction
     # frames — which stalls the GUI for seconds on slow GL drivers
-    # (macOS GL-over-Metal). Disable with NAPARI_GLIR_METERING=0.
+    # (macOS GL-over-Metal).
     from napari.experimental import _glir_metering
 
     _glir_metering.install()

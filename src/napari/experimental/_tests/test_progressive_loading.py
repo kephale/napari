@@ -986,39 +986,6 @@ def test_progress_updates_deferred(
     loader._pbar = None
 
 
-def test_congestion_brake_pauses_and_resumes(
-    qtbot,
-    make_napari_viewer,
-    multiscale_arrays,
-):
-    """A batch that sat in the event queue past the threshold pauses
-    the fetch workers; the debounced check resumes them once the main
-    thread breathes again.
-    """
-    import time as _time
-
-    from napari.experimental._progressive_loading import _FetchRateLimiter
-
-    viewer = make_napari_viewer()
-    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
-    loader = layer.metadata['progressive_loader']
-    _wait_for_idle_loader(qtbot, loader)
-
-    loader._limiter = _FetchRateLimiter(None)
-    assert loader._limiter._go.is_set()
-    # off by default; the brake is opt-in
-    assert loader._congestion_threshold_s == 0.0
-    loader._congestion_brake(_time.monotonic() - 1.0)
-    assert loader._limiter._go.is_set()
-    loader._congestion_threshold_s = 0.2
-    loader._congestion_brake(
-        _time.monotonic() - loader._congestion_threshold_s - 1.0,
-    )
-    assert not loader._limiter._go.is_set()
-    assert loader._holding
-    qtbot.waitUntil(lambda: loader._limiter._go.is_set(), timeout=3000)
-
-
 # ---------- fetch rate limiting ----------
 
 
@@ -1093,25 +1060,10 @@ def test_fetch_chunks_respects_limiter(multiscale_arrays):
         ),
     )
     elapsed = _time.monotonic() - start
-    # batches are stamped with their send time for congestion tracking
-    fetched = [key for batch in batches for key in batch.payload]
+    fetched = [key for batch in batches for key in batch]
     assert sorted(map(str, fetched)) == sorted(map(str, keys))
     # 4 KB at 8 KB/s with the first chunk free -> >= ~0.375s
     assert elapsed >= 0.3
-
-
-def test_loader_max_bytes_per_second_env_override(
-    qtbot,
-    make_napari_viewer,
-    multiscale_arrays,
-    monkeypatch,
-):
-    monkeypatch.setenv('NAPARI_PROGRESSIVE_MAX_BPS', '12500000')
-    viewer = make_napari_viewer()
-    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
-    loader = layer.metadata['progressive_loader']
-    assert loader._max_bytes_per_second == 12_500_000
-    _wait_for_idle_loader(qtbot, loader)
 
 
 def test_loader_unlimited_by_default(
@@ -1214,21 +1166,6 @@ def test_interaction_hold_buffers_batches_and_refreshes(
     _wait_for_idle_loader(qtbot, loader)
 
 
-def test_interaction_hold_disabled_by_env(
-    qtbot,
-    make_napari_viewer,
-    multiscale_arrays,
-    monkeypatch,
-):
-    monkeypatch.setenv('NAPARI_PROGRESSIVE_HOLD', '0')
-    viewer = make_napari_viewer()
-    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
-    loader = layer.metadata['progressive_loader']
-    loader._on_interaction()
-    assert not loader._holding
-    _wait_for_idle_loader(qtbot, loader)
-
-
 def test_interaction_hold_pauses_fetch_limiter(
     qtbot,
     make_napari_viewer,
@@ -1254,7 +1191,7 @@ def test_glir_hold_defers_all_uploads(monkeypatch):
 
     from napari.experimental import _glir_metering as gm
 
-    monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
+
 
     class FakeParser:
         def __init__(self):
@@ -1339,28 +1276,6 @@ def test_double_buffer_swaps_and_content_correct(
         np.asarray(loader._data[0][0:64, 0:64, 0:64]),
         np.asarray(multiscale_3d_arrays[0]),
     )
-
-
-def test_double_buffer_disabled_by_env(
-    qtbot,
-    make_napari_viewer,
-    multiscale_3d_arrays,
-    monkeypatch,
-):
-    monkeypatch.setenv('NAPARI_PROGRESSIVE_DOUBLE_BUFFER', '0')
-    viewer = make_napari_viewer()
-    viewer.dims.ndisplay = 3
-    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
-    loader = layer.metadata['progressive_loader']
-    _wait_for_idle_loader(qtbot, loader)
-    layer.locked_data_level = 0
-    qtbot.waitUntil(
-        lambda: len(loader._data[0].loaded_chunks) > 0,
-        timeout=10000,
-    )
-    _wait_for_idle_loader(qtbot, loader)
-    assert loader._texture_patches > 0
-    assert loader._dbuf is None
 
 
 def _engaged_3d_dbuf(qtbot, make_napari_viewer, arrays):
@@ -1515,12 +1430,12 @@ def test_interactive_step_disabled(
     qtbot,
     make_napari_viewer,
     multiscale_3d_arrays,
-    monkeypatch,
 ):
-    monkeypatch.setenv('NAPARI_PROGRESSIVE_INTERACTIVE_STEP', '1')
     viewer = make_napari_viewer()
     viewer.dims.ndisplay = 3
-    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    layer = add_progressive_loading_image(
+        multiscale_3d_arrays, viewer=viewer, interactive_step_rate=1.0,
+    )
     loader = layer.metadata['progressive_loader']
     _wait_for_idle_loader(qtbot, loader)
     node = loader._get_volume_node()

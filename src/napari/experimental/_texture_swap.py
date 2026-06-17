@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 import time
 
 import numpy as np
@@ -42,7 +41,7 @@ LOGGER = logging.getLogger('napari.experimental._texture_swap')
 #: spare tiles. Sized for the 16 MB default tile cap, whose quantized
 #: shape vocabulary spans ~5 sizes (96..251^3) — up to 4 retired
 #: front/back pairs alive at once, <= ~60 MB of spares.
-#: NAPARI_PROGRESSIVE_TEXTURE_POOL overrides (0 disables).
+#:
 DEFAULT_TEXTURE_POOL_SIZE = 8
 
 
@@ -69,10 +68,7 @@ class DoubleBufferedVolumeTexture:
         # last; reused by _acquire instead of delete + reallocate.
         # Accepted from a predecessor pair so rebuilds reuse textures.
         self._pool: list[tuple] = pool if pool is not None else []
-        env_pool = os.environ.get('NAPARI_PROGRESSIVE_TEXTURE_POOL')
-        self._pool_max = (
-            int(env_pool) if env_pool else DEFAULT_TEXTURE_POOL_SIZE
-        )
+        self._pool_max = DEFAULT_TEXTURE_POOL_SIZE
         self._back = self._acquire(
             self._front.shape,
             getattr(self._front, '_data_dtype', None) or np.float32,
@@ -622,10 +618,7 @@ class DoubleBufferedImageTexture:
         self._front = node._texture
         self._shape = tuple(self._front.shape[:2])
         self._pool: list[tuple] = pool if pool is not None else []
-        env_pool = os.environ.get('NAPARI_PROGRESSIVE_TEXTURE_POOL')
-        self._pool_max = (
-            int(env_pool) if env_pool else DEFAULT_TEXTURE_POOL_SIZE
-        )
+        self._pool_max = DEFAULT_TEXTURE_POOL_SIZE
         self._back = self._acquire(
             self._shape,
             getattr(self._front, '_data_dtype', None) or np.float32,

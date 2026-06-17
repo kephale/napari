@@ -207,7 +207,7 @@ def test_small_2d_texture_not_metered(parser):
 
 
 def test_install_uninstall_idempotent(monkeypatch):
-    monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
+
     original = glir._GlirQueueShare.flush
     try:
         assert gm.install()
@@ -223,15 +223,8 @@ def test_install_uninstall_idempotent(monkeypatch):
     gm.uninstall()  # second uninstall is a no-op
 
 
-def test_install_disabled_by_env(monkeypatch):
-    monkeypatch.setenv('NAPARI_GLIR_METERING', '0')
-    original = glir._GlirQueueShare.flush
-    assert not gm.install()
-    assert glir._GlirQueueShare.flush is original
-
-
 def test_metered_flush_carries_and_drains(monkeypatch):
-    monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
+
     parser = FakeParser()
     parser.add_texture3d(1)
     try:
@@ -257,7 +250,7 @@ def test_metered_flush_carries_and_drains(monkeypatch):
 
 
 def test_metered_flush_new_size_cancels_carry(monkeypatch):
-    monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
+
     parser = FakeParser()
     parser.add_texture3d(1)
     try:
@@ -343,7 +336,7 @@ def test_viewport_and_clearcolor_deduped(parser):
 
 
 def test_deletes_deferred_to_quiet_flush(monkeypatch):
-    monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
+
     parser = FakeParser()
     parser.add_texture3d(1)
     try:
@@ -380,7 +373,7 @@ def test_delete_drain_is_paced(monkeypatch):
     once — each deletion can sync the GPU pipeline, so a bulk drain is
     itself a multi-second stall at pass end.
     """
-    monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
+
     parser = FakeParser()
     parser.add_texture3d(1)
     try:
@@ -421,7 +414,7 @@ def test_delete_drain_is_paced(monkeypatch):
 
 
 def test_uninstall_flushes_deferred_deletes(monkeypatch):
-    monkeypatch.delenv('NAPARI_GLIR_METERING', raising=False)
+
     parser = FakeParser()
     try:
         assert gm.install()
