@@ -389,3 +389,70 @@ class TestLockedDataLevelDraw:
                 f'Level {level_idx}: expected all {expected_value}, '
                 f'got unique values {np.unique(view)}'
             )
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for multiscale bugfixes
+# ---------------------------------------------------------------------------
+
+
+def test_get_value_ray_3d_multiscale_rgb():
+    """_get_value_ray must handle RGB data whose slice has a trailing
+    channel dimension (D, H, W, 3) without a shape mismatch.
+
+    Regression test: on main, ``slice_shape = np.array(im_slice.shape)``
+    produced 4 elements for an RGB slice, but
+    ``level0_shape[dims_displayed]`` has only 3. The division then failed
+    with a broadcast error.
+    """
+    data = [
+        np.full((8, 16, 16, 3), 42, dtype=np.uint8),
+        np.full((4, 8, 8, 3), 42, dtype=np.uint8),
+    ]
+    layer = Image(data, multiscale=True, rgb=True)
+    dims = Dims(ndim=3, ndisplay=3)
+    layer._slice_dims(dims)
+
+    start = np.array([0.0, 0.0, 0.0])
+    end = np.array([7.0, 15.0, 15.0])
+    dims_displayed = [0, 1, 2]
+
+    value = layer._get_value_ray(start, end, dims_displayed)
+    assert value is not None
+
+
+def test_set_view_slice_3d_multiscale_corners_without_viewer():
+    """Switching a multiscale layer to ndisplay=3 without a viewer
+    (no _update_draw) must set corner_pixels and _data_level to the
+    coarsest level so slicing produces correct 3D data.
+
+    Regression test: without the fix, corner_pixels stayed at the 2D
+    extent and _data_level was not updated, leading to wrong or empty
+    slices.
+    """
+    data = [
+        np.full((8, 40, 20), 10, dtype=np.uint8),
+        np.full((4, 20, 10), 20, dtype=np.uint8),
+        np.full((2, 10, 5), 30, dtype=np.uint8),
+    ]
+    layer = Image(data, multiscale=True)
+
+    dims_3d = Dims(ndim=3, ndisplay=3)
+    layer._slice_dims(dims_3d)
+
+    coarsest = len(data) - 1
+    assert layer.data_level == coarsest, (
+        f'Expected data_level={coarsest}, got {layer.data_level}'
+    )
+
+    expected_shape = np.array(data[coarsest].shape)
+    corners = layer.corner_pixels
+    actual_extent = corners[1, :] - corners[0, :] + 1
+    np.testing.assert_array_equal(
+        actual_extent,
+        expected_shape,
+        err_msg=(
+            'corner_pixels should span the full coarsest level '
+            'when switching to 3D without a viewer'
+        ),
+    )
