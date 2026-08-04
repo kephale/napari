@@ -2,10 +2,18 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import dask.array as da
 import numpy as np
-from lodstone import Region, TileKey, Update
+from lodstone import Plan, Region, Tile, TileKey, Update
 
-from napari.experimental._lodstone_loading import _NapariTarget
+from napari.experimental._lodstone_loading import (
+    PlanComparison,
+    PlanTrace,
+    _camera_view,
+    _level_transforms,
+    _NapariTarget,
+    add_lodstone_loading_image,
+)
 
 
 class _VirtualData:
@@ -42,3 +50,226 @@ def test_target_applies_full_nd_chunk_before_render_callback() -> None:
     assert np.all(vdata.values[1] == 1)
     assert ((1, 2), (0, 4), (0, 4)) in vdata.loaded_chunks
     assert delivered == [(7, vdata, [region.slices()])]
+
+
+def test_plan_trace_compares_geometry_not_planner_specific_keys() -> None:
+    region = Region((0, 0), (8, 8))
+    left = Tile(TileKey(0, (0, 0), ()), region, 0.0)
+    right = Tile(TileKey(0, (99, 99), ()), region, 42.0)
+    first = Plan((left,), frozenset({left.key}), 0, (left,))
+    second = Plan((right,), frozenset({right.key}), 0, (right,))
+
+    trace = PlanTrace.from_plan(first)
+    comparison = PlanComparison(
+        SimpleNamespace(),
+        trace,
+        PlanTrace.from_plan(second),
+    )
+
+    assert comparison.matches
+    assert trace.tiles == ((0, (0, 0), (8, 8), 0),)
+    assert trace.wanted == trace.tiles
+
+
+def test_level_transforms_include_downsampling_and_layer_transform() -> None:
+    layer_matrix = np.eye(3)
+    layer_matrix[0, 0] = 3
+    layer_matrix[1, 1] = 5
+    layer_matrix[:-1, -1] = (7, 11)
+    layer = SimpleNamespace(
+        _data_to_world=SimpleNamespace(affine_matrix=layer_matrix),
+    )
+    data = SimpleNamespace(ndim=2, _scale_factors=((1, 1), (2, 4)))
+
+    finest, coarse = _level_transforms(layer, data)
+
+    np.testing.assert_allclose(finest, layer_matrix)
+    np.testing.assert_allclose(
+        coarse,
+        np.array([[6, 0, 7], [0, 20, 11], [0, 0, 1]]),
+    )
+
+
+def test_camera_view_captures_2d_viewport_center_and_zoom() -> None:
+    viewer = SimpleNamespace(
+        canvas=SimpleNamespace(size=(200, 400)),
+        camera=SimpleNamespace(center=(0, 10, 20), zoom=4),
+        dims=SimpleNamespace(point=(0, 0)),
+    )
+    layer = SimpleNamespace(
+        _slice_input=SimpleNamespace(displayed=(0, 1)),
+        world_to_data=lambda point: point,
+    )
+
+    view = _camera_view(viewer, layer, (100, 100), depth_span=1)
+
+    assert view.viewport == (200, 400)
+    np.testing.assert_allclose(
+        view.world_to_clip @ np.array([10, 20, 0, 1]),
+        (0, 0, 0, 1),
+    )
+    # Four pixels per world unit on both canvas axes.
+    assert view.world_to_clip[0, 0] * view.viewport[0] / 2 == 4
+    assert view.world_to_clip[1, 1] * view.viewport[1] / 2 == 4
+
+
+def test_camera_view_captures_3d_orientation_and_hidden_index() -> None:
+    viewer = SimpleNamespace(
+        canvas=SimpleNamespace(size=(200, 400)),
+        camera=SimpleNamespace(
+            center=(8, 16, 24),
+            zoom=4,
+            view_direction=(-1, 0, 0),
+            up_direction=(0, -1, 0),
+        ),
+        dims=SimpleNamespace(point=(99, 8, 16, 24)),
+    )
+    layer = SimpleNamespace(
+        _slice_input=SimpleNamespace(displayed=(1, 2, 3)),
+        world_to_data=lambda point: point,
+    )
+
+    view = _camera_view(viewer, layer, (10, 20, 30, 40), depth_span=80)
+
+    assert view.index == (9, None, None, None)
+    np.testing.assert_allclose(
+        view.world_to_clip @ np.array([8, 16, 24, 1]),
+        (0, 0, 0, 1),
+    )
+    # Moving with the view direction moves from the camera into the scene.
+    assert (view.world_to_clip @ np.array([7, 16, 24, 1]))[2] > 0
+
+
+def test_real_fetch_pass_records_napari_and_lodstone_plans(
+    qtbot,
+    make_napari_viewer,
+) -> None:
+    base = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    arrays = [
+        da.from_array(base, chunks=(16, 16)),
+        da.from_array(base[::2, ::2], chunks=(16, 16)),
+        da.from_array(base[::4, ::4], chunks=(16, 16)),
+    ]
+    viewer = make_napari_viewer()
+    layer = add_lodstone_loading_image(arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    try:
+        qtbot.waitUntil(lambda: bool(loader._plan_comparisons), timeout=10000)
+        comparison = loader.plan_comparisons[-1]
+
+        assert comparison.view.viewport == viewer.canvas.size
+        assert comparison.view.displayed_axes == tuple(
+            layer._slice_input.displayed
+        )
+        assert comparison.napari.tiles
+        assert comparison.lodstone.tiles
+        assert comparison.geometry_matches
+        assert (
+            PlanTrace.from_plan(loader._lodstone_planner.next_plan)
+            == comparison.lodstone
+        )
+
+        comparison_count = len(loader.plan_comparisons)
+        viewer.camera.center = (16, 48)
+        viewer.camera.zoom = 20
+        # Headless tests do not have a canvas draw to refresh corner_pixels.
+        layer.corner_pixels = np.array([[0, 33], [36, 63]])
+        loader._data[0].loaded_chunks.clear()
+        loader._active = None
+        loader._check()
+        qtbot.waitUntil(
+            lambda: len(loader.plan_comparisons) > comparison_count,
+            timeout=10000,
+        )
+        assert loader.plan_comparisons[-1].geometry_matches
+
+    finally:
+        loader.close()
+
+
+def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
+    qtbot,
+    make_napari_viewer,
+) -> None:
+    base = np.zeros((32, 32, 32), dtype=np.uint16)
+    arrays = [
+        da.from_array(base, chunks=(8, 8, 8)),
+        da.from_array(base[::2, ::2, ::2], chunks=(8, 8, 8)),
+        da.from_array(base[::4, ::4, ::4], chunks=(8, 8, 8)),
+    ]
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_lodstone_loading_image(arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    try:
+        qtbot.waitUntil(lambda: bool(loader.plan_comparisons), timeout=10000)
+        comparison = loader.plan_comparisons[-1]
+
+        assert comparison.view.displayed_axes == tuple(
+            layer._slice_input.displayed
+        )
+        assert comparison.napari.tiles
+        assert comparison.lodstone.tiles
+        assert comparison.geometry_matches
+        assert (
+            PlanTrace.from_plan(loader._lodstone_planner.next_plan)
+            == comparison.lodstone
+        )
+
+        comparison_count = len(loader.plan_comparisons)
+        viewer.camera.angles = (25, 35, 10)
+        viewer.camera.zoom = 20
+        loader._data[0].loaded_chunks.clear()
+        loader._active = None
+        loader._check()
+        qtbot.waitUntil(
+            lambda: len(loader.plan_comparisons) > comparison_count,
+            timeout=10000,
+        )
+        assert loader.plan_comparisons[-1].geometry_matches
+
+        comparison_count = len(loader.plan_comparisons)
+        viewer.camera.zoom = 1
+        loader._data[1].loaded_chunks.clear()
+        loader._active = None
+        loader._check()
+        qtbot.waitUntil(
+            lambda: len(loader.plan_comparisons) > comparison_count,
+            timeout=10000,
+        )
+        comparison = loader.plan_comparisons[-1]
+        assert comparison.napari.target_level == 1
+        assert comparison.lodstone.target_level == 1
+        assert comparison.geometry_matches
+    finally:
+        loader.close()
+
+
+def test_plan_geometry_matches_after_hidden_axis_step(
+    qtbot,
+    make_napari_viewer,
+) -> None:
+    base = np.zeros((3, 64, 64), dtype=np.uint16)
+    arrays = [
+        da.from_array(base, chunks=(1, 16, 16)),
+        da.from_array(base[:, ::2, ::2], chunks=(1, 16, 16)),
+        da.from_array(base[:, ::4, ::4], chunks=(1, 16, 16)),
+    ]
+    viewer = make_napari_viewer()
+    layer = add_lodstone_loading_image(arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    try:
+        qtbot.waitUntil(lambda: bool(loader.plan_comparisons), timeout=10000)
+        comparison_count = len(loader.plan_comparisons)
+
+        viewer.dims.set_point(0, 2)
+        qtbot.waitUntil(
+            lambda: len(loader.plan_comparisons) > comparison_count,
+            timeout=10000,
+        )
+        comparison = loader.plan_comparisons[-1]
+
+        assert comparison.view.index == (2, None, None)
+        assert comparison.geometry_matches
+    finally:
+        loader.close()
