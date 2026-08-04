@@ -708,6 +708,7 @@ class ProgressiveLoader:
         interaction_hold: bool = True,
         interactive_step_rate: float = 4.0,
         coarse_first: bool = True,
+        _start_immediately: bool = True,
     ):
         self._viewer = viewer
         self._layer = layer
@@ -910,7 +911,8 @@ class ProgressiveLoader:
         self._tile_margin_3d = 1.25
         layer._tile_margin_3d = self._tile_margin_3d
 
-        self._check()
+        if _start_immediately:
+            self._check()
 
     # -- lifecycle --
 
@@ -3154,6 +3156,7 @@ def _attach_progressive_loader(
     interactive_step_rate,
     coarse_first,
     debug_overlay=None,
+    loader_class=ProgressiveLoader,
 ) -> ProgressiveLoader:
     """Wire a constructed multiscale layer to a :class:`ProgressiveLoader`.
 
@@ -3197,7 +3200,7 @@ def _attach_progressive_loader(
     from napari.experimental import _glir_metering
 
     _glir_metering.install()
-    loader = ProgressiveLoader(
+    loader = loader_class(
         viewer,
         layer,
         data,
