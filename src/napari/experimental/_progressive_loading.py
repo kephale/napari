@@ -1250,20 +1250,43 @@ class ProgressiveLoader:
                 np.asarray(vdata.shape, dtype=np.int64),
                 displayed,
             )
-            extent = np.minimum(level_extent, self._tile_extent_3d)
+            view_dir = getattr(layer, '_view_direction_data', lambda _d: None)(
+                displayed
+            )
+            render_corners = layer._corners_for_locked_level(
+                level,
+                displayed,
+                bbox,
+                view_dir,
+            )
+            extent = (
+                render_corners[1, displayed] - render_corners[0, displayed] + 1
+            )
             if bbox is not None:
                 downsample = np.take(
                     np.asarray(self._data._scale_factors[level]),
                     displayed,
                 )
-                view_extent = np.ceil((bbox[1] - bbox[0]) / downsample).astype(
-                    np.int64,
+                level_bbox = np.stack(
+                    [
+                        np.clip(bbox[0] / downsample, 0, level_extent),
+                        np.clip(bbox[1] / downsample, 0, level_extent),
+                    ]
                 )
+                required_low = np.floor(level_bbox[0]).astype(np.int64)
+                required_high = np.ceil(level_bbox[1]).astype(np.int64)
+                view_extent = np.maximum(required_high - required_low, 1)
                 visible = np.minimum(
                     np.maximum(view_extent, 1),
                     level_extent,
                 )
-                if np.any(visible > self._tile_extent_3d):
+                render_low = render_corners[0, displayed]
+                render_high = render_corners[1, displayed] + 1
+                if (
+                    np.any(visible > extent)
+                    or np.any(render_low > required_low)
+                    or np.any(render_high < required_high)
+                ):
                     # the tile cap cannot cover the canvas at this
                     # level: a finer-but-partial tile reads as the
                     # volume shrinking while you zoom in — coverage

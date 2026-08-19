@@ -479,6 +479,7 @@ def test_zoom_target_level_3d_uninitialized_camera(
     [
         (45.67695591944634, 65.58991673574316, 70.5187757126331),
         (66.77365262411085, 62.60192271711876, 93.99837913639783),
+        (87.99167405929343, 29.98890885990298, 126.75775008239037),
     ],
 )
 def test_camera_bbox_covers_rotated_screen_plane(
@@ -641,6 +642,33 @@ def test_corners_for_locked_level_subvolume(
     # small level: unaffected
     corners = layer._corners_for_locked_level(2, displayed, bbox)
     assert (corners[1] - corners[0] + 1)[list(displayed)].max() == 16
+
+
+def test_corners_adapt_tile_shape_to_rotated_viewport(
+    make_napari_viewer,
+):
+    """A wide rotated footprint must not expose the shallow tile face."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    shapes = [(448, 2174, 2423), (224, 1087, 1212), (112, 544, 606)]
+    arrays = [
+        da.zeros(shape, chunks=(128, 362, 362), dtype=np.uint8)
+        for shape in shapes
+    ]
+    layer = viewer.add_image(arrays, multiscale=True)
+    layer._max_tile_extent_3d = 400
+    layer._tile_max_bytes_3d = 64 * 1024**2
+    layer._interval_max_bytes_3d = 512 * 1024**2
+    layer._tile_margin_3d = 1.25
+    displayed = list(layer._slice_input.displayed)
+    bbox = np.array([[202.0, 750.0, 1650.0], [398.0, 1250.0, 1950.0]])
+
+    corners = layer._corners_for_locked_level(0, displayed, bbox)
+    low = corners[0, displayed]
+    high = corners[1, displayed] + 1
+    assert np.all(low <= np.floor(bbox[0]))
+    assert np.all(high >= np.ceil(bbox[1]))
+    assert np.prod(high - low, dtype=np.int64) <= 64 * 1024**2
 
 
 def test_unlocked_3d_view_tiled_when_capped(

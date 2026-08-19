@@ -423,8 +423,10 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         diagnostics = self._lodstone_stream.diagnostics
         LOGGER.info(
             'Lodstone submitted exact napari plan: generation=%d '
-            'desired_tiles=%d wanted_tiles=%d native_chunks=%d',
+            'target_level=%d desired_tiles=%d wanted_tiles=%d '
+            'native_chunks=%d',
             diagnostics.generation,
+            plan.target_level,
             diagnostics.desired_tiles,
             diagnostics.wanted_tiles,
             diagnostics.unique_native_chunks,

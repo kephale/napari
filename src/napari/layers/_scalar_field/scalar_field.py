@@ -704,10 +704,10 @@ class ScalarFieldBase(Layer, ABC):
         current view in level-0 data coordinates) or the middle of the
         level.
 
-        When *view_direction* is given (unit vector in displayed-data
-        coords), the tile center is biased toward the near face of the
-        volume (the side the camera sees first) so that the closest data
-        loads first after a rotation.
+        When a viewport bbox is available, the tile shape adapts to its
+        rotated per-axis footprint and remains centered on it. Chunk fetch
+        priority, rather than moving the crop itself, handles near-to-far
+        loading after a rotation.
         """
         shape_at_level = np.take(
             np.asarray(self.level_shapes[level]), displayed_axes
@@ -767,20 +767,34 @@ class ScalarFieldBase(Layer, ABC):
                     )
         else:
             tile_extent = np.minimum(shape_at_level, extent_cap)
+        base = None
         if data_bbox_int is not None and np.all(np.isfinite(data_bbox_int)):
             bbox = np.asarray(data_bbox_int, dtype=float) / downsample
+            bbox = np.stack(
+                [
+                    np.clip(bbox[0], 0, shape_at_level),
+                    np.clip(bbox[1], 0, shape_at_level),
+                ]
+            )
             center = bbox.mean(axis=0)
-
-            # Bias toward the near face: shift the center against the
-            # view direction so the tile covers the camera-facing side
-            # of the volume rather than its geometric center.
-            if view_direction is not None:
-                vd = np.asarray(view_direction, dtype=float)
-                vd_norm = np.linalg.norm(vd)
-                if vd_norm > 1e-12:
-                    vd = vd / vd_norm
-                    shift = -vd * tile_extent * 0.35
-                    center = center + shift
+            if tile_bytes is not None:
+                # Spend the texture budget around the rotated viewport's
+                # actual per-axis footprint.  A fixed anisotropic tile based
+                # only on the dataset shape can be too shallow along a
+                # rotated screen axis while wasting space off-screen.
+                visible = np.maximum(np.ceil(bbox[1] - bbox[0]), 1).astype(
+                    np.int64
+                )
+                base = np.minimum(
+                    np.minimum(shape_at_level, gl_max),
+                    np.maximum(visible, _MIN_TILE_EXTENT_3D),
+                )
+                if int(np.prod(base, dtype=np.int64)) <= max_elements:
+                    margin = float(getattr(self, '_tile_margin_3d', 1.25))
+                    tile_extent = np.minimum(
+                        np.ceil(base * margin).astype(np.int64),
+                        shape_at_level,
+                    )
         else:
             center = shape_at_level / 2
         quantum = _TILE_EXTENT_QUANTUM_3D
@@ -789,6 +803,27 @@ class ScalarFieldBase(Layer, ABC):
             -(-tile_extent // quantum) * quantum,
             shape_at_level,
         )
+        if tile_bytes is not None:
+            # Quantization supplies stable tile dimensions but can push a
+            # viewport-adaptive candidate over budget.  Remove only margin
+            # slack; never shrink below the visible footprint here.
+            minimum = (
+                np.minimum(
+                    -(-base // quantum) * quantum,
+                    shape_at_level,
+                )
+                if base is not None
+                else np.minimum(_MIN_TILE_EXTENT_3D, shape_at_level)
+            )
+            while int(
+                np.prod(tile_extent, dtype=np.int64)
+            ) > max_elements and np.any(tile_extent > minimum):
+                slack = tile_extent - minimum
+                axis = int(np.argmax(slack))
+                tile_extent[axis] = max(
+                    int(tile_extent[axis]) - quantum,
+                    int(minimum[axis]),
+                )
         center = np.clip(center, 0, shape_at_level - 1)
         if np.all(tile_extent >= shape_at_level):
             return corners
