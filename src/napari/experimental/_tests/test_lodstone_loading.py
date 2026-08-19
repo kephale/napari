@@ -167,6 +167,14 @@ def test_real_fetch_pass_records_napari_and_lodstone_plans(
         assert comparison.geometry_matches
         assert loader._submitted_plan is not None
         assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
+        qtbot.waitUntil(
+            lambda: bool(loader.execution_diagnostics), timeout=10000
+        )
+        diagnostics = loader.execution_diagnostics[-1]
+        assert diagnostics.desired_tiles == len(comparison.napari.tiles)
+        assert diagnostics.wanted_tiles == len(comparison.napari.wanted)
+        assert diagnostics.unique_native_chunks > 0
+        assert diagnostics.source_reads > 0
 
         comparison_count = len(loader.plan_comparisons)
         viewer.scene.camera.center = (16, 48)

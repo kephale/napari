@@ -22,6 +22,7 @@ from lodstone import (
     Planner,
     Region,
     Stream,
+    StreamDiagnostics,
     Tile,
     TileKey,
     View,
@@ -34,6 +35,7 @@ from napari.experimental._progressive_loading import (
     DEFAULT_TILE_MAX_BYTES_3D,
     ProgressiveLoader,
     _attach_progressive_loader,
+    _chunk_id,
     _estimate_contrast_limits,
     _normalize_scale_for_float32,
     _resolve_viewer_and_tile_cap,
@@ -268,6 +270,9 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             3: Planner(lod_bias=lod_bias),
         }
         self._plan_comparisons: deque[PlanComparison] = deque(maxlen=32)
+        self._execution_diagnostics: deque[StreamDiagnostics] = deque(
+            maxlen=32
+        )
         self._lodstone_dispatcher = _QtDispatcher()
         self._submitted_plan: Plan | None = None
         self._lodstone_target = _NapariTarget(self)
@@ -281,6 +286,23 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         self._lodstone_stream.on_status_changed(self._on_lodstone_status)
         self._lodstone_enabled = True
         self._check()
+
+    def _start_resident_fill(self, min_coord, max_coord) -> None:
+        vdata = self._data[self._resident_level]
+        dimensions = chunk_slices(vdata, interval=(min_coord, max_coord))
+        desired = 0
+        wanted = 0
+        for key in itertools.product(*dimensions):
+            desired += 1
+            wanted += _chunk_id(key) not in vdata.loaded_chunks
+        LOGGER.info(
+            'napari resident bootstrap trace: level=%d '
+            'desired_chunks=%d wanted_chunks=%d',
+            self._resident_level,
+            desired,
+            wanted,
+        )
+        super()._start_resident_fill(min_coord, max_coord)
 
     def _start_stage(self, generation: int, index: int) -> None:
         if not self._lodstone_enabled or self._lodstone_stream is None:
@@ -344,6 +366,15 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         self._lodstone_target.generation = generation
         self._worker = _WorkerProxy(self._lodstone_stream)
         self._lodstone_stream.submit(view, plan)
+        diagnostics = self._lodstone_stream.diagnostics
+        LOGGER.info(
+            'Lodstone submitted exact napari plan: generation=%d '
+            'desired_tiles=%d wanted_tiles=%d native_chunks=%d',
+            diagnostics.generation,
+            diagnostics.desired_tiles,
+            diagnostics.wanted_tiles,
+            diagnostics.unique_native_chunks,
+        )
 
     @staticmethod
     def _plan_tiles(level: int, queue, phase: int) -> tuple[Tile, ...]:
@@ -454,7 +485,17 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         """Recent PR/shared-planner traces, oldest first."""
         return tuple(self._plan_comparisons)
 
+    @property
+    def execution_diagnostics(self) -> tuple[StreamDiagnostics, ...]:
+        """Recent exact-plan native-read traces, oldest first."""
+        return tuple(self._execution_diagnostics)
+
     def _on_lodstone_status(self, status) -> None:
+        stream = self._lodstone_stream
+        if status.state in {'complete', 'failed'} and stream is not None:
+            diagnostics = stream.diagnostics
+            if diagnostics.generation == status.generation:
+                self._record_execution_diagnostics(diagnostics, status.state)
         if status.state == 'failed':
             LOGGER.error(
                 'Lodstone progressive pass failed: %s',
@@ -465,6 +506,40 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
                     status.error.__traceback__,
                 ),
             )
+
+    def _record_execution_diagnostics(
+        self, diagnostics: StreamDiagnostics, state: str
+    ) -> None:
+        if diagnostics.generation == 0:
+            LOGGER.info(
+                'Lodstone execution trace: no exact plan was submitted; '
+                'napari resident bootstrap remained active'
+            )
+            return
+        if (
+            self._execution_diagnostics
+            and self._execution_diagnostics[-1].generation
+            == diagnostics.generation
+        ):
+            return
+        self._execution_diagnostics.append(diagnostics)
+        LOGGER.info(
+            'Lodstone execution trace: state=%s generation=%d '
+            'desired_tiles=%d wanted_tiles=%d native_chunks=%d '
+            'cache_hits=%d joined_reads=%d source_reads=%d '
+            'evictions=%d cache_chunks=%d cache_bytes=%d',
+            state,
+            diagnostics.generation,
+            diagnostics.desired_tiles,
+            diagnostics.wanted_tiles,
+            diagnostics.unique_native_chunks,
+            diagnostics.cache_hits,
+            diagnostics.joined_reads,
+            diagnostics.source_reads,
+            diagnostics.evictions,
+            diagnostics.cache_chunks,
+            diagnostics.cache_bytes,
+        )
 
     def _on_interaction(self, event=None) -> None:
         super()._on_interaction(event)
@@ -482,6 +557,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         self._lodstone_enabled = False
         if stream is not None:
             stream.close()
+            self._record_execution_diagnostics(stream.diagnostics, 'closed')
         super().close()
 
 
