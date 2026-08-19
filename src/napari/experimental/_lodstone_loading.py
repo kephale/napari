@@ -188,16 +188,6 @@ class _QtDispatcher(QObject):
         self.requested.emit(callback)
 
 
-class _PassPlanner:
-    def __init__(self) -> None:
-        self.next_plan: Plan | None = None
-
-    def plan(self, *_args, **_kwargs) -> Plan:
-        if self.next_plan is None:
-            raise RuntimeError('napari did not prepare a Lodstone pass')
-        return self.next_plan
-
-
 class _WorkerProxy:
     def __init__(self, stream: Stream) -> None:
         self._stream = stream
@@ -279,12 +269,11 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         }
         self._plan_comparisons: deque[PlanComparison] = deque(maxlen=32)
         self._lodstone_dispatcher = _QtDispatcher()
-        self._lodstone_planner = _PassPlanner()
+        self._submitted_plan: Plan | None = None
         self._lodstone_target = _NapariTarget(self)
         self._lodstone_stream = Stream(
             source,
             self._lodstone_target,
-            planner=self._lodstone_planner,
             dispatch=self._lodstone_dispatcher.dispatch,
             workers=self._fetch_workers,
             bytes_per_second=self._max_bytes_per_second,
@@ -346,13 +335,15 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             comparison.lodstone.target_level,
             len(comparison.lodstone.tiles),
         )
-        # Planning authority transfers here. Napari's plan above remains in
-        # the comparison trace while all renderer/residency behavior stays on
-        # the existing ProgressiveLoader path.
-        self._lodstone_planner.next_plan = shared
+        # The renderer-specific napari plan is authoritative. In particular,
+        # its 3-D plan is a chunk-aligned, memory-bounded cuboid and is
+        # intentionally broader than strict view-frustum intersection on
+        # large anisotropic volumes such as Zebrahub. Lodstone executes these
+        # exact regions while the shared planner remains a diagnostic trace.
+        self._submitted_plan = plan
         self._lodstone_target.generation = generation
         self._worker = _WorkerProxy(self._lodstone_stream)
-        self._lodstone_stream.update(view)
+        self._lodstone_stream.submit(view, plan)
 
     @staticmethod
     def _plan_tiles(level: int, queue, phase: int) -> tuple[Tile, ...]:
@@ -497,6 +488,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
 def add_lodstone_loading_image(
     img,
     viewer=None,
+    fill_value=0,
     contrast_limits=None,
     colormap='gray',
     rendering='attenuated_mip',
@@ -517,7 +509,7 @@ def add_lodstone_loading_image(
         viewer,
         tile_max_bytes_3d,
     )
-    data = MultiScaleVirtualData(img)
+    data = MultiScaleVirtualData(img, fill_value=fill_value)
     _normalize_scale_for_float32(data, layer_kwargs, 'image')
     if contrast_limits is None:
         contrast_limits = _estimate_contrast_limits(data.arrays[-1])
@@ -554,6 +546,7 @@ def add_lodstone_loading_image(
 def add_lodstone_loading_labels(
     labels,
     viewer=None,
+    fill_value=0,
     name=None,
     auto_level_3d=True,
     max_pixel_size_3d=2.0,
@@ -572,7 +565,7 @@ def add_lodstone_loading_labels(
         viewer,
         tile_max_bytes_3d,
     )
-    data = MultiScaleVirtualData(labels)
+    data = MultiScaleVirtualData(labels, fill_value=fill_value)
     _normalize_scale_for_float32(data, layer_kwargs, 'label')
 
     from napari.layers import Labels

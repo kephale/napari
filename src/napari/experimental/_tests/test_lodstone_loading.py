@@ -165,10 +165,8 @@ def test_real_fetch_pass_records_napari_and_lodstone_plans(
         assert comparison.napari.tiles
         assert comparison.lodstone.tiles
         assert comparison.geometry_matches
-        assert (
-            PlanTrace.from_plan(loader._lodstone_planner.next_plan)
-            == comparison.lodstone
-        )
+        assert loader._submitted_plan is not None
+        assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
 
         comparison_count = len(loader.plan_comparisons)
         viewer.scene.camera.center = (16, 48)
@@ -212,10 +210,8 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
         assert comparison.napari.tiles
         assert comparison.lodstone.tiles
         assert comparison.geometry_matches
-        assert (
-            PlanTrace.from_plan(loader._lodstone_planner.next_plan)
-            == comparison.lodstone
-        )
+        assert loader._submitted_plan is not None
+        assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
 
         comparison_count = len(loader.plan_comparisons)
         viewer.scene.camera.angles = (25, 35, 10)
@@ -287,12 +283,13 @@ def test_lodstone_labels_use_shared_progressive_loader(
         da.from_array(base[::4, ::4], chunks=(16, 16)),
     ]
     viewer = make_napari_viewer()
-    layer = add_lodstone_loading_labels(arrays, viewer=viewer)
+    layer = add_lodstone_loading_labels(arrays, viewer=viewer, fill_value=9)
     loader = layer.metadata['progressive_loader']
     try:
         qtbot.waitUntil(lambda: bool(loader.plan_comparisons), timeout=10000)
 
         assert layer._type_string == 'labels'
+        assert all(level.fill_value == 9 for level in loader._data)
         assert loader.plan_comparisons[-1].geometry_matches
     finally:
         loader.close()
@@ -318,5 +315,42 @@ def test_lodstone_preserves_rectilinear_chunk_geometry(
             (9, 13, 15),
         )
         assert loader.plan_comparisons[-1].geometry_matches
+    finally:
+        loader.close()
+
+
+def test_napari_plan_remains_authoritative_when_generic_plan_differs(
+    qtbot,
+    make_napari_viewer,
+) -> None:
+    base = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    arrays = [
+        da.from_array(base, chunks=(16, 16)),
+        da.from_array(base[::2, ::2], chunks=(16, 16)),
+    ]
+    viewer = make_napari_viewer()
+    layer = add_lodstone_loading_image(arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    try:
+        qtbot.waitUntil(lambda: bool(loader.plan_comparisons), timeout=10000)
+        comparison_count = len(loader.plan_comparisons)
+        loader._shared_planners[2] = SimpleNamespace(
+            plan=lambda *_args, **_kwargs: Plan((), frozenset(), 0, ()),
+        )
+        loader._data[0].loaded_chunks.clear()
+        loader._active = None
+
+        loader._check()
+        qtbot.waitUntil(
+            lambda: len(loader.plan_comparisons) > comparison_count,
+            timeout=10000,
+        )
+
+        comparison = loader.plan_comparisons[-1]
+        assert not comparison.geometry_matches
+        assert comparison.napari.tiles
+        assert not comparison.lodstone.tiles
+        assert loader._submitted_plan is not None
+        assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
     finally:
         loader.close()
