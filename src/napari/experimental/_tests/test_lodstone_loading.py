@@ -30,6 +30,13 @@ class _VirtualData:
     def set_offset(self, key, value) -> None:
         self.values[key] = value
 
+    def set_chunk(self, key, value, source_level) -> bool:
+        self.set_offset(key, value)
+        chunk_id = tuple((sl.start, sl.stop) for sl in key)
+        self.loaded_chunks.add(chunk_id)
+        self.chunk_source[chunk_id] = source_level
+        return True
+
 
 def test_level_diagnostic_array_reads_source_and_returns_level_label() -> None:
     class RecordingArray:

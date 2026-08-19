@@ -350,10 +350,7 @@ def _chunk_id(chunk_key: tuple[slice, ...]) -> tuple[tuple[int, int], ...]:
 
 def _apply_chunk(vdata: VirtualData, chunk_key, chunk) -> None:
     """Write a fetched chunk into *vdata* and record its provenance."""
-    vdata.set_offset(chunk_key, chunk)
-    cid = _chunk_id(chunk_key)
-    vdata.loaded_chunks.add(cid)
-    vdata.chunk_source[cid] = vdata.scale_level
+    vdata.set_chunk(chunk_key, chunk, vdata.scale_level)
 
 
 def _pack_upload_block(vdata: VirtualData, keys) -> tuple | None:
@@ -1303,10 +1300,9 @@ class ProgressiveLoader:
         """Approximate visible bbox around the camera, in level-0 coords.
 
         Sized from the canvas dimensions and zoom so 3D sub-volume tiles
-        cover (roughly) what is on screen rather than the whole memory
-        budget. In 3D the depth axis (along the view direction) gets a
-        smaller extent than the screen-plane axes so the tile tracks the
-        rotated frustum.
+        cover what is on screen rather than the whole memory budget.  In 3D
+        this is the data-axis-aligned bound of the camera's oriented screen
+        plane, plus a smaller depth extent along the viewing ray.
         """
         camera = self._viewer.scene.camera
         camera_center = np.asarray(camera.center, dtype=float)
@@ -1328,36 +1324,44 @@ class ProgressiveLoader:
             return None
         zoom = float(camera.zoom)
         try:
-            canvas_size = max(self._viewer.canvas.size)
+            canvas_size = np.asarray(self._viewer.canvas.size, dtype=float)
         except Exception:  # pragma: no cover - headless  # noqa: BLE001
-            canvas_size = 800
-        if not np.isfinite(zoom) or zoom <= 0 or canvas_size <= 0:
+            canvas_size = np.array([800.0, 800.0])
+        if (
+            not np.isfinite(zoom)
+            or zoom <= 0
+            or canvas_size.size < 2
+            or np.any(canvas_size[:2] <= 0)
+        ):
             return np.stack([center, center])
         layer_scale = np.take(
             np.asarray(self._layer.scale, dtype=float),
             list(displayed_axes),
         )
-        screen_half = (canvas_size / zoom) / 2 / np.maximum(layer_scale, 1e-12)
-        # In 3D, project the view direction onto data axes and shrink
-        # the depth axis so the bbox tracks the rotated frustum instead
-        # of always being a uniform cube.
-        half_extent = screen_half.copy()
+        screen_half = canvas_size[:2] / (2 * zoom)
+        screen_radius = float(np.max(screen_half))
+        half_extent = screen_radius / np.maximum(layer_scale, 1e-12)
         if self._viewer.dims.ndisplay == 3:
             try:
-                view_dir_world = np.asarray(
-                    camera.view_direction, dtype=float
-                )[-len(displayed_axes) :]
-                view_dir_data = np.abs(view_dir_world) / np.maximum(
-                    layer_scale, 1e-12
-                )
-                view_dir_data /= np.maximum(
-                    np.linalg.norm(view_dir_data), 1e-12
-                )
-                # screen-plane axes get full extent; depth axis gets a
-                # fraction proportional to its alignment with view dir
-                depth_fraction = np.maximum(view_dir_data, 0.1)
-                half_extent = screen_half * np.maximum(
-                    1.0 - 0.7 * depth_fraction, 0.3
+                directions = []
+                view_world = np.asarray(camera.view_direction, dtype=float)
+                up_world = np.asarray(camera.up_direction, dtype=float)
+                right_world = np.cross(up_world, view_world)
+                for world_direction in (up_world, right_world, view_world):
+                    full_direction = np.zeros(self._layer.ndim, dtype=float)
+                    full_direction[list(displayed_axes)] = world_direction[
+                        -len(displayed_axes) :
+                    ]
+                    data_direction = np.asarray(
+                        self._layer._world_to_data_ray(full_direction),
+                        dtype=float,
+                    )[list(displayed_axes)]
+                    directions.append(data_direction)
+                up_data, right_data, view_data = directions
+                half_extent = (
+                    screen_half[0] * np.abs(up_data)
+                    + screen_half[1] * np.abs(right_data)
+                    + 0.35 * screen_radius * np.abs(view_data)
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -2396,20 +2400,25 @@ class ProgressiveLoader:
         if len(displayed) < 3:
             # mid ndisplay transition: displayed dims not 3D yet
             return chunk_priority_2D(keys, interval[0], interval[1])
-        layer_scale = np.take(
-            np.asarray(self._layer.scale, dtype=float),
-            displayed,
-        )
-        camera_center = np.asarray(camera.center, dtype=float) / (
-            np.take(factors, displayed) * np.maximum(layer_scale, 1e-12)
-        )
+        world_point = np.asarray(self._viewer.dims.point, dtype=float)
+        world_point[displayed] = np.asarray(camera.center, dtype=float)[-3:]
+        camera_center = np.asarray(
+            self._layer.world_to_data(world_point), dtype=float
+        )[displayed] / np.take(factors, displayed)
+        full_direction = np.zeros(self._layer.ndim, dtype=float)
+        full_direction[displayed] = np.asarray(
+            camera.view_direction, dtype=float
+        )[-3:]
+        view_direction = np.asarray(
+            self._layer._world_to_data_ray(full_direction), dtype=float
+        )[displayed] / np.take(factors, displayed)
         # chunk_priority_3D sanitizes degenerate camera state internally
         return chunk_priority_3D(
             keys,
             interval[0],
             interval[1],
             camera_center=camera_center,
-            view_direction=camera.view_direction,
+            view_direction=view_direction,
         )
 
     def _make_progress(self, total: int, description: str):

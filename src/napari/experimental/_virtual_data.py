@@ -511,6 +511,35 @@ class VirtualData:
                 return
             self.hyperslice[tuple(dst_key)] = value[tuple(src_key)]
 
+    def set_chunk(
+        self,
+        key: tuple[slice, ...],
+        value,
+        source_level: int,
+    ) -> bool:
+        """Atomically write a resident chunk and record its provenance.
+
+        Backdrop repair uses ``loaded_chunks`` while holding ``lock`` to
+        decide which pixels it may replace.  Keeping the pixel write and
+        that bookkeeping in one critical section prevents a repair from
+        overwriting a newly loaded fine chunk in between those operations.
+
+        Returns ``False`` when an interval change made the complete chunk
+        stale before it could be applied.
+        """
+        chunk_id = tuple((int(sl.start), int(sl.stop)) for sl in key)
+        with self.lock:
+            if self._min_coord is None or any(
+                int(sl.start) < self._min_coord[dim]
+                or int(sl.stop) > self._max_coord[dim]
+                for dim, sl in enumerate(key)
+            ):
+                return False
+            self.set_offset(key, value)
+            self.loaded_chunks.add(chunk_id)
+            self.chunk_source[chunk_id] = int(source_level)
+            return True
+
     def __getitem__(self, key) -> VirtualArrayView:
         full = tuple((0, s) for s in self.shape)
         return VirtualArrayView(self, full)[key]

@@ -1,3 +1,4 @@
+import itertools
 import os
 import sys
 import threading
@@ -470,6 +471,51 @@ def test_zoom_target_level_3d_uninitialized_camera(
     viewer.scene.camera.zoom = 50.0
     qtbot.waitUntil(lambda: layer.data_level == 0, timeout=10000)
     _wait_for_idle_loader(qtbot, loader)
+    loader.close()
+
+
+@pytest.mark.parametrize(
+    'angles',
+    [
+        (45.67695591944634, 65.58991673574316, 70.5187757126331),
+        (66.77365262411085, 62.60192271711876, 93.99837913639783),
+    ],
+)
+def test_camera_bbox_covers_rotated_screen_plane(
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+    angles,
+):
+    """Regression for empty top-right quadrants at reported camera poses."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    camera = viewer.scene.camera
+    camera.angles = angles
+    displayed = list(layer._slice_input.displayed)
+    bbox = loader._camera_bbox_level0(displayed)
+    assert bbox is not None
+
+    screen_half = np.asarray(viewer.canvas.size) / (2 * camera.zoom)
+    data_directions = []
+    view = np.asarray(camera.view_direction, dtype=float)
+    up = np.asarray(camera.up_direction, dtype=float)
+    for direction in (up, np.cross(up, view)):
+        full = np.zeros(layer.ndim, dtype=float)
+        full[displayed] = direction[-len(displayed) :]
+        data_directions.append(
+            np.asarray(layer._world_to_data_ray(full))[displayed]
+        )
+    center = bbox.mean(axis=0)
+    for up_sign, right_sign in itertools.product((-1, 1), repeat=2):
+        corner = center + (
+            up_sign * screen_half[0] * data_directions[0]
+            + right_sign * screen_half[1] * data_directions[1]
+        )
+        assert np.all(corner >= bbox[0] - 1e-9)
+        assert np.all(corner <= bbox[1] + 1e-9)
     loader.close()
 
 

@@ -282,18 +282,8 @@ class _NapariTarget:
         for update in updates:
             vdata = self.loader._data[update.level]
             key = update.region.slices()
-            vdata.set_offset(key, update.data)
-            chunk_id = tuple(
-                (int(start), int(stop))
-                for start, stop in zip(
-                    update.region.start,
-                    update.region.stop,
-                    strict=True,
-                )
-            )
-            vdata.loaded_chunks.add(chunk_id)
-            vdata.chunk_source[chunk_id] = update.level
-            grouped[update.level].append(key)
+            if vdata.set_chunk(key, update.data, update.level):
+                grouped[update.level].append(key)
         for level, batch in grouped.items():
             self.loader._on_chunks(
                 self.generation,

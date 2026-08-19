@@ -212,6 +212,35 @@ def test_set_offset_outside_interval_is_ignored(dask_array, base_array):
     assert vdata.hyperslice.sum() == 0
 
 
+def test_set_chunk_updates_pixels_and_provenance_under_one_lock(
+    dask_array, base_array
+):
+    """Backdrop repair must never observe fine pixels as still unloaded."""
+    vdata = VirtualData(dask_array)
+    vdata.set_interval((0, 0), (64, 80))
+
+    class LockCheckingSet(set):
+        def add(self, value):
+            assert vdata.lock._is_owned()
+            super().add(value)
+
+    vdata.loaded_chunks = LockCheckingSet()
+    key = (slice(0, 32), slice(0, 40))
+    assert vdata.set_chunk(key, base_array[key], source_level=0)
+    assert ((0, 32), (0, 40)) in vdata.loaded_chunks
+    assert vdata.chunk_source[((0, 32), (0, 40))] == 0
+    np.testing.assert_array_equal(vdata.hyperslice[:32, :40], base_array[key])
+
+
+def test_set_chunk_rejects_stale_interval(dask_array, base_array):
+    vdata = VirtualData(dask_array)
+    vdata.set_interval((64, 80), (100, 120))
+    key = (slice(0, 32), slice(0, 40))
+    assert not vdata.set_chunk(key, base_array[key], source_level=0)
+    assert not vdata.loaded_chunks
+    assert not vdata.chunk_source
+
+
 def test_concurrent_reads_and_writes(dask_array, base_array):
     """Concurrent set_offset/set_interval/reads must not raise."""
     vdata = VirtualData(dask_array)
