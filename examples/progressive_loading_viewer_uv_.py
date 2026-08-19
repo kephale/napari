@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.13"
+# requires-python = ">=3.11"
 # dependencies = [
 #     "napari[pyqt5]",
 #     "zarr>=3.1.6",
@@ -7,236 +7,437 @@
 #     "aiohttp",
 #     "requests",
 #     "s3fs",
+#     "dask[array]",
 # ]
 #
 # [tool.uv.sources]
-# napari = { git = "https://github.com/kephale/napari", branch = "progressive-loading-rebase" }
+# napari = { git = "https://github.com/kephale/napari", branch = "lodstone-integration" }
 # ///
 """
-Progressive loading: generic OME-Zarr viewer
-============================================
+Progressive loading dataset viewer
+==================================
 
-Open any local or remote OME-Zarr with progressive loading, or pick a
-named preset::
+Open any local or remote OME-Zarr with progressive loading, or select one of
+the bundled dataset presets::
 
-    # Named presets — no URL needed
-    uv run progressive_loading_viewer_uv.py cardiac
-    uv run progressive_loading_viewer_uv.py zebrafish-em
-    uv run progressive_loading_viewer_uv.py platynereis
-    uv run progressive_loading_viewer_uv.py zebrahub
-    uv run progressive_loading_viewer_uv.py hela
-    uv run progressive_loading_viewer_uv.py covid
+    uv run examples/progressive_loading_viewer_uv_.py --list
+    uv run examples/progressive_loading_viewer_uv_.py zebrahub
+    uv run examples/progressive_loading_viewer_uv_.py cardiac
+    uv run examples/progressive_loading_viewer_uv_.py hela-labels
+    uv run examples/progressive_loading_viewer_uv_.py mandelbulb
+    uv run examples/progressive_loading_viewer_uv_.py /local/image.zarr
+    uv run examples/progressive_loading_viewer_uv_.py s3://bucket/image.zarr
+    uv run examples/progressive_loading_viewer_uv_.py https://host/image.zarr
 
-    # Any URL
-    uv run progressive_loading_viewer_uv.py https://example.com/data.ome.zarr
-    uv run progressive_loading_viewer_uv.py s3://bucket/data.zarr/path/to/group
-    uv run progressive_loading_viewer_uv.py /local/path.zarr
-
-    # List all presets
-    uv run progressive_loading_viewer_uv.py --list
-
-Options::
-
-    --levels N        Number of multiscale levels to load (default: all)
-    --contrast LO HI  Contrast limits (default: auto or preset)
-    --colormap NAME   Colormap name (default: gray or preset)
-    --cache-mb N      In-memory cache size in MB (default: 4000)
-    --3d              Start in 3D display mode
-    --rendering NAME  3D rendering mode (default: attenuated_mip)
+Command-line options override preset defaults. Use ``--labels`` to treat a
+custom Zarr as labels and ``--3d`` or ``--2d`` to select the initial view.
 
 .. tags:: experimental
 """
 
+from __future__ import annotations
+
 import argparse
+from pathlib import Path
 
 import napari
 from napari.experimental._progressive_loading import (
     add_progressive_loading_image,
+    add_progressive_loading_labels,
 )
-from napari.experimental._progressive_loading_datasets import open_ome_zarr
+from napari.experimental._progressive_loading_datasets import (
+    local_zarr_dataset,
+    mandelbrot_dataset,
+    mandelbulb_dataset,
+    mandelbulb_rgb_dataset,
+    open_ome_zarr,
+)
 
-# ── Presets ────────────────────────────────────────────────────────────
-# Each preset defines the URL/path plus sensible defaults so users can
-# just type a short name.  All fields except 'path' are optional.
+MIB = 1024**2
+
+
+def _remote(
+    description,
+    path,
+    *,
+    levels=None,
+    contrast=None,
+    colormap='gray',
+    threed=False,
+    rendering='attenuated_mip',
+    zarr_format=None,
+    name=None,
+    transform=None,
+):
+    return {
+        'description': description,
+        'threed': threed,
+        'layers': [
+            {
+                'path': path,
+                'levels': levels,
+                'contrast': contrast,
+                'colormap': colormap,
+                'rendering': rendering,
+                'zarr_format': zarr_format,
+                'name': name,
+                'transform': transform,
+            }
+        ],
+    }
+
 
 PRESETS = {
-    'cardiac': {
-        'desc': 'Zebrafish heart FIB-SEM — 16 B voxels, 15-level pyramid (COSEM)',
-        'path': 's3://janelia-cosem-datasets/jrc_zf-cardiac-1/jrc_zf-cardiac-1.zarr/recon-1/em/fibsem-uint8',
-        'levels': 15,
-        'contrast': (0, 255),
-        'colormap': 'turbo',
+    'cardiac': _remote(
+        'Zebrafish heart FIB-SEM — 16 B voxels, 15 levels (COSEM)',
+        's3://janelia-cosem-datasets/jrc_zf-cardiac-1/'
+        'jrc_zf-cardiac-1.zarr/recon-1/em/fibsem-uint8',
+        levels=15,
+        contrast=(0, 255),
+        colormap='turbo',
+        threed=True,
+        name='Zebrafish heart (FIB-SEM)',
+    ),
+    'zebrafish-em': _remote(
+        'Zebrafish embryo sagittal EM — 350 Gpx, 8 levels (IDR)',
+        'https://uk1s3.embassy.ebi.ac.uk/idr/zarr/v0.1/4495402.zarr/',
+        levels=8,
+        contrast=(0, 255),
+        colormap='cyan',
+        zarr_format=2,
+        name='Zebrafish embryo EM (350 Gpx)',
+    ),
+    'platynereis': _remote(
+        'Platynereis whole-worm serial EM — 10 levels (EMBL)',
+        'https://s3.embl.de/i2k-2020/platy-raw.ome.zarr',
+        levels=10,
+        contrast=(0, 255),
+        colormap='green',
+        threed=True,
+        name='Platynereis (serial-section EM)',
+    ),
+    'zebrahub': _remote(
+        'Zebrafish embryo light-sheet timelapse (CZ Biohub)',
+        'https://public.czbiohub.org/royerlab/zebrahub/imaging/'
+        'single-objective/ZSNS002.ome.zarr/',
+        levels=4,
+        contrast=(0, 1000),
+        name='Zebrahub ZSNS002',
+    ),
+    'hela': _remote(
+        'HeLa cell FIB-SEM — 6 levels (COSEM)',
+        's3://janelia-cosem-datasets/jrc_hela-2/'
+        'jrc_hela-2.zarr/recon-1/em/fibsem-uint8',
+        levels=6,
+        contrast=(0, 255),
+        threed=True,
+        name='HeLa cell (FIB-SEM)',
+    ),
+    'covid': _remote(
+        'SARS-CoV-2 infected cell FIB-SEM, uint16 (COSEM)',
+        's3://janelia-cosem-datasets/jrc_ccl81-covid-1/'
+        'jrc_ccl81-covid-1.zarr/recon-1/em/fibsem-uint16',
+        levels=5,
+        contrast=(0, 65535),
+        colormap='inferno',
+        threed=True,
+        name='SARS-CoV-2 cell (FIB-SEM)',
+    ),
+    'mouse-kidney': _remote(
+        'Mouse kidney FIB-SEM (COSEM)',
+        's3://janelia-cosem-datasets/jrc_mus-kidney/'
+        'jrc_mus-kidney.zarr/recon-1/em/fibsem-uint8',
+        levels=5,
+        contrast=(0, 255),
+        colormap='magma',
+        threed=True,
+        name='Mouse kidney (FIB-SEM)',
+    ),
+    'idr-em-2d': _remote(
+        'SARS-CoV-2 intestinal organoid TEM — 13 Gpx (IDR)',
+        'https://uk1s3.embassy.ebi.ac.uk/idr/zarr/v0.4/idr0083A/9822152.zarr/',
+        levels=11,
+        contrast=(0, 65535),
+        name='SARS-CoV-2 organoid TEM',
+    ),
+    'wsi': _remote(
+        'CMU-1 whole-slide RGB image (Glencoe)',
+        's3://gs-public-zarr-archive/CMU-1.ome.zarr',
+        levels=5,
+        contrast=(0, 255),
+        zarr_format=2,
+        name='CMU-1 (WSI)',
+        transform='channels-first-rgb',
+    ),
+    'liver-labels': {
+        'description': 'Mouse liver FIB-SEM with organelle labels (COSEM)',
         'threed': True,
-        'rendering': 'attenuated_mip',
+        'layers': [
+            {
+                'path': 's3://janelia-cosem-datasets/jrc_mus-liver/'
+                'jrc_mus-liver.zarr/recon-1/em/fibsem-uint8',
+                'levels': 5,
+                'contrast': (0, 255),
+                'name': 'EM (FIB-SEM)',
+            },
+            {
+                'path': 's3://janelia-cosem-datasets/jrc_mus-liver/'
+                'jrc_mus-liver.zarr/recon-1/labels/groundtruth/crop124/all',
+                'levels': 5,
+                'layer_type': 'labels',
+                'name': 'organelles (crop124)',
+            },
+        ],
     },
-    'zebrafish-em': {
-        'desc': 'Zebrafish embryo sagittal EM — 350 Gpx, 8 levels (IDR idr0053)',
-        'path': 'https://uk1s3.embassy.ebi.ac.uk/idr/zarr/v0.1/4495402.zarr/',
-        'levels': 8,
-        'contrast': (0, 255),
-        'colormap': 'cyan',
-        'zarr_format': 2,
-    },
-    'platynereis': {
-        'desc': 'Platynereis whole-worm serial EM — 10 levels, anisotropic (EMBL)',
-        'path': 'https://s3.embl.de/i2k-2020/platy-raw.ome.zarr',
-        'levels': 10,
-        'contrast': (0, 255),
-        'colormap': 'green',
+    'hela-labels': {
+        'description': 'HeLa FIB-SEM with organelle labels (COSEM)',
         'threed': True,
-        'rendering': 'attenuated_mip',
-    },
-    'zebrahub': {
-        'desc': 'Zebrafish embryo light-sheet 4D timelapse — 1100 tp (CZ Biohub)',
-        'path': 'https://public.czbiohub.org/royerlab/zebrahub/imaging/single-objective/ZSNS002.ome.zarr/',
-        'levels': 4,
-        'contrast': (0, 1000),
-        'colormap': 'blue',
-    },
-    'hela': {
-        'desc': 'HeLa cell FIB-SEM + organelle labels (COSEM)',
-        'path': 's3://janelia-cosem-datasets/jrc_hela-2/jrc_hela-2.zarr/recon-1/em/fibsem-uint8',
-        'levels': 6,
-        'contrast': (0, 255),
-        'colormap': 'gray',
-        'threed': True,
-        'rendering': 'attenuated_mip',
-    },
-    'covid': {
-        'desc': 'SARS-CoV-2 infected cell FIB-SEM, uint16 (COSEM)',
-        'path': 's3://janelia-cosem-datasets/jrc_ccl81-covid-1/jrc_ccl81-covid-1.zarr/recon-1/em/fibsem-uint16',
-        'levels': 5,
-        'contrast': (0, 65535),
-        'colormap': 'inferno',
-        'threed': True,
-        'rendering': 'attenuated_mip',
-    },
-    'mouse-kidney': {
-        'desc': 'Mouse kidney FIB-SEM (COSEM / OpenOrganelle)',
-        'path': 's3://janelia-cosem-datasets/jrc_mus-kidney/jrc_mus-kidney.zarr/recon-1/em/fibsem-uint8',
-        'levels': 5,
-        'contrast': (0, 255),
-        'colormap': 'magma',
-        'threed': True,
-        'rendering': 'attenuated_mip',
-    },
-    'idr-em-2d': {
-        'desc': 'SARS-CoV-2 intestinal organoid TEM — 13 Gpx (IDR idr0083)',
-        'path': 'https://uk1s3.embassy.ebi.ac.uk/idr/zarr/v0.4/idr0083A/9822152.zarr/',
-        'levels': 11,
-        'contrast': (0, 65535),
-        'colormap': 'gray',
+        'layers': [
+            {
+                'path': 's3://janelia-cosem-datasets/jrc_hela-2/'
+                'jrc_hela-2.zarr/recon-1/em/fibsem-uint8',
+                'levels': 6,
+                'contrast': (0, 255),
+                'name': 'HeLa EM (FIB-SEM)',
+            },
+            {
+                'path': 's3://janelia-cosem-datasets/jrc_hela-2/'
+                'jrc_hela-2.zarr/recon-1/labels/groundtruth/crop155/all',
+                'levels': 6,
+                'layer_type': 'labels',
+                'name': 'organelles (crop155)',
+            },
+        ],
     },
     'mandelbrot': {
-        'desc': 'Generative Mandelbrot set (local, no network)',
-        'path': '__generative_mandelbrot__',
-        'colormap': 'twilight_shifted',
-        'contrast': (0, 255),
+        'description': 'Generative Mandelbrot set (local, lazy)',
+        'layers': [
+            {
+                'generator': 'mandelbrot',
+                'contrast': (0, 255),
+                'colormap': 'twilight_shifted',
+            }
+        ],
     },
     'mandelbulb': {
-        'desc': 'Generative Mandelbulb (local, no network)',
-        'path': '__generative_mandelbulb__',
-        'colormap': 'inferno',
-        'contrast': (0, 255),
+        'description': 'Generative Mandelbulb (local, lazy)',
         'threed': True,
-        'rendering': 'attenuated_mip',
+        'layers': [
+            {
+                'generator': 'mandelbulb',
+                'contrast': (0, 64),
+                'colormap': 'magma',
+            }
+        ],
+    },
+    'mandelbulb-rgb': {
+        'description': 'Generative RGB Mandelbulb (local, lazy)',
+        'threed': True,
+        'layers': [{'generator': 'mandelbulb-rgb', 'rgb': True}],
+    },
+    'local-zarr': {
+        'description': 'Materialized local Mandelbulb Zarr (builds once)',
+        'threed': True,
+        'layers': [
+            {
+                'generator': 'local-zarr',
+                'contrast': (0, 64),
+                'colormap': 'magma',
+            }
+        ],
     },
 }
 
 
-def open_generative(name: str):
-    from napari.experimental._progressive_loading_datasets import (
-        mandelbrot_dataset,
-        mandelbulb_dataset,
-    )
-    if name == '__generative_mandelbrot__':
-        ds = mandelbrot_dataset(max_levels=14)
-    else:
-        ds = mandelbulb_dataset(max_levels=6)
-    return ds['arrays'], None
-
-
-def list_presets():
+def list_presets() -> None:
     print('\nAvailable presets:\n')
-    max_name = max(len(n) for n in PRESETS)
-    for name, p in PRESETS.items():
-        flag = '3D' if p.get('threed') else '2D'
-        print(f'  {name:<{max_name}}  [{flag}]  {p["desc"]}')
+    width = max(map(len, PRESETS))
+    for name, preset in PRESETS.items():
+        mode = '3D' if preset.get('threed') else '2D'
+        print(f'  {name:<{width}}  [{mode}]  {preset["description"]}')
     print()
 
 
-def main(argv=None):
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Open an OME-Zarr with napari progressive loading',
+        description='Open a preset or Zarr path with progressive loading',
     )
-    parser.add_argument('path', nargs='?', default=None,
-                        help='Preset name, local path, or remote URL')
-    parser.add_argument('--list', action='store_true',
-                        help='List available presets and exit')
-    parser.add_argument('--levels', type=int, default=None,
-                        help='Number of multiscale levels (default: all)')
-    parser.add_argument('--contrast', type=float, nargs=2, metavar=('LO', 'HI'),
-                        default=None, help='Contrast limits')
-    parser.add_argument('--colormap', default=None, help='Colormap name')
-    parser.add_argument('--cache-mb', type=int, default=4000,
-                        help='Remote cache size in MB (default: 4000)')
-    parser.add_argument('--3d', dest='threed', action='store_true',
-                        default=None, help='Start in 3D display mode')
-    parser.add_argument('--rendering', default=None,
-                        help='3D rendering mode (default: attenuated_mip)')
-    args = parser.parse_args(argv)
+    parser.add_argument('source', nargs='?', help='preset name, URL, or path')
+    parser.add_argument('--list', action='store_true')
+    parser.add_argument('--levels', type=int, help='number of pyramid levels')
+    parser.add_argument(
+        '--contrast', type=float, nargs=2, metavar=('LO', 'HI')
+    )
+    parser.add_argument('--colormap')
+    parser.add_argument('--name')
+    parser.add_argument('--cache-mb', type=int, default=4000)
+    display = parser.add_mutually_exclusive_group()
+    display.add_argument('--3d', dest='threed', action='store_true')
+    display.add_argument('--2d', dest='threed', action='store_false')
+    parser.set_defaults(threed=None)
+    parser.add_argument('--rendering')
+    parser.add_argument('--zarr-format', type=int, choices=(2, 3))
+    parser.add_argument('--no-squeeze', action='store_true')
+    parser.add_argument('--labels', action='store_true')
+    parser.add_argument('--rgb', action='store_true')
+    parser.add_argument('--tile-mib', type=int)
+    parser.add_argument('--interval-mib', type=int)
+    parser.add_argument('--rate-mib', type=float)
+    parser.add_argument(
+        '--screenshot',
+        type=Path,
+        help='save a screenshot after loading, then close the viewer',
+    )
+    parser.add_argument(
+        '--screenshot-delay',
+        type=float,
+        default=30,
+        metavar='SECONDS',
+        help='time to progressively load before taking --screenshot',
+    )
+    return parser
 
-    if args.list:
+
+def _generated(spec, cache_bytes):
+    name = spec['generator']
+    if name == 'mandelbrot':
+        return mandelbrot_dataset(max_levels=14, cache_bytes=cache_bytes)[
+            'arrays'
+        ]
+    if name == 'mandelbulb':
+        return mandelbulb_dataset(
+            max_levels=5,
+            tilesize=32,
+            maxiter=64,
+            cache_bytes=cache_bytes,
+        )['arrays']
+    if name == 'mandelbulb-rgb':
+        return mandelbulb_rgb_dataset(
+            max_levels=5,
+            tilesize=32,
+            maxiter=64,
+            cache_bytes=cache_bytes,
+        )['arrays']
+    return local_zarr_dataset(
+        Path('mandelbulb.zarr'), cache_bytes=cache_bytes
+    )['arrays']
+
+
+def _open_layer(spec, arguments, cache_bytes):
+    if 'generator' in spec:
+        return _generated(spec, cache_bytes), None, None
+
+    arrays, scale, translate = open_ome_zarr(
+        spec['path'],
+        num_levels=arguments.levels or spec.get('levels'),
+        cache_bytes=cache_bytes,
+        zarr_format=arguments.zarr_format or spec.get('zarr_format'),
+        squeeze=not arguments.no_squeeze,
+    )
+    if spec.get('transform') == 'channels-first-rgb':
+        import dask.array as da
+
+        arrays = [da.asarray(array).transpose(1, 2, 0) for array in arrays]
+        if scale is not None:
+            scale = scale[-2:]
+        if translate is not None:
+            translate = translate[-2:]
+        spec['rgb'] = True
+    return arrays, scale, translate
+
+
+def main(argv=None) -> None:
+    parser = _parser()
+    arguments = parser.parse_args(argv)
+    if arguments.list:
         list_presets()
         return
-
-    if args.path is None:
+    if arguments.source is None:
         parser.print_help()
         print('\nUse --list to see available presets.')
         return
 
-    # Resolve preset or raw path
-    preset = PRESETS.get(args.path, {})
-    data_path = preset.get('path', args.path)
+    preset = PRESETS.get(arguments.source)
+    if preset is None:
+        preset = {
+            'description': arguments.source,
+            'layers': [
+                {
+                    'path': arguments.source,
+                    'layer_type': 'labels' if arguments.labels else 'image',
+                    'rgb': arguments.rgb,
+                }
+            ],
+        }
+    threed = (
+        arguments.threed
+        if arguments.threed is not None
+        else preset.get('threed', False)
+    )
+    cache_bytes = arguments.cache_mb * 1_000_000
+    viewer = napari.Viewer(title=f'Progressive: {arguments.source}')
+    viewer.dims.ndisplay = 3 if threed else 2
 
-    # Merge: CLI flags override preset defaults
-    num_levels = args.levels or preset.get('levels')
-    contrast = args.contrast or preset.get('contrast')
-    colormap = args.colormap or preset.get('colormap', 'gray')
-    threed = args.threed if args.threed is not None else preset.get('threed', False)
-    rendering = args.rendering or preset.get('rendering', 'attenuated_mip')
-    zarr_format = preset.get('zarr_format')
-
-    # Open data
-    if data_path.startswith('__generative_'):
-        arrays, scale = open_generative(data_path)
-        translate = None
-    else:
-        print(f'Opening {data_path} ...')
-        arrays, scale, translate = open_ome_zarr(
-            data_path, num_levels=num_levels,
-            cache_bytes=args.cache_mb * 1_000_000,
-            zarr_format=zarr_format,
+    for original_spec in preset['layers']:
+        spec = dict(original_spec)
+        print(f'Opening {spec.get("path", spec.get("generator"))} ...')
+        arrays, scale, translate = _open_layer(spec, arguments, cache_bytes)
+        print(
+            f'  {len(arrays)} levels, level 0: shape={arrays[0].shape} '
+            f'dtype={arrays[0].dtype}'
         )
+        layer_type = spec.get('layer_type', 'image')
+        kwargs = {'name': arguments.name or spec.get('name')}
+        if layer_type == 'image':
+            contrast = arguments.contrast or spec.get('contrast')
+            if contrast is not None:
+                kwargs['contrast_limits'] = tuple(contrast)
+            kwargs['colormap'] = arguments.colormap or spec.get(
+                'colormap', 'gray'
+            )
+            kwargs['rgb'] = arguments.rgb or spec.get('rgb', False)
+            if threed:
+                kwargs['rendering'] = arguments.rendering or spec.get(
+                    'rendering', 'attenuated_mip'
+                )
+        if scale is not None:
+            kwargs['scale'] = scale
+        if translate is not None:
+            kwargs['translate'] = translate
+        if arguments.tile_mib is not None:
+            kwargs['tile_max_bytes_3d'] = arguments.tile_mib * MIB
+        if arguments.interval_mib is not None:
+            kwargs['interval_max_bytes'] = arguments.interval_mib * MIB
+        if arguments.rate_mib is not None:
+            kwargs['max_bytes_per_second'] = arguments.rate_mib * MIB
 
-    print(f'  {len(arrays)} levels, level 0: shape={arrays[0].shape} '
-          f'dtype={arrays[0].dtype}')
+        factory = (
+            add_progressive_loading_labels
+            if layer_type == 'labels'
+            else add_progressive_loading_image
+        )
+        factory(arrays, viewer=viewer, **kwargs)
 
-    kwargs = {'colormap': colormap}
-    if contrast is not None:
-        kwargs['contrast_limits'] = tuple(contrast)
-    if scale is not None:
-        kwargs['scale'] = scale
-    if translate is not None:
-        kwargs['translate'] = translate
-    if threed:
-        kwargs['rendering'] = rendering
+    viewer.reset_view()
+    if arguments.screenshot is not None:
+        from qtpy.QtCore import QTimer
 
-    viewer = napari.Viewer()
-    if threed:
-        viewer.dims.ndisplay = 3
+        screenshot = arguments.screenshot.expanduser().resolve()
+        screenshot.parent.mkdir(parents=True, exist_ok=True)
 
-    add_progressive_loading_image(arrays, viewer=viewer, **kwargs)
+        def save_screenshot() -> None:
+            viewer.screenshot(screenshot, canvas_only=False)
+            print(f'Saved screenshot to {screenshot}')
+            for layer in tuple(viewer.layers):
+                loader = layer.metadata.get('progressive_loader')
+                if loader is not None:
+                    loader.close()
+            viewer.close()
+
+        QTimer.singleShot(
+            max(0, round(arguments.screenshot_delay * 1000)),
+            save_screenshot,
+        )
     napari.run()
 
 
