@@ -40,17 +40,16 @@ import contextlib
 import itertools
 import logging
 import os
-import threading
 import time
 import weakref
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from functools import partial
 from typing import TYPE_CHECKING
 
 import numpy as np
 from lodstone import (
     Region,
     anisotropic_extent_for_bytes,
+    chunk_key_id,
+    chunk_slices_for,
     clamp_region_to_budget,
     isotropic_extent_for_bytes,
 )
@@ -64,7 +63,6 @@ from napari.experimental._texture_swap import (
 from napari.experimental._virtual_data import (
     MultiScaleVirtualData,
     VirtualData,
-    chunk_boundaries,
     chunk_shape_for,
 )
 from napari.utils import progress
@@ -146,27 +144,7 @@ def chunk_slices(data, interval: tuple | None = None) -> list[list[slice]]:
         set of chunk keys is the cartesian product across dimensions.
 
     """
-    if isinstance(data, VirtualData):
-        boundaries = data._boundaries
-    else:
-        boundaries = chunk_boundaries(data)
-
-    result: list[list[slice]] = []
-    for dim, bounds in enumerate(boundaries):
-        starts, stops = bounds[:-1], bounds[1:]
-        if interval is not None:
-            min_c = int(interval[0][dim])
-            max_c = int(interval[1][dim])
-            first = int(np.searchsorted(stops, min_c, side='right'))
-            last = int(np.searchsorted(starts, max_c, side='left'))
-            starts, stops = starts[first:last], stops[first:last]
-        result.append(
-            [
-                slice(int(start), int(stop))
-                for start, stop in zip(starts, stops, strict=True)
-            ],
-        )
-    return result
+    return [list(axis) for axis in chunk_slices_for(data, interval)]
 
 
 def get_chunk_center(chunk_key: tuple[slice, ...]) -> np.ndarray:
@@ -351,12 +329,7 @@ def chunk_priority_3D(
 
 def _chunk_id(chunk_key: tuple[slice, ...]) -> tuple[tuple[int, int], ...]:
     """Hashable identifier for a chunk key."""
-    return tuple((int(sl.start), int(sl.stop)) for sl in chunk_key)
-
-
-def _apply_chunk(vdata: VirtualData, chunk_key, chunk) -> None:
-    """Write a fetched chunk into *vdata* and record its provenance."""
-    vdata.set_chunk(chunk_key, chunk, vdata.scale_level)
+    return chunk_key_id(chunk_key)
 
 
 def _pack_upload_block(vdata: VirtualData, keys) -> tuple | None:
@@ -365,26 +338,11 @@ def _pack_upload_block(vdata: VirtualData, keys) -> tuple | None:
     Returns ``(low, high, block)`` in absolute coordinates, or ``None``
     when the region is outside the resident interval.
     """
-    ndim = vdata.ndim
-    low = [min(int(k[d].start) for k in keys) for d in range(ndim)]
-    high = [max(int(k[d].stop) for k in keys) for d in range(ndim)]
-    with vdata.lock:
-        if vdata._min_coord is None:
-            return None
-        low = [
-            max(lo, mn) for lo, mn in zip(low, vdata._min_coord, strict=True)
-        ]
-        high = [
-            min(hi, mx) for hi, mx in zip(high, vdata._max_coord, strict=True)
-        ]
-        if any(hi <= lo for lo, hi in zip(low, high, strict=True)):
-            return None
-        source = tuple(
-            slice(lo - mn, hi - mn)
-            for lo, hi, mn in zip(low, high, vdata._min_coord, strict=True)
-        )
-        block = np.ascontiguousarray(vdata.hyperslice[source])
-    return low, high, block
+    copied = vdata.copy_chunk_union(keys)
+    if copied is None:
+        return None
+    region, block = copied
+    return list(region.start), list(region.stop), block
 
 
 def _tile_extent_3d_for(dtype: np.dtype, interval_max_bytes: int) -> int:
@@ -437,158 +395,6 @@ def _anisotropic_tile_extent(
 
 
 # ---------- background fetching ----------
-
-
-def _key_nbytes(chunk_key: tuple[slice, ...], itemsize: int) -> int:
-    """Size in bytes of the data selected by a concrete chunk key."""
-    n = int(itemsize)
-    for s in chunk_key:
-        n *= max(0, int(s.stop) - int(s.start))
-    return n
-
-
-class _FetchRateLimiter:
-    """Gate and pace fetch throughput across all fetch workers.
-
-    ``acquire(nbytes)`` blocks the calling *worker* thread, first while
-    the limiter is paused (interaction hold), then — when a
-    bytes-per-second rate is configured — until issuing a fetch of that
-    size keeps the average rate within budget (leaky bucket). Pacing on
-    the worker side bounds every downstream cost of chunk delivery:
-    GIL pressure from fetch compute, slice/refresh event cascades, and
-    GPU upload traffic.
-
-    ``pause()``/``resume()`` suspend fetching entirely while the user
-    interacts. ``cancel()`` wakes all sleeping workers immediately so a
-    cancelled pass can wind down without waiting out its delays.
-    """
-
-    def __init__(self, bytes_per_second: float | None = None):
-        self.bytes_per_second = (
-            float(bytes_per_second) if bytes_per_second else None
-        )
-        self._lock = threading.Lock()
-        self._next_free = time.monotonic()
-        self._cancelled = threading.Event()
-        self._go = threading.Event()
-        self._go.set()
-
-    def acquire(self, nbytes: int) -> None:
-        while not self._go.wait(timeout=1.0):  # paused
-            if self._cancelled.is_set():
-                return
-        if self.bytes_per_second is None or self._cancelled.is_set():
-            return
-        with self._lock:
-            now = time.monotonic()
-            start = max(now, self._next_free)
-            self._next_free = start + nbytes / self.bytes_per_second
-        delay = start - time.monotonic()
-        if delay > 0:
-            self._cancelled.wait(delay)
-
-    def pause(self) -> None:
-        self._go.clear()
-
-    def resume(self) -> None:
-        self._go.set()
-
-    def cancel(self) -> None:
-        self._cancelled.set()
-        self._go.set()  # wake paused workers; cancelled passes must exit
-
-
-@thread_worker
-def _fetch_chunks(
-    array,
-    chunk_queue: list[tuple[slice, ...]],
-    num_workers: int = 1,
-    apply=None,
-    batch_seconds: float = 0.05,
-    pack=None,
-    limiter: _FetchRateLimiter | None = None,
-):
-    """Fetch chunks from ``array``, yielding batches of completed keys.
-
-    ``apply(chunk_key, ndarray)`` is called on the *worker* thread for
-    every fetched chunk — typically ``VirtualData.set_offset``, which is
-    lock-guarded numpy work that has no reason to occupy the GUI thread.
-    Completed chunk keys are then yielded to the main thread in batches
-    (at most one signal per ``batch_seconds``), so chunk bursts do not
-    flood the Qt event loop with per-chunk signal dispatches.
-
-    Yields lists of chunk keys (or ``pack(keys)`` when ``pack`` is
-    given — e.g. to precompute a contiguous upload block on the worker
-    rather than the GUI thread). With ``num_workers > 1``, chunks are
-    fetched by a small thread pool (useful for GIL-releasing compute
-    like numba and for remote IO); a bounded in-flight window keeps
-    completion order close to the priority order of ``chunk_queue``.
-    """
-    itemsize = np.dtype(array.dtype).itemsize
-
-    def fetch(chunk_key):
-        if limiter is not None:
-            # paces the worker BEFORE the fetch, so compute, delivery
-            # and GPU upload all follow the configured byte rate
-            limiter.acquire(_key_nbytes(chunk_key, itemsize))
-        start = time.monotonic()
-        chunk = np.asarray(array[chunk_key])
-        if apply is not None:
-            apply(chunk_key, chunk)
-        LOGGER.debug(
-            'fetched chunk %s in %.3fs',
-            chunk_key,
-            time.monotonic() - start,
-        )
-        return chunk_key
-
-    def emit(batch):
-        return pack(batch) if pack is not None else batch
-
-    if num_workers <= 1 or len(chunk_queue) <= 1:
-        batch: list = []
-        last_yield = time.monotonic()
-        for chunk_key in chunk_queue:
-            batch.append(fetch(chunk_key))
-            now = time.monotonic()
-            if now - last_yield >= batch_seconds:
-                last_yield = now
-                yield emit(batch)
-                batch = []
-        if batch:
-            yield emit(batch)
-        return
-
-    pool = ThreadPoolExecutor(max_workers=num_workers)
-    pending = iter(chunk_queue)
-    in_flight = {
-        pool.submit(fetch, chunk_key): chunk_key
-        for chunk_key in itertools.islice(pending, num_workers)
-    }
-    batch = []
-    last_yield = time.monotonic()
-    try:
-        while in_flight:
-            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
-            for future in done:
-                in_flight.pop(future)
-                next_key = next(pending, None)
-                if next_key is not None:
-                    try:
-                        in_flight[pool.submit(fetch, next_key)] = next_key
-                    except RuntimeError:  # pool/interpreter shutting down
-                        pending = iter(())
-                batch.append(future.result())
-            now = time.monotonic()
-            if batch and (now - last_yield >= batch_seconds):
-                last_yield = now
-                yield emit(batch)
-                batch = []
-        if batch:
-            yield emit(batch)
-    finally:
-        # don't block cancellation on fetches that haven't started
-        pool.shutdown(wait=False, cancel_futures=True)
 
 
 class ProgressiveLoader:
@@ -747,8 +553,6 @@ class ProgressiveLoader:
         self._max_bytes_per_second = (
             float(max_bytes_per_second) if max_bytes_per_second else None
         )
-        self._limiter: _FetchRateLimiter | None = None
-        self._resident_limiter: _FetchRateLimiter | None = None
         self._interaction_hold = bool(interaction_hold)
         self._double_buffer = True
         self._dbuf = None
@@ -784,7 +588,6 @@ class ProgressiveLoader:
         self._last_refresh = 0.0
         self._last_refresh_duration = 0.0
         self._pbar = None
-        self._resident_pbar = None
         # (experimental.async_, slicer._force_sync) as they were before
         # this layer switched the viewer to async slicing; restored by
         # close(). Set by _attach_progressive_loader.
@@ -795,7 +598,6 @@ class ProgressiveLoader:
         # and a timer flushes them from the top of the event loop
         # (see _advance_progress/_flush_progress)
         self._pbar_pending = 0
-        self._resident_pbar_pending = 0
         self._pbar_flushing = False
         self._pbar_scheduled = False
         self._pbar_last_flush = 0.0
@@ -805,7 +607,6 @@ class ProgressiveLoader:
         # matching fetch pass skip its pass-start full-tile upload
         self._synced_backdrop_key: tuple | None = None
 
-        self._resident_worker = None
         self._repair_worker = None
         # a repair was requested while one was running: chain a
         # follow-up over the (possibly moved) region when it finishes
@@ -972,12 +773,6 @@ class ProgressiveLoader:
             with contextlib.suppress(Exception):
                 self._dbuf.close()
             self._dbuf = None
-        if self._resident_limiter is not None:
-            self._resident_limiter.cancel()
-            self._resident_limiter = None
-        if self._resident_worker is not None:
-            self._resident_worker.quit()
-            self._resident_worker = None
         if self._repair_worker is not None:
             # quit() only requests abort, and nothing polls it for a
             # non-generator worker: an in-flight gather runs to
@@ -987,9 +782,6 @@ class ProgressiveLoader:
             with contextlib.suppress(Exception):
                 self._repair_worker.quit()
             self._repair_worker = None
-        self._close_progress(self._resident_pbar)
-        self._resident_pbar = None
-        self._resident_pbar_pending = 0
         for emitter, callback in self._connections:
             # RuntimeError: napari emitters can fail to normalize a
             # callback while its owner is mid-teardown
@@ -1492,9 +1284,6 @@ class ProgressiveLoader:
         first = not self._holding
         self._hold_until = time.monotonic() + self._hold_s
         if first:
-            for limiter in (self._limiter, self._resident_limiter):
-                if limiter is not None:
-                    limiter.pause()
             self._degrade_render_quality()
         from napari.experimental import _glir_metering
 
@@ -1622,9 +1411,6 @@ class ProgressiveLoader:
         # batches buffered during the drag, or a level switch's full
         # tile) has drained — not the instant the pointer stops
         self._maybe_restore_quality()
-        for limiter in (self._limiter, self._resident_limiter):
-            if limiter is not None:
-                limiter.resume()
         if self._held_batches:
             held, self._held_batches = self._held_batches, []
             for generation, vdata, batch in held:
@@ -1645,14 +1431,10 @@ class ProgressiveLoader:
             return
         self._ensure_persistent_overview()
         self._apply_auto_level()
-        self._ensure_resident()
         level = int(layer.data_level)
         self._ensure_renderable_corners_3d(level)
         min_coord, max_coord = self._level_interval(level)
         if np.any(max_coord <= min_coord):
-            return
-        if level == self._resident_level and self._resident_worker is not None:
-            # The coarsest level is being filled by the resident worker.
             return
         view_key = (level, tuple(min_coord), tuple(max_coord))
         if view_key == self._active:
@@ -2270,7 +2052,6 @@ class ProgressiveLoader:
         self._degrade_render_quality()
         self._refresh(force=True)
 
-        self._limiter = self._make_limiter()
         self._stages = stages
         self._start_stage(generation, 0)
 
@@ -2373,52 +2154,8 @@ class ProgressiveLoader:
         return stages
 
     def _start_stage(self, generation: int, index: int) -> None:
-        level, queue = self._stages[index]
-        self._stage_index = index
-        vdata = self._data[level]
-        final_stage = index == len(self._stages) - 1
-
-        apply = partial(_apply_chunk, vdata)
-
-        def pack(keys, vdata=vdata):
-            # worker thread: precompute the contiguous union-region block
-            # for the coalesced GPU upload, so the main thread never
-            # copies pixel data
-            return keys, _pack_upload_block(vdata, keys)
-
-        use_pack = (
-            final_stage
-            and self._texture_patching
-            and self._viewer.dims.ndisplay in (2, 3)
-            and vdata.ndim >= self._viewer.dims.ndisplay
-        )
-        worker = _fetch_chunks(
-            vdata.array,
-            queue,
-            num_workers=self._fetch_workers,
-            apply=apply,
-            pack=pack if use_pack else None,
-            limiter=self._limiter,
-        )
-        worker.yielded.connect(
-            lambda batch: self._on_chunks(generation, vdata, batch),
-        )
-        worker.finished.connect(
-            lambda: self._on_stage_finished(generation, index),
-        )
-        self._worker = worker
-        worker.start()
-
-    def _on_stage_finished(self, generation: int, index: int) -> None:
-        if generation != self._generation or self._closed:
-            return
-        if index + 1 < len(self._stages):
-            # fold the finished rung into the rendered level off-thread
-            # (per-batch folds are skipped while a repair is running)
-            self._repair_backdrop()
-            self._start_stage(generation, index + 1)
-        else:
-            self._on_fetch_finished(generation)
+        """Submit the renderer plan through the configured loading engine."""
+        raise NotImplementedError
 
     def _prioritize_3d(self, level, keys, interval):
         camera = self._viewer.scene.camera
@@ -2470,11 +2207,7 @@ class ProgressiveLoader:
             with contextlib.suppress(Exception):
                 pbar.close()
 
-    def _advance_progress(
-        self,
-        count: int = 1,
-        resident: bool = False,
-    ) -> None:
+    def _advance_progress(self, count: int = 1) -> None:
         """Accumulate progress for the timer-driven flush.
 
         ``QtLabeledProgressBar.setValue`` runs ``processEvents()``;
@@ -2484,10 +2217,7 @@ class ProgressiveLoader:
         handlers only increment counters; the Qt update runs from a
         timer at the top of the event loop.
         """
-        if resident:
-            self._resident_pbar_pending += count
-        else:
-            self._pbar_pending += count
+        self._pbar_pending += count
         if self._closed or self._pbar_scheduled:
             return
         now = time.monotonic()
@@ -2512,34 +2242,19 @@ class ProgressiveLoader:
             return
         self._pbar_flushing = True
         try:
-            for pbar, attr in (
-                (self._pbar, '_pbar_pending'),
-                (self._resident_pbar, '_resident_pbar_pending'),
-            ):
-                count = getattr(self, attr)
-                if count:
-                    setattr(self, attr, 0)
-                    if pbar is not None:
-                        with contextlib.suppress(Exception):
-                            pbar.update(count)
+            count = self._pbar_pending
+            if count:
+                self._pbar_pending = 0
+                if self._pbar is not None:
+                    with contextlib.suppress(Exception):
+                        self._pbar.update(count)
         finally:
             self._pbar_flushing = False
-
-    def _make_limiter(self) -> _FetchRateLimiter:
-        limiter = _FetchRateLimiter(self._max_bytes_per_second)
-        if self._holding:
-            limiter.pause()
-        return limiter
 
     def _cancel_active(self) -> None:
         self._generation += 1
         self._stages = []
         self._held_batches.clear()  # all stale now
-        if self._limiter is not None:
-            # wake workers sleeping on rate pacing so the pass winds
-            # down promptly
-            self._limiter.cancel()
-            self._limiter = None
         if self._worker is not None:
             self._worker.quit()
             self._worker = None
@@ -3016,152 +2731,8 @@ class ProgressiveLoader:
         self._repair_worker = worker
         worker.start()
 
-    # -- resident coarsest level --
-
-    def _resident_target_interval(
-        self,
-    ) -> tuple[np.ndarray, np.ndarray] | None:
-        """The interval of the coarsest level worth keeping resident.
-
-        Prefers the full level (so backdrops/thumbnails work everywhere);
-        if that exceeds the memory budget — e.g. the coarsest level of a
-        large timelapse spans every timepoint — falls back to the full
-        *displayed* extent at the current step of the other dimensions.
-        Returns ``None`` if even that is too large.
-        """
-        vdata = self._data[self._resident_level]
-        itemsize = vdata.dtype.itemsize
-        if vdata.size * itemsize <= self._resident_max_bytes:
-            return (
-                np.zeros(vdata.ndim, dtype=np.int64),
-                np.asarray(vdata.shape, dtype=np.int64),
-            )
-
-        min_coord = np.zeros(vdata.ndim, dtype=np.int64)
-        max_coord = np.asarray(vdata.shape, dtype=np.int64)
-        displayed = set(self._layer._slice_input.displayed)
-        self._restrict_to_current_step(
-            self._resident_level,
-            displayed,
-            min_coord,
-            max_coord,
-        )
-        nbytes = np.prod(max_coord - min_coord, dtype=np.int64) * itemsize
-        if nbytes > self._resident_max_bytes:
-            if not self._resident_disabled:
-                self._resident_disabled = True
-                LOGGER.warning(
-                    'coarsest level slice is %.0f MB (> %.0f MB); not '
-                    'keeping it resident. Backdrops and thumbnails will be '
-                    'limited to the visible region.',
-                    nbytes / 1e6,
-                    self._resident_max_bytes / 1e6,
-                )
-            return None
-        return min_coord, max_coord
-
-    def _ensure_resident(self) -> None:
-        """Keep the coarsest level resident around the current view.
-
-        The resident level provides instant low-resolution context when
-        panning/zooming, backs the layer thumbnail, and is the backdrop
-        source for finer levels. When the resident interval no longer
-        covers the current dims step (e.g. the time slider moved), it is
-        refilled.
-        """
-        target = self._resident_target_interval()
-        if target is None:
-            return
-        min_coord, max_coord = target
-        vdata = self._data[self._resident_level]
-        if vdata.covers(min_coord, max_coord):
-            if self._resident_worker is not None:
-                return
-            keys = chunk_slices(vdata, interval=(min_coord, max_coord))
-            if all(
-                _chunk_id(key) in vdata.loaded_chunks
-                for key in itertools.product(*keys)
-            ):
-                return
-        self._start_resident_fill(min_coord, max_coord)
-
-    def _start_resident_fill(self, min_coord, max_coord) -> None:
-        if self._resident_limiter is not None:
-            self._resident_limiter.cancel()
-            self._resident_limiter = None
-        if self._resident_worker is not None:
-            self._resident_worker.quit()
-            self._resident_worker = None
-        self._close_progress(self._resident_pbar)
-        self._resident_pbar = None
-        self._resident_pbar_pending = 0
-        vdata = self._data[self._resident_level]
-        vdata.set_interval(min_coord, max_coord)
-        interval = vdata.interval
-        keys = chunk_slices(vdata, interval=interval)
-        queue = [
-            key
-            for key in chunk_priority_2D(keys, interval[0], interval[1])
-            if _chunk_id(key) not in vdata.loaded_chunks
-        ]
-        if not queue:
-            return
-
-        self._resident_pbar = self._make_progress(
-            len(queue),
-            f'{self._layer.name}: loading overview',
-        )
-
-        apply = partial(_apply_chunk, vdata)
-
-        self._resident_limiter = self._make_limiter()
-        worker = _fetch_chunks(
-            vdata.array,
-            queue,
-            num_workers=self._fetch_workers,
-            apply=apply,
-            pack=lambda keys: self._pack_resident_batch(vdata, keys),
-            limiter=self._resident_limiter,
-        )
-
-        def on_chunk(batch, vdata=vdata):
-            if self._closed or self._resident_worker is not worker:
-                return
-            if self._resident_pbar is not None:
-                self._advance_progress(len(batch), resident=True)
-            self._on_resident_chunks(vdata, batch)
-
-        def on_finished():
-            if self._closed or self._resident_worker is not worker:
-                return
-            self._resident_worker = None
-            self._close_progress(self._resident_pbar)
-            self._resident_pbar = None
-            # If the active level's interval was initialized before this
-            # fill finished, its backdrop is zeros; repair the regions
-            # that have no real chunks yet so the canvas shows the
-            # (coarse) volume immediately.
-            self._repair_backdrop()
-            self._refresh(final=True)
-            # Re-evaluate coverage now that backdrops are available.
-            self._check()
-
-        worker.yielded.connect(on_chunk)
-        worker.finished.connect(on_finished)
-        self._resident_worker = worker
-        worker.start()
-
     def _ensure_persistent_overview(self) -> None:
         """Optional renderer hook for persistent coarse coverage."""
-
-    def _pack_resident_batch(self, vdata: VirtualData, keys):
-        """Prepare one resident batch away from the Qt thread."""
-        return keys
-
-    def _on_resident_chunks(self, vdata: VirtualData, batch) -> None:
-        """Present resident data on the Qt thread."""
-        if self._layer.data_level == self._resident_level:
-            self._refresh()
 
 
 # ---------- public entry point ----------
@@ -3386,218 +2957,19 @@ def _warn_if_chunks_suboptimal(data: MultiScaleVirtualData) -> None:
         warnings.warn(msg, stacklevel=2)
 
 
-def add_progressive_loading_image(
-    img,
-    viewer: napari.Viewer | None = None,
-    contrast_limits: tuple[float, float] | None = None,
-    colormap: str = 'gray',
-    rendering: str = 'attenuated_mip',
-    name: str | None = None,
-    auto_level_3d: bool = True,
-    max_pixel_size_3d: float = 2.0,
-    interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
-    tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
-    max_bytes_per_second: float | None = None,
-    interaction_hold: bool = True,
-    interactive_step_rate: float = 4.0,
-    coarse_first: bool = True,
-    debug_overlay: bool | None = None,
-    **layer_kwargs,
-):
-    """Add a progressively loading multiscale image to a viewer.
-
-    The image is added as a *single* multiscale layer. Chunks of the level
-    napari selects for rendering are streamed in on a background thread,
-    nearest to the view center first, while coarser data is shown as a
-    backdrop. The layer's resolution selector (``locked_data_level``) is
-    respected.
-
-    Parameters
-    ----------
-    img : sequence of array-like
-        Multiscale image data, highest resolution first. Levels may be
-        zarr arrays, dask arrays, or anything implementing ``shape``,
-        ``dtype``, ``chunks``/``chunksize`` and ``__getitem__``.
-    viewer : napari.Viewer, optional
-        The viewer to add the image to. A new one is created if not given.
-    contrast_limits : tuple of float, optional
-        Contrast limits for the layer. If not given, they are estimated
-        from a central sample of the coarsest level.
-    colormap : str
-        Colormap for the layer.
-    rendering : str
-        3D rendering mode for the layer.
-    name : str, optional
-        Layer name.
-    auto_level_3d : bool
-        In 3D, automatically pick the rendered data level from the camera
-        zoom (napari itself always uses the coarsest level in 3D). The
-        resolution selector stays on "Auto"; pinning an explicit level
-        there suspends automatic selection.
-    max_pixel_size_3d : float
-        Tuning knob for 3D auto level selection: target the coarsest
-        level whose voxels project to at most this many screen pixels.
-    interval_max_bytes : int
-        Memory budget for a single level's resident interval.
-    tile_max_bytes_3d : int
-        Upper bound for a 3D sub-volume tile; bounds the cost of the
-        full-tile GPU uploads at pass boundaries (roughly
-        size / 125 MB/s of GUI blocking on slow GL drivers).
-    max_bytes_per_second : float, optional
-        Rate-limit chunk loading (see
-        :class:`ProgressiveLoader`). ``None`` = unlimited.
-    interaction_hold : bool
-        Suspend all streaming work while the user interacts (see
-        :class:`ProgressiveLoader`).
-    interactive_step_rate : float
-        Coarsen the volume raycast step by this factor during
-        interaction, restoring full quality on settle (see
-        :class:`ProgressiveLoader`). 1.0 disables.
-    coarse_first : bool
-        Resolve fresh views coarse-to-fine through the intermediate
-        pyramid levels before the target level (see
-        :class:`ProgressiveLoader`).
-    debug_overlay : bool, optional
-        Show chunk wireframes and a resolution HUD (see
-        :meth:`ProgressiveLoader.enable_debug_overlay`). Defaults to
-        the ``NAPARI_PROGRESSIVE_DEBUG`` environment variable.
-    **layer_kwargs
-        Additional keyword arguments passed to ``viewer.add_image``.
-
-    Returns
-    -------
-    napari.layers.Image
-        The created layer. The active :class:`ProgressiveLoader` is stored
-        in ``layer.metadata['progressive_loader']``.
-
-    """
-    viewer, tile_max_bytes_3d = _resolve_viewer_and_tile_cap(
-        viewer, tile_max_bytes_3d
+def add_progressive_loading_image(img, viewer=None, **kwargs):
+    """Add an image through the LodStone progressive-loading integration."""
+    from napari.experimental._lodstone_loading import (
+        add_lodstone_loading_image,
     )
-    data = MultiScaleVirtualData(img)
-    _normalize_scale_for_float32(data, layer_kwargs, 'image')
 
-    if contrast_limits is None:
-        contrast_limits = _estimate_contrast_limits(data.arrays[-1])
+    return add_lodstone_loading_image(img, viewer=viewer, **kwargs)
 
-    from napari.layers import Image
 
-    # Construct the layer directly (instead of viewer.add_image) so the
-    # 3D tile extent can be set before the layer controls are built.
-    layer = Image(
-        data._data,
-        multiscale=True,
-        contrast_limits=contrast_limits,
-        colormap=colormap,
-        rendering=rendering,
-        name=name,
-        **layer_kwargs,
+def add_progressive_loading_labels(labels, viewer=None, **kwargs):
+    """Add labels through the LodStone progressive-loading integration."""
+    from napari.experimental._lodstone_loading import (
+        add_lodstone_loading_labels,
     )
-    _attach_progressive_loader(
-        layer,
-        data,
-        viewer,
-        interval_max_bytes=interval_max_bytes,
-        tile_max_bytes_3d=tile_max_bytes_3d,
-        auto_level_3d=auto_level_3d,
-        max_pixel_size_3d=max_pixel_size_3d,
-        max_bytes_per_second=max_bytes_per_second,
-        interaction_hold=interaction_hold,
-        interactive_step_rate=interactive_step_rate,
-        coarse_first=coarse_first,
-        debug_overlay=debug_overlay,
-    )
-    return layer
 
-
-def add_progressive_loading_labels(
-    labels,
-    viewer: napari.Viewer | None = None,
-    name: str | None = None,
-    auto_level_3d: bool = True,
-    max_pixel_size_3d: float = 2.0,
-    interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
-    tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
-    max_bytes_per_second: float | None = None,
-    interaction_hold: bool = True,
-    interactive_step_rate: float = 4.0,
-    coarse_first: bool = True,
-    debug_overlay: bool | None = None,
-    **layer_kwargs,
-):
-    """Add a progressively loading multiscale labels layer to a viewer.
-
-    Works identically to :func:`add_progressive_loading_image` but creates
-    a :class:`~napari.layers.Labels` layer.  Editing is disabled (napari
-    disables editing for multiscale labels), so the layer is read-only.
-
-    Parameters
-    ----------
-    labels : sequence of array-like
-        Multiscale label data, highest resolution first.  Must be integer
-        typed.  Levels may be zarr arrays, dask arrays, or anything
-        implementing ``shape``, ``dtype``, ``chunks``/``chunksize`` and
-        ``__getitem__``.
-    viewer : napari.Viewer, optional
-        The viewer to add the layer to.  A new one is created if not given.
-    name : str, optional
-        Layer name.
-    auto_level_3d : bool
-        Automatically pick the rendered data level from the camera zoom
-        in 3D.
-    max_pixel_size_3d : float
-        Tuning knob for 3D auto level selection.
-    interval_max_bytes : int
-        Memory budget for a single level's resident interval.
-    tile_max_bytes_3d : int
-        Upper bound for a 3D sub-volume tile.
-    max_bytes_per_second : float, optional
-        Rate-limit chunk loading.  ``None`` = unlimited.
-    interaction_hold : bool
-        Suspend all streaming work while the user interacts.
-    interactive_step_rate : float
-        Coarsen the volume raycast step by this factor during interaction.
-    coarse_first : bool
-        Resolve fresh views coarse-to-fine through the intermediate
-        pyramid levels before the target level.
-    debug_overlay : bool, optional
-        Show chunk wireframes and a resolution HUD. Defaults to the
-        ``NAPARI_PROGRESSIVE_DEBUG`` environment variable.
-    **layer_kwargs
-        Additional keyword arguments passed to the ``Labels`` constructor.
-
-    Returns
-    -------
-    napari.layers.Labels
-        The created layer.  The active :class:`ProgressiveLoader` is stored
-        in ``layer.metadata['progressive_loader']``.
-    """
-    viewer, tile_max_bytes_3d = _resolve_viewer_and_tile_cap(
-        viewer, tile_max_bytes_3d
-    )
-    data = MultiScaleVirtualData(labels)
-    _normalize_scale_for_float32(data, layer_kwargs, 'label')
-
-    from napari.layers import Labels
-
-    layer = Labels(
-        data._data,
-        multiscale=True,
-        name=name,
-        **layer_kwargs,
-    )
-    _attach_progressive_loader(
-        layer,
-        data,
-        viewer,
-        interval_max_bytes=interval_max_bytes,
-        tile_max_bytes_3d=tile_max_bytes_3d,
-        auto_level_3d=auto_level_3d,
-        max_pixel_size_3d=max_pixel_size_3d,
-        max_bytes_per_second=max_bytes_per_second,
-        interaction_hold=interaction_hold,
-        interactive_step_rate=interactive_step_rate,
-        coarse_first=coarse_first,
-        debug_overlay=debug_overlay,
-    )
-    return layer
+    return add_lodstone_loading_labels(labels, viewer=viewer, **kwargs)

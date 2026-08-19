@@ -49,7 +49,6 @@ pytestmark = [
 ]
 
 from napari.experimental._progressive_loading import (  # noqa: E402
-    _apply_chunk,
     add_progressive_loading_image,
     chunk_slices,
 )
@@ -90,7 +89,6 @@ def _wait_idle(qtbot, loader, timeout=30000):
     qtbot.waitUntil(
         lambda: (
             loader._worker is None
-            and loader._resident_worker is None
             and getattr(loader, '_repair_worker', None) is None
         ),
         timeout=timeout,
@@ -122,10 +120,7 @@ def _load_fully(md, level):
     for key in itertools.product(
         *chunk_slices(vdata, interval=vdata.interval)
     ):
-        # _apply_chunk, not set_offset: it also records the chunk as
-        # loaded, which is what makes the level eligible as a backdrop
-        # source
-        _apply_chunk(vdata, key, np.asarray(vdata.array[key]))
+        vdata.set_chunk(key, np.asarray(vdata.array[key]), vdata.scale_level)
 
 
 def _backdrop_shift(loader, levels, factors, target, src):

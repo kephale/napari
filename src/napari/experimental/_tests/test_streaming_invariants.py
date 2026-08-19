@@ -120,7 +120,6 @@ def _wait_for_idle_loader(qtbot, loader, timeout=30000):
     def idle():
         return (
             loader._worker is None
-            and loader._resident_worker is None
             and getattr(loader, '_repair_worker', None) is None
         )
 
@@ -334,7 +333,7 @@ def test_settled_view_change_completes_without_further_events(
     """One settled view change loads its whole viewport with no help.
 
     Reproduces the reported stall shape: a pan starts a fetch pass, the
-    user briefly interacts again (batches buffer during the hold), the
+    user briefly interacts again (LodStone pauses during the hold), the
     interaction settles once — and then nothing else happens. The pass
     must still run to full coverage and reconcile on its own; if any
     tile waits for the *next* interaction, this fails.
@@ -369,8 +368,7 @@ def test_settled_view_change_completes_without_further_events(
 
         # wait until a fetch is genuinely in flight (blocked on the
         # gate), then start the drag: the interaction hold pauses any
-        # further fetches, but the in-flight one completes and its
-        # batch must buffer rather than land
+        # further LodStone reads and delivery
         qtbot.waitUntil(gated.touched.is_set, timeout=10000)
         loader._on_interaction()
         assert loader._holding
@@ -385,12 +383,10 @@ def test_settled_view_change_completes_without_further_events(
             'start',
             lambda *args, **kwargs: None,
         )
-        # let the fetch generator's batching window (batch_seconds)
-        # elapse so the in-flight chunk yields the moment it completes
-        # instead of being coalesced into a later, post-hold batch
         qtbot.wait(100)
         gate.set()
-        qtbot.waitUntil(lambda: bool(loader._held_batches), timeout=10000)
+        qtbot.wait(100)
+        assert loader._worker is not None
 
         # the single settle event; from here on, NO further interaction
         loader._check()

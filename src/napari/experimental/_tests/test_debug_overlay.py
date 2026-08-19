@@ -43,11 +43,7 @@ def multiscale_arrays():
 
 def _wait_for_idle_loader(qtbot, loader, timeout=30000):
     def idle():
-        return (
-            loader._worker is None
-            and loader._resident_worker is None
-            and loader._repair_worker is None
-        )
+        return loader._worker is None and loader._repair_worker is None
 
     qtbot.waitUntil(idle, timeout=timeout)
 

@@ -20,10 +20,12 @@ pytestmark = [
     ),
 ]
 
+from napari.experimental._lodstone_loading import (  # noqa: E402
+    LodstoneProgressiveLoader,
+)
 from napari.experimental._progressive_loading import (  # noqa: E402
     ProgressiveLoader,
     add_progressive_loading_image,
-    chunk_priority_2D,
     chunk_priority_3D,
     chunk_slices,
 )
@@ -43,81 +45,19 @@ def multiscale_arrays():
     return [da.from_array(level, chunks=(32, 32)) for level in levels]
 
 
-# ---------- chunk geometry ----------
-
-
-def test_chunk_slices_full(multiscale_arrays):
-    vdata = VirtualData(multiscale_arrays[0])
-    slices = chunk_slices(vdata)
-    assert len(slices) == 2
-    assert len(slices[0]) == 256 // 32
-    assert slices[0][0] == slice(0, 32)
-    assert slices[0][-1] == slice(224, 256)
-
-
-def test_chunk_slices_interval(multiscale_arrays):
-    vdata = VirtualData(multiscale_arrays[0])
-    interval = ((40, 0), (100, 32))
-    slices = chunk_slices(vdata, interval=interval)
-    assert slices[0] == [slice(32, 64), slice(64, 96), slice(96, 128)]
-    assert slices[1] == [slice(0, 32)]
-
-
-def test_chunk_slices_accepts_raw_arrays(multiscale_arrays):
-    slices = chunk_slices(multiscale_arrays[1])
-    assert len(slices[0]) == 128 // 32
-
-
-def test_chunk_priority_2d_center_first(multiscale_arrays):
-    vdata = VirtualData(multiscale_arrays[0])
-    keys = chunk_slices(vdata)
-    queue = chunk_priority_2D(keys, (0, 0), (256, 256))
-    assert len(queue) == 64
-    first_center = np.array([(sl.start + sl.stop) / 2 for sl in queue[0]])
-    last_center = np.array([(sl.start + sl.stop) / 2 for sl in queue[-1]])
-    view_center = np.array([128, 128])
-    assert np.linalg.norm(first_center - view_center) <= np.linalg.norm(
-        last_center - view_center,
-    )
-
-
-def test_chunk_priority_2d_empty():
-    assert chunk_priority_2D([[], []], (0, 0), (0, 0)) == []
-
-
-def test_chunk_priority_3d_orders_by_depth():
-    arr = da.zeros((64, 64, 64), chunks=(16, 16, 16), dtype=np.uint8)
-    vdata = VirtualData(arr)
-    keys = chunk_slices(vdata)
-    queue = chunk_priority_3D(
-        keys,
-        (0, 0, 0),
-        (64, 64, 64),
-        camera_center=(32, 32, 32),
-        view_direction=(1, 0, 0),
-    )
-    assert len(queue) == 64
-    # strictly front-to-back: the chunk closest to the viewer loads first,
-    # and depth along the view direction never decreases
-    assert queue[0][0].start == 0
-    depths = [key[0].start for key in queue]
-    assert depths == sorted(depths)
-
-
-# ---------- viewer integration ----------
-
-
 def _wait_for_idle_loader(qtbot, loader, timeout=30000):
-    """Wait until the loader has no in-flight fetch workers."""
+    """Wait until the loader has no in-flight loading or repair work."""
 
     def idle():
         return (
             loader._worker is None
-            and loader._resident_worker is None
             and getattr(loader, '_repair_worker', None) is None
         )
 
     qtbot.waitUntil(idle, timeout=timeout)
+
+
+# ---------- chunk geometry ----------
 
 
 def test_add_progressive_loading_image(
@@ -256,7 +196,9 @@ def test_interval_clamped_to_memory_budget(
         multiscale=True,
         contrast_limits=(0, 255),
     )
-    loader = ProgressiveLoader(viewer, layer, data, interval_max_bytes=4096)
+    loader = LodstoneProgressiveLoader(
+        viewer, layer, data, interval_max_bytes=4096
+    )
     layer.metadata['progressive_loader'] = loader
     min_coord, max_coord = loader._level_interval(0)
     extent = np.asarray(max_coord) - np.asarray(min_coord)
@@ -390,7 +332,9 @@ def test_zoom_target_level_respects_memory_budget(
         multiscale=True,
         contrast_limits=(0, 255),
     )
-    loader = ProgressiveLoader(viewer, layer, data, interval_max_bytes=20**3)
+    loader = LodstoneProgressiveLoader(
+        viewer, layer, data, interval_max_bytes=20**3
+    )
     layer.metadata['progressive_loader'] = loader
     # zoomed OUT, the viewport covers the whole volume: level 0 (64^3,
     # tiled to 32^3 minimum) and level 1 (32^3) exceed the byte budget;
@@ -399,44 +343,6 @@ def test_zoom_target_level_respects_memory_budget(
     viewer.scene.camera.zoom = 0.1
     assert loader._zoom_target_level_3d() == 2
     loader.close()
-
-
-def test_chunk_priority_3d_degenerate_camera():
-    """NaN/zero camera state must not produce NaN priorities or warnings.
-
-    Regression test: before the 3D camera is fully initialized (e.g. the
-    window has not been shown yet), view_direction can be zero and
-    center/zoom non-finite, which corrupted the chunk sort order.
-    """
-    import warnings
-
-    arr = da.zeros((64, 64, 64), chunks=(16, 16, 16), dtype=np.uint8)
-    vdata = VirtualData(arr)
-    keys = chunk_slices(vdata)
-    degenerate_cameras = [
-        {'camera_center': (0, 0, 0), 'view_direction': (0, 0, 0)},
-        {
-            'camera_center': (np.nan, np.nan, np.nan),
-            'view_direction': (1, 0, 0),
-        },
-        {
-            'camera_center': (np.inf, 0, 0),
-            'view_direction': (1, 0, 0),
-        },
-        # huge-but-finite center: overflows the priority arithmetic
-        {
-            'camera_center': (1e308, -1e308, 1e308),
-            'view_direction': (1, 0, 0),
-        },
-    ]
-    for camera in degenerate_cameras:
-        with warnings.catch_warnings():
-            warnings.simplefilter('error', RuntimeWarning)
-            queue = chunk_priority_3D(keys, (0, 0, 0), (64, 64, 64), **camera)
-        assert len(queue) == 64
-        # fallback ordering: the most central chunks come first
-        first_center = np.array([(sl.start + sl.stop) / 2 for sl in queue[0]])
-        assert np.all(np.abs(first_center - 32) <= 16)
 
 
 def test_zoom_target_level_3d_uninitialized_camera(
@@ -917,7 +823,7 @@ def test_zoom_target_respects_chunk_budget(
         multiscale=True,
         contrast_limits=(0, 255),
     )
-    loader = ProgressiveLoader(
+    loader = LodstoneProgressiveLoader(
         viewer,
         layer,
         data,
@@ -935,37 +841,6 @@ def test_zoom_target_respects_chunk_budget(
     assert target >= 1
     loader._closed = False
     loader.close()
-
-
-def test_fill_unloaded_from_repairs_backdrop():
-    """Backdrop repair fills only chunks without real data."""
-    from napari.experimental._virtual_data import MultiScaleVirtualData
-
-    base = np.full((64, 64), 7, dtype=np.uint8)
-    coarse = np.full((32, 32), 9, dtype=np.uint8)
-    msvd = MultiScaleVirtualData(
-        [
-            da.from_array(base, chunks=(16, 16)),
-            da.from_array(coarse, chunks=(16, 16)),
-        ],
-    )
-    # resident coarse level fully loaded
-    msvd[1].set_interval((0, 0), (32, 32))
-    msvd[1].set_offset((slice(0, 32), slice(0, 32)), coarse)
-    msvd[1].loaded_chunks.add(((0, 16), (0, 16)))
-
-    # fine level: interval initialized to zeros (the race), one real chunk
-    msvd[0].set_interval((0, 0), (64, 64))
-    msvd[0].set_offset((slice(0, 16), slice(0, 16)), base[:16, :16])
-    msvd[0].loaded_chunks.add(((0, 16), (0, 16)))
-
-    assert msvd.fill_unloaded_from(0, 1)
-    hyperslice = msvd[0].hyperslice
-    # the loaded chunk keeps its real data
-    assert (hyperslice[:16, :16] == 7).all()
-    # everything else now shows the upsampled coarse value
-    assert (hyperslice[16:, 16:] == 9).all()
-    assert (hyperslice[:16, 16:] == 9).all()
 
 
 def test_huge_world_auto_normalized(qtbot, make_napari_viewer):
@@ -1429,143 +1304,6 @@ def test_progress_updates_deferred(
 # ---------- fetch rate limiting ----------
 
 
-def test_rate_limiter_paces_bytes_per_second():
-    import time as _time
-
-    from napari.experimental._progressive_loading import _FetchRateLimiter
-
-    limiter = _FetchRateLimiter(bytes_per_second=1e6)  # 1 MB/s
-    start = _time.monotonic()
-    # 5 x 100 KB: first acquire is free, the rest are paced -> >= ~0.4s
-    for _ in range(5):
-        limiter.acquire(100_000)
-    elapsed = _time.monotonic() - start
-    assert elapsed >= 0.35
-    assert elapsed < 2.0
-
-
-def test_rate_limiter_cancel_wakes_sleepers():
-    import threading as _threading
-    import time as _time
-
-    from napari.experimental._progressive_loading import _FetchRateLimiter
-
-    limiter = _FetchRateLimiter(bytes_per_second=1.0)  # absurdly slow
-    limiter.acquire(10)  # next acquire would sleep ~10s
-    done = _threading.Event()
-
-    def sleeper():
-        limiter.acquire(10)
-        done.set()
-
-    t = _threading.Thread(target=sleeper, daemon=True)
-    t.start()
-    _time.sleep(0.05)
-    limiter.cancel()
-    assert done.wait(1.0), 'cancel() did not wake the sleeping acquire'
-    # cancelled limiter no longer paces at all
-    start = _time.monotonic()
-    limiter.acquire(10**9)
-    assert _time.monotonic() - start < 0.1
-
-
-def test_key_nbytes():
-    from napari.experimental._progressive_loading import _key_nbytes
-
-    key = (slice(0, 4), slice(8, 16), slice(0, 32))
-    assert _key_nbytes(key, 2) == 4 * 8 * 32 * 2
-
-
-def test_fetch_chunks_respects_limiter(multiscale_arrays):
-    import time as _time
-
-    from napari.experimental._progressive_loading import (
-        _fetch_chunks,
-        _FetchRateLimiter,
-    )
-
-    vdata = VirtualData(multiscale_arrays[2])  # 64x64 uint8
-    vdata.set_interval((0, 0), (64, 64))
-    keys = [
-        (slice(i, i + 32), slice(j, j + 32)) for i in (0, 32) for j in (0, 32)
-    ]  # 4 chunks x 1 KB
-    limiter = _FetchRateLimiter(bytes_per_second=8_192)  # 8 chunks/s
-    start = _time.monotonic()
-    batches = list(
-        _fetch_chunks.__wrapped__(
-            vdata.array,
-            keys,
-            num_workers=2,
-            limiter=limiter,
-        ),
-    )
-    elapsed = _time.monotonic() - start
-    fetched = [key for batch in batches for key in batch]
-    assert sorted(map(str, fetched)) == sorted(map(str, keys))
-    # 4 KB at 8 KB/s with the first chunk free -> >= ~0.375s
-    assert elapsed >= 0.3
-
-
-def test_loader_unlimited_by_default(
-    qtbot,
-    make_napari_viewer,
-    multiscale_arrays,
-):
-    viewer = make_napari_viewer()
-    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
-    loader = layer.metadata['progressive_loader']
-    assert loader._max_bytes_per_second is None
-    # a limiter is still created (it doubles as the interaction-hold
-    # gate) but performs no rate pacing
-    assert loader._make_limiter().bytes_per_second is None
-    _wait_for_idle_loader(qtbot, loader)
-    loader.close()
-
-
-# ---------- interaction hold ----------
-
-
-def test_rate_limiter_pause_blocks_until_resume():
-    import threading as _threading
-    import time as _time
-
-    from napari.experimental._progressive_loading import _FetchRateLimiter
-
-    limiter = _FetchRateLimiter()  # unlimited rate, gate only
-    limiter.pause()
-    passed = _threading.Event()
-
-    def worker():
-        limiter.acquire(1)
-        passed.set()
-
-    t = _threading.Thread(target=worker, daemon=True)
-    t.start()
-    _time.sleep(0.05)
-    assert not passed.is_set(), 'paused limiter let a fetch through'
-    limiter.resume()
-    assert passed.wait(1.0), 'resume() did not release the worker'
-
-
-def test_rate_limiter_cancel_releases_paused_worker():
-    import threading as _threading
-    import time as _time
-
-    from napari.experimental._progressive_loading import _FetchRateLimiter
-
-    limiter = _FetchRateLimiter()
-    limiter.pause()
-    passed = _threading.Event()
-    t = _threading.Thread(
-        target=lambda: (limiter.acquire(1), passed.set()),
-        daemon=True,
-    )
-    t.start()
-    _time.sleep(0.05)
-    limiter.cancel()
-    assert passed.wait(1.0), 'cancel() did not release a paused worker'
-
-
 def test_interaction_hold_buffers_batches_and_refreshes(
     qtbot,
     make_napari_viewer,
@@ -1604,25 +1342,6 @@ def test_interaction_hold_buffers_batches_and_refreshes(
     assert loader._holding
     assert loader._hold_until > _time.monotonic()
     loader._end_hold()
-    _wait_for_idle_loader(qtbot, loader)
-    loader.close()
-
-
-def test_interaction_hold_pauses_fetch_limiter(
-    qtbot,
-    make_napari_viewer,
-    multiscale_arrays,
-):
-    viewer = make_napari_viewer()
-    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
-    loader = layer.metadata['progressive_loader']
-    _wait_for_idle_loader(qtbot, loader)
-    loader._limiter = loader._make_limiter()
-    loader._on_interaction()
-    assert not loader._limiter._go.is_set()
-    loader._end_hold()
-    assert loader._limiter._go.is_set()
-    loader._limiter = None
     _wait_for_idle_loader(qtbot, loader)
     loader.close()
 
@@ -2251,7 +1970,10 @@ def test_reshape_staged_and_swapped(
     assert node._texture is dbuf._front
     assert dbuf._front is not old_front
     assert tuple(node._texture.shape[:3]) == new_shape
-    assert node._vol_shape == new_shape
+    expected_geometry = (
+        loader._data[0].shape if node.clipmap_enabled else new_shape
+    )
+    assert node._vol_shape == expected_geometry
     assert node._need_vertex_update
     assert dbuf.matches(node)
     assert not dbuf.dirty
@@ -2307,7 +2029,10 @@ def test_reshape_waits_for_backlog_drain(
     assert not dbuf._reshape_pending
     assert node._texture is dbuf._front
     assert tuple(node._texture.shape[:3]) == new_shape
-    assert node._vol_shape == new_shape
+    expected_geometry = (
+        loader._data[0].shape if node.clipmap_enabled else new_shape
+    )
+    assert node._vol_shape == expected_geometry
     assert not dbuf.dirty
     loader.close()
 

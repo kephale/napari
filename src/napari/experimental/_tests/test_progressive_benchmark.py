@@ -90,12 +90,10 @@ def _coverage_complete(loader, layer) -> bool:
 
 
 def test_progressive_bench_zoom_pan(qtbot, make_napari_viewer, monkeypatch):
+    from lodstone.datasets import mandelbrot_dataset
     from qtpy.QtCore import QTimer
 
     import napari.experimental._progressive_loading as pl
-    from napari.experimental._progressive_loading_datasets import (
-        mandelbrot_dataset,
-    )
 
     # attribute the worst single main-thread stall to the loader's own
     # entry points (class-level patch, before the loader is constructed)
@@ -142,11 +140,7 @@ def test_progressive_bench_zoom_pan(qtbot, make_napari_viewer, monkeypatch):
     heartbeat.start()
 
     def idle():
-        return (
-            loader._worker is None
-            and loader._resident_worker is None
-            and loader._repair_worker is None
-        )
+        return loader._worker is None and loader._repair_worker is None
 
     qtbot.waitUntil(idle, timeout=int(MOVE_TIMEOUT_S * 1000))
     qtbot.wait(300)

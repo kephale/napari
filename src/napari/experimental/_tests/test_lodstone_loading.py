@@ -4,16 +4,14 @@ from types import SimpleNamespace
 
 import dask.array as da
 import numpy as np
-from lodstone import Plan, Region, Tile, TileKey, Update
+from lodstone import Plan, Region, TileKey, Update
 
 from napari.experimental._lodstone_loading import (
     LEVEL_LABEL_OFFSET,
     MISSING_LEVEL_LABEL,
-    PlanComparison,
     PlanTrace,
     _camera_view,
     _level_transforms,
-    _LevelDiagnosticArray,
     _NapariTarget,
     add_lodstone_level_diagnostics,
     add_lodstone_loading_image,
@@ -38,41 +36,21 @@ class _VirtualData:
         return True
 
 
-def _expected_submitted_trace(loader):
+def _assert_submitted_uses_selected_geometry(loader):
     comparison = loader.bounded_plan_comparisons[-1]
-    return (
+    expected = (
         comparison.lodstone
         if comparison.geometry_matches
         else comparison.napari
     )
-
-
-def test_level_diagnostic_array_reads_source_and_returns_level_label() -> None:
-    class RecordingArray:
-        shape = (8, 8)
-        dtype = np.dtype(np.uint16)
-        chunks = (4, 4)
-
-        def __init__(self) -> None:
-            self.reads = []
-
-        def __getitem__(self, key):
-            self.reads.append(key)
-            return np.arange(64, dtype=self.dtype).reshape(self.shape)[key]
-
-    source = RecordingArray()
-    diagnostic = _LevelDiagnosticArray(source, level=2)
-
-    result = diagnostic[1:5, 2:7]
-
-    assert source.reads == [(slice(1, 5), slice(2, 7))]
-    assert diagnostic.shape == source.shape
-    assert diagnostic.chunks == source.chunks
-    assert diagnostic.fill_value == MISSING_LEVEL_LABEL
-    np.testing.assert_array_equal(
-        result,
-        np.full((4, 5), 2 + LEVEL_LABEL_OFFSET, dtype=np.uint8),
-    )
+    actual = PlanTrace.from_plan(loader._submitted_plan)
+    assert actual.target_level == expected.target_level
+    assert frozenset(actual.tiles) == frozenset(expected.tiles)
+    assert frozenset(expected.wanted) <= frozenset(actual.wanted)
+    expected_wanted = frozenset(expected.wanted)
+    assert {
+        tile[0] for tile in actual.wanted if tile not in expected_wanted
+    } <= {loader._resident_level}
 
 
 def test_target_applies_full_nd_chunk_before_render_callback() -> None:
@@ -103,25 +81,6 @@ def test_target_applies_full_nd_chunk_before_render_callback() -> None:
     target.apply(staged)
 
     assert delivered == [(7, vdata, [region.slices()])]
-
-
-def test_plan_trace_compares_geometry_not_planner_specific_keys() -> None:
-    region = Region((0, 0), (8, 8))
-    left = Tile(TileKey(0, (0, 0), ()), region, 0.0)
-    right = Tile(TileKey(0, (99, 99), ()), region, 42.0)
-    first = Plan((left,), frozenset({left.key}), 0, (left,))
-    second = Plan((right,), frozenset({right.key}), 0, (right,))
-
-    trace = PlanTrace.from_plan(first)
-    comparison = PlanComparison(
-        SimpleNamespace(),
-        trace,
-        PlanTrace.from_plan(second),
-    )
-
-    assert comparison.matches
-    assert trace.tiles == ((0, (0, 0), (8, 8), 0),)
-    assert trace.wanted == trace.tiles
 
 
 def test_level_transforms_include_downsampling_and_layer_transform() -> None:
@@ -220,10 +179,7 @@ def test_real_fetch_pass_records_napari_and_lodstone_plans(
         bounded = loader.bounded_plan_comparisons[-1]
         assert bounded.geometry_matches
         assert loader._submitted_plan is not None
-        assert (
-            PlanTrace.from_plan(loader._submitted_plan)
-            == _expected_submitted_trace(loader)
-        )
+        _assert_submitted_uses_selected_geometry(loader)
         qtbot.waitUntil(
             lambda: bool(loader.execution_diagnostics), timeout=10000
         )
@@ -280,14 +236,11 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
             comparison.napari.target_level == comparison.lodstone.target_level
         )
         assert loader._submitted_plan is not None
-        assert (
-            PlanTrace.from_plan(loader._submitted_plan)
-            == _expected_submitted_trace(loader)
-        )
-        assert all(
-            tile.level == comparison.napari.target_level
-            for tile in loader._submitted_plan.wanted
-        )
+        _assert_submitted_uses_selected_geometry(loader)
+        assert {tile.level for tile in loader._submitted_plan.wanted} <= {
+            comparison.napari.target_level,
+            loader._resident_level,
+        }
 
         comparison_count = len(loader.plan_comparisons)
         viewer.scene.camera.angles = (25, 35, 10)
@@ -303,10 +256,7 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
         assert (
             comparison.napari.target_level == comparison.lodstone.target_level
         )
-        assert (
-            PlanTrace.from_plan(loader._submitted_plan)
-            == _expected_submitted_trace(loader)
-        )
+        _assert_submitted_uses_selected_geometry(loader)
 
         comparison_count = len(loader.plan_comparisons)
         viewer.scene.camera.zoom = 1
@@ -320,10 +270,7 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
         comparison = loader.plan_comparisons[-1]
         assert comparison.napari.target_level == 1
         assert comparison.lodstone.target_level == 1
-        assert (
-            PlanTrace.from_plan(loader._submitted_plan)
-            == _expected_submitted_trace(loader)
-        )
+        _assert_submitted_uses_selected_geometry(loader)
     finally:
         loader.close()
 
@@ -571,9 +518,6 @@ def test_bounded_region_plan_is_used_when_generic_plan_differs(
         assert comparison.napari.tiles
         assert not comparison.lodstone.tiles
         assert loader._submitted_plan is not None
-        assert (
-            PlanTrace.from_plan(loader._submitted_plan)
-            == _expected_submitted_trace(loader)
-        )
+        _assert_submitted_uses_selected_geometry(loader)
     finally:
         loader.close()

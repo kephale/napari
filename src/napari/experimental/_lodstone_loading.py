@@ -9,7 +9,6 @@ chunk reads, decoded caching, batching, cancellation, and stale-pass rejection.
 
 from __future__ import annotations
 
-import itertools
 import logging
 from collections import defaultdict, deque
 from typing import Any
@@ -25,9 +24,11 @@ from lodstone import (
     Region,
     Stream,
     StreamDiagnostics,
-    Tile,
     TileKey,
     View,
+    available_tile_keys,
+    merge_plans,
+    plan_from_slices,
 )
 from lodstone.sources import ArrayPyramidSource
 from qtpy.QtCore import QObject, Qt, Signal, Slot
@@ -37,7 +38,6 @@ from napari.experimental._progressive_loading import (
     DEFAULT_TILE_MAX_BYTES_3D,
     ProgressiveLoader,
     _attach_progressive_loader,
-    _chunk_id,
     _estimate_contrast_limits,
     _normalize_scale_for_float32,
     _pack_upload_block,
@@ -105,7 +105,13 @@ def _level_diagnostic_color_map(levels: int) -> dict[int | None, str]:
 
 def _level_transforms(layer, data) -> list[np.ndarray]:
     """Map every pyramid level into napari world coordinates."""
-    data_to_world = np.asarray(layer._data_to_world.affine_matrix, dtype=float)
+    layer_to_world = np.asarray(
+        layer._data_to_world.affine_matrix, dtype=float
+    )
+    data_to_world = np.eye(data.ndim + 1, dtype=float)
+    spatial_ndim = layer_to_world.shape[0] - 1
+    data_to_world[:spatial_ndim, :spatial_ndim] = layer_to_world[:-1, :-1]
+    data_to_world[:spatial_ndim, -1] = layer_to_world[:-1, -1]
     transforms = []
     for factors in data._scale_factors:
         level_to_finest = np.eye(data.ndim + 1, dtype=float)
@@ -205,6 +211,7 @@ class _NapariTarget:
     def __init__(self, loader: LodstoneProgressiveLoader) -> None:
         self.loader = loader
         self.generation = 0
+        self.prepared_regions: dict[int, Region] = {}
 
     def layout(self, view, pyramid) -> Layout:
         return Layout(
@@ -215,24 +222,45 @@ class _NapariTarget:
         )
 
     def prepare(self, view, plan) -> None:
-        return None
+        bounds: dict[int, tuple[list[int], list[int]]] = {}
+        for tile in plan.desired:
+            if tile.level not in bounds:
+                bounds[tile.level] = [
+                    list(tile.region.start),
+                    list(tile.region.stop),
+                ]
+                continue
+            start, stop = bounds[tile.level]
+            for axis in range(tile.region.ndim):
+                start[axis] = min(start[axis], tile.region.start[axis])
+                stop[axis] = max(stop[axis], tile.region.stop[axis])
+        self.prepared_regions = {
+            level: Region(tuple(start), tuple(stop))
+            for level, (start, stop) in bounds.items()
+        }
 
     def stage(self, updates):
         """Write and pack chunks on Lodstone's worker thread."""
         grouped: dict[int, list[tuple[slice, ...]]] = defaultdict(list)
         for update in updates:
             vdata = self.loader._data[update.level]
+            prepared = self.prepared_regions.get(update.level)
+            if prepared is not None and not vdata.covers(
+                prepared.start, prepared.stop
+            ):
+                vdata.set_interval(prepared.start, prepared.stop)
             key = update.region.slices()
             if vdata.set_chunk(key, update.data, update.level):
                 grouped[update.level].append(key)
         active = getattr(self.loader, '_active', None)
         target = active[0] if active is not None else None
+        resident = getattr(self.loader, '_resident_level', target)
         return tuple(
             (
                 level,
                 batch,
                 _pack_upload_block(self.loader._data[level], batch)
-                if level == target
+                if level in {target, resident}
                 else None,
             )
             for level, batch in grouped.items()
@@ -245,6 +273,13 @@ class _NapariTarget:
         if staged and not isinstance(staged[0], tuple):
             staged = self.stage(staged)
         for level, batch, block in staged:
+            resident = getattr(self.loader, '_resident_level', None)
+            on_resident = getattr(self.loader, '_on_resident_chunks', None)
+            if level == resident and on_resident is not None:
+                on_resident(
+                    self.loader._data[level],
+                    (batch, block) if block is not None else batch,
+                )
             self.loader._on_chunks(
                 self.generation,
                 self.loader._data[level],
@@ -363,17 +398,6 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         except (KeyError, AttributeError, RuntimeError):
             pass
 
-    def _pack_resident_batch(self, vdata, keys):
-        if (
-            self._closed
-            or self._viewer is None
-            or not isinstance(self._data, MultiScaleVirtualData)
-            or self._viewer.dims.ndisplay != 3
-            or self._data.ndim != 3
-        ):
-            return keys
-        return keys, _pack_upload_block(vdata, keys)
-
     def _on_resident_chunks(self, vdata, batch) -> None:
         block = None
         if isinstance(batch, tuple):
@@ -385,59 +409,30 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         if self._layer.data_level == self._resident_level:
             self._refresh()
 
-    def _start_resident_fill(self, min_coord, max_coord) -> None:
-        vdata = self._data[self._resident_level]
-        dimensions = chunk_slices(vdata, interval=(min_coord, max_coord))
-        desired = 0
-        wanted = 0
-        for key in itertools.product(*dimensions):
-            desired += 1
-            wanted += _chunk_id(key) not in vdata.loaded_chunks
-        LOGGER.info(
-            'napari resident bootstrap trace: level=%d '
-            'desired_chunks=%d wanted_chunks=%d',
-            self._resident_level,
-            desired,
-            wanted,
-        )
-        super()._start_resident_fill(min_coord, max_coord)
-
     def _start_stage(self, generation: int, index: int) -> None:
         if not self._lodstone_enabled or self._lodstone_stream is None:
-            super()._start_stage(generation, index)
             return
 
         target = self._stages[-1][0]
         desired_stages = self._desired_stages(target)
-        phases = {
-            level: phase
-            for phase, (level, _queue) in enumerate(desired_stages)
-        }
-        wanted = tuple(
-            tile
-            for level, queue in self._stages
-            for tile in self._plan_tiles(level, queue, phases[level])
-        )
-        desired = tuple(
-            tile
-            for phase, (level, queue) in enumerate(desired_stages)
-            for tile in self._plan_tiles(level, queue, phase)
-        )
-        plan = Plan(
-            wanted=wanted,
-            retain=frozenset(
-                tile.key for tile in desired if tile.level == target
-            ),
+        view = self._pass_view()
+        available = self._available_keys(view)
+        plan = plan_from_slices(
+            self._lodstone_source.pyramid,
+            view,
+            desired_stages,
             target_level=target,
-            desired=desired,
+            available=available,
+            fetch_levels={target}
+            if self._uses_atomic_clipmap_page()
+            else None,
         )
         plan_source = 'napari-fallback'
-        view = self._pass_view(desired)
         shared = self._shared_planners[len(view.displayed_axes)].plan(
             self._lodstone_source.pyramid,
             view,
             self._lodstone_target.layout(view, self._lodstone_source.pyramid),
-            available=self._available_keys(view),
+            available=available,
         )
         comparison = PlanComparison(
             view,
@@ -448,7 +443,9 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         active = self._active
         if active is not None:
             _active_level, active_min, active_max = active
-            bounded = self._bounded_planners[len(view.displayed_axes)].plan_region(
+            bounded = self._bounded_planners[
+                len(view.displayed_axes)
+            ].plan_region(
                 self._lodstone_source.pyramid,
                 view,
                 self._lodstone_target.layout(
@@ -456,7 +453,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
                 ),
                 target_level=target,
                 target_region=Region(active_min, active_max),
-                available=self._available_keys(view),
+                available=available,
                 fetch_intermediate=not self._uses_atomic_clipmap_page(),
             )
             bounded_comparison = PlanComparison(
@@ -468,6 +465,17 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             if bounded_comparison.geometry_matches:
                 plan = bounded
                 plan_source = 'lodstone-region'
+        overview = self._bounded_planners[
+            len(view.displayed_axes)
+        ].plan_overview(
+            self._lodstone_source.pyramid,
+            view,
+            level_index=self._resident_level,
+            memory_limit=self._resident_max_bytes,
+            available=available,
+        )
+        plan = merge_plans(plan, overview)
+        self._chunks_total = len(plan.wanted)
         LOGGER.debug(
             'planner trace: matches=%s geometry_matches=%s '
             'napari=(level=%d tiles=%d) '
@@ -499,22 +507,6 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             diagnostics.wanted_tiles,
             diagnostics.unique_native_chunks,
         )
-
-    @staticmethod
-    def _plan_tiles(level: int, queue, phase: int) -> tuple[Tile, ...]:
-        result = []
-        for priority, key in enumerate(queue):
-            region = Region(
-                tuple(int(item.start) for item in key),
-                tuple(int(item.stop) for item in key),
-            )
-            tile_key = TileKey(
-                level,
-                tuple(int(item.start) for item in key),
-                (),
-            )
-            result.append(Tile(tile_key, region, float(priority), phase))
-        return tuple(result)
 
     def _desired_stages(self, target: int) -> list[tuple[int, list]]:
         """Reconstruct napari's complete ladder, including cached chunks."""
@@ -561,37 +553,35 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
 
     def _available_keys(self, view: View) -> frozenset[TileKey]:
         """Translate napari's loaded-chunk bookkeeping to Lodstone keys."""
-        selection = tuple(
-            -1 if value is None else int(value) for value in view.index
+        return available_tile_keys(
+            self._lodstone_source.pyramid,
+            view,
+            {
+                level: vdata.loaded_chunks
+                for level, vdata in enumerate(self._data)
+            },
         )
-        keys = set()
-        for level, vdata in enumerate(self._data):
-            source_level = self._lodstone_source.pyramid.levels[level]
-            chunk_ids = set(vdata.loaded_chunks)
-            if level == self._resident_level:
-                # The PR's dedicated resident worker owns these reads. Treat
-                # its complete target interval as available even while the
-                # worker is still filling it, so Lodstone does not duplicate
-                # coarsest-level I/O in the foreground pass.
-                target = self._resident_target_interval()
-                if target is not None:
-                    resident_keys = chunk_slices(vdata, interval=target)
-                    chunk_ids.update(
-                        tuple(
-                            (int(item.start), int(item.stop)) for item in key
-                        )
-                        for key in itertools.product(*resident_keys)
-                    )
-            for chunk_id in chunk_ids:
-                starts = tuple(int(start) for start, _stop in chunk_id)
-                grid_index = tuple(
-                    source_level.chunk_index(axis, starts[axis])
-                    for axis in view.displayed_axes
-                )
-                keys.add(TileKey(level, grid_index, selection))
-        return frozenset(keys)
 
-    def _pass_view(self, tiles: list[Tile]) -> View:
+    def _ensure_resident(self) -> None:
+        """The LodStone plan carries persistent overview residency."""
+
+    def _resident_target_interval(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        view = self._pass_view()
+        plan = self._bounded_planners[len(view.displayed_axes)].plan_overview(
+            self._lodstone_source.pyramid,
+            view,
+            level_index=self._resident_level,
+            memory_limit=self._resident_max_bytes,
+        )
+        if not plan.desired:
+            return None
+        start = np.min([tile.region.start for tile in plan.desired], axis=0)
+        stop = np.max([tile.region.stop for tile in plan.desired], axis=0)
+        return np.asarray(start), np.asarray(stop)
+
+    def _pass_view(self) -> View:
         transforms = self._lodstone_source.pyramid.levels[0].voxel_to_world
         extent = np.asarray(self._data.shape, dtype=float)
         world_extent = np.abs(transforms[:-1, :-1]) @ extent

@@ -42,17 +42,18 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import napari
-from napari.experimental._progressive_loading import (
-    add_progressive_loading_image,
-    add_progressive_loading_labels,
-)
-from napari.experimental._progressive_loading_datasets import (
+from lodstone.datasets import (
     local_zarr_dataset,
     mandelbrot_dataset,
     mandelbulb_dataset,
     mandelbulb_rgb_dataset,
     open_ome_zarr,
+)
+
+import napari
+from napari.experimental._lodstone_loading import (
+    add_lodstone_loading_image,
+    add_lodstone_loading_labels,
 )
 
 MIB = 1024**2
@@ -413,9 +414,9 @@ def main(argv=None) -> None:
             kwargs['max_bytes_per_second'] = arguments.rate_mib * MIB
 
         factory = (
-            add_progressive_loading_labels
+            add_lodstone_loading_labels
             if layer_type == 'labels'
-            else add_progressive_loading_image
+            else add_lodstone_loading_image
         )
         factory(arrays, viewer=viewer, **kwargs)
 
