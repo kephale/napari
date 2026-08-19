@@ -50,12 +50,18 @@ import dask.array as da
 import numpy as np
 import pytest
 
-pytest.importorskip('qtpy', reason='requires Qt backend')
+qtpy = pytest.importorskip('qtpy', reason='requires Qt backend')
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == 'darwin' and os.environ.get('CI') == 'true',
-    reason='Progressive loading tests hang on macOS CI (no real display)',
-)
+pytestmark = [
+    pytest.mark.skipif(
+        sys.platform == 'darwin' and os.environ.get('CI') == 'true',
+        reason='Progressive loading tests hang on macOS CI (no real display)',
+    ),
+    pytest.mark.skipif(
+        qtpy.API_NAME.startswith('PySide'),
+        reason='QTimer wedge under pytest with PySide6; see #9067',
+    ),
+]
 
 from napari.experimental._progressive_loading import (  # noqa: E402
     _chunk_id,
@@ -240,7 +246,7 @@ def test_camera_move_does_no_sync_read_on_gui_thread(
 
         # a pan to unfetched territory through the debounced camera
         # path. The camera hooks are invoked directly rather than by
-        # writing viewer.camera.*: on a headless viewer that write
+        # writing viewer.scene.camera.*: on a headless viewer that write
         # intermittently wedges Qt's timer dispatch on macOS, and the
         # corner_pixels update is what the draw loop would derive from
         # the camera anyway.
@@ -285,7 +291,7 @@ def test_sync_backdrop_bounded_to_viewport(
 
         fills: list[tuple] = []
         patches: list[tuple] = []
-        loader._backdrop_fill_layered = lambda level, lo, hi: (
+        loader._backdrop_fill_layered = lambda level, lo, hi, data=None: (
             fills.append((level, list(lo), list(hi))) or True
         )
         loader._patch_texture_region = lambda vdata, lo, hi, block=None: (
@@ -706,7 +712,7 @@ def test_repair_requests_chain_when_busy(
         fills = []
         release = threading.Event()
 
-        def slow_fill(level, lo, hi):
+        def slow_fill(level, lo, hi, data=None):
             fills.append(level)
             release.wait(10)
             return True

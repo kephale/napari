@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 
 import dask.array as da
 import numpy as np
@@ -289,7 +290,7 @@ def test_auto_level_3d_follows_zoom(
     _wait_for_idle_loader(qtbot, loader)
 
     # zoomed far out: coarsest level
-    viewer.camera.zoom = 0.01
+    viewer.scene.camera.zoom = 0.01
     qtbot.waitUntil(lambda: layer.data_level == 2, timeout=10000)
     # the resolution selector still reads "Auto" to the user: the level
     # was driven without emitting locked_data_level events
@@ -297,7 +298,7 @@ def test_auto_level_3d_follows_zoom(
     _wait_for_idle_loader(qtbot, loader)
 
     # zoomed in: finest level
-    viewer.camera.zoom = 50.0
+    viewer.scene.camera.zoom = 50.0
     qtbot.waitUntil(lambda: layer.data_level == 0, timeout=10000)
     _wait_for_idle_loader(qtbot, loader)
     assert len(loader._data[0].loaded_chunks) > 0
@@ -317,7 +318,7 @@ def test_auto_level_3d_respects_user_pin(
 
     layer.locked_data_level = 2
     assert loader._user_locked
-    viewer.camera.zoom = 50.0
+    viewer.scene.camera.zoom = 50.0
     loader._check()
     # auto mode must not override the user's pin
     assert layer.data_level == 2
@@ -340,7 +341,7 @@ def test_auto_level_3d_released_in_2d(
     viewer.dims.ndisplay = 3
     layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
     loader = layer.metadata['progressive_loader']
-    viewer.camera.zoom = 50.0
+    viewer.scene.camera.zoom = 50.0
     qtbot.waitUntil(lambda: loader._auto_locked is not None, timeout=10000)
     _wait_for_idle_loader(qtbot, loader)
 
@@ -365,7 +366,7 @@ def test_auto_level_3d_can_be_disabled(
         auto_level_3d=False,
     )
     loader = layer.metadata['progressive_loader']
-    viewer.camera.zoom = 50.0
+    viewer.scene.camera.zoom = 50.0
     loader._check()
     # napari's 3D behavior: coarsest level
     assert layer.data_level == len(multiscale_3d_arrays) - 1
@@ -394,7 +395,7 @@ def test_zoom_target_level_respects_memory_budget(
     # tiled to 32^3 minimum) and level 1 (32^3) exceed the byte budget;
     # level 2 (16^3) fits. (Zoomed in, the viewport bound can make finer
     # levels affordable - see test_zoom_target_respects_chunk_budget.)
-    viewer.camera.zoom = 0.1
+    viewer.scene.camera.zoom = 0.1
     assert loader._zoom_target_level_3d() == 2
     loader.close()
 
@@ -459,14 +460,14 @@ def test_zoom_target_level_3d_uninitialized_camera(
     real_viewer = loader._viewer
     for bad_zoom in (float('nan'), float('inf'), 0.0):
         loader._viewer = SimpleNamespace(
-            camera=SimpleNamespace(zoom=bad_zoom),
+            scene=SimpleNamespace(camera=SimpleNamespace(zoom=bad_zoom)),
             dims=real_viewer.dims,
         )
         assert loader._zoom_target_level_3d() == coarsest
     loader._viewer = real_viewer
 
     # camera in a valid state: zoom-driven selection resumes
-    viewer.camera.zoom = 50.0
+    viewer.scene.camera.zoom = 50.0
     qtbot.waitUntil(lambda: layer.data_level == 0, timeout=10000)
     _wait_for_idle_loader(qtbot, loader)
     loader.close()
@@ -484,7 +485,7 @@ def test_auto_level_3d_survives_selector_echo(
     viewer.dims.ndisplay = 3
     layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
     loader = layer.metadata['progressive_loader']
-    viewer.camera.zoom = 0.01
+    viewer.scene.camera.zoom = 0.01
     qtbot.waitUntil(lambda: loader._auto_locked is not None, timeout=10000)
     _wait_for_idle_loader(qtbot, loader)
 
@@ -493,7 +494,7 @@ def test_auto_level_3d_survives_selector_echo(
     assert not loader._user_locked
 
     # auto mode still follows the zoom afterwards
-    viewer.camera.zoom = 50.0
+    viewer.scene.camera.zoom = 50.0
     qtbot.waitUntil(lambda: layer.data_level == 0, timeout=10000)
     _wait_for_idle_loader(qtbot, loader)
     loader.close()
@@ -821,7 +822,7 @@ def test_zoom_target_respects_chunk_budget(
     # Prevent new fetch passes without destroying the viewer reference
     # (_zoom_target_level_3d needs self._viewer alive for camera state).
     loader._closed = True
-    viewer.camera.zoom = 0.1  # zoomed out: viewport covers the volume
+    viewer.scene.camera.zoom = 0.1  # zoomed out: viewport covers the volume
     target = loader._zoom_target_level_3d()
     # level 0 = 4^3 = 64 chunks > 8; level 1 = 2^3 = 8 chunks fits
     assert target >= 1
@@ -915,6 +916,37 @@ def test_close_restores_synchronous_slicing(
     assert viewer._layer_slicer._force_sync
 
 
+def test_close_drains_pending_slice_callback(
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
+):
+    """Closing the last loader releases queued main-thread callbacks."""
+    from types import SimpleNamespace
+
+    from superqt.utils._ensure_thread import CallCallable
+
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    qt_viewer = viewer.window._qt_viewer
+
+    # Calling the decorated slot off the GUI thread posts a CallCallable
+    # whose args retain qt_viewer until its MetaCall is delivered.
+    thread = threading.Thread(
+        target=qt_viewer._on_slice_ready,
+        args=(SimpleNamespace(value={}),),
+    )
+    thread.start()
+    thread.join()
+    assert any(qt_viewer in call._args for call in CallCallable.instances)
+
+    loader.close()
+
+    assert all(qt_viewer not in call._args for call in CallCallable.instances)
+
+
 def test_async_slicing_kept_while_another_progressive_layer_lives(
     qtbot,
     make_napari_viewer,
@@ -944,6 +976,76 @@ def test_async_slicing_kept_while_another_progressive_layer_lives(
     loaders[1].close()
     assert not get_settings().experimental.async_
     assert viewer._layer_slicer._force_sync
+
+
+def test_backdrop_fill_after_close_is_a_noop(
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
+):
+    """close() drops the pyramid, so a late fill must bail, not raise."""
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+
+    loader.close()
+    assert len(loader._data) == 0
+    assert loader._backdrop_fill_layered(0, (0, 0), (32, 32)) is False
+
+
+def test_repair_worker_survives_close_mid_gather(
+    qtbot,
+    make_napari_viewer,
+    multiscale_arrays,
+):
+    """A backdrop repair already running when the layer goes away must
+    still finish cleanly.
+
+    ``repair`` is a plain function worker, so ``quit()`` only sets an
+    abort flag that nothing polls — teardown cannot stop the gather. It
+    used to read ``self._data``, which ``close()`` had replaced with an
+    empty list, raising ``AttributeError: 'list' object has no attribute
+    '_scale_factors'`` from the worker thread.
+    """
+    viewer = make_napari_viewer()
+    layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    layer.locked_data_level = 0
+    _wait_for_idle_loader(qtbot, loader)
+    assert layer.data_level != loader._resident_level
+
+    # Hold the gather open past close(), from inside the fill (so its
+    # empty-pyramid guard has already passed) and only on the worker
+    # thread — blocking the GUI thread here would deadlock the release.
+    main_thread = threading.current_thread()
+    entered = threading.Event()
+    release = threading.Event()
+    real_backdrop_level = loader._backdrop_level
+
+    def blocking_backdrop_level(*args, **kwargs):
+        if threading.current_thread() is not main_thread:
+            entered.set()
+            release.wait(10)
+        return real_backdrop_level(*args, **kwargs)
+
+    loader._backdrop_level = blocking_backdrop_level
+
+    loader._repair_backdrop()
+    worker = loader._repair_worker
+    assert worker is not None
+    errors: list = []
+    finished: list = []
+    worker.errored.connect(errors.append)
+    worker.finished.connect(lambda: finished.append(True))
+    qtbot.waitUntil(entered.is_set, timeout=10000)
+
+    loader.close()
+    assert len(loader._data) == 0
+
+    release.set()
+    qtbot.waitUntil(lambda: bool(finished), timeout=10000)
+    assert errors == []
 
 
 def test_huge_world_normalization_compensates_offsets():
