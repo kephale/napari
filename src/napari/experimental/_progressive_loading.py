@@ -1541,9 +1541,15 @@ class ProgressiveLoader:
         seconds). Quality is restored by :meth:`_maybe_restore_quality`
         once interaction has settled and the backlog is gone.
         """
-        if self._interactive_step_rate is None or self._saved_step is not None:
+        viewer = self._viewer
+        if (
+            self._closed
+            or viewer is None
+            or self._interactive_step_rate is None
+            or self._saved_step is not None
+        ):
             return
-        if self._viewer.dims.ndisplay != 3:
+        if viewer.dims.ndisplay != 3:
             return
         node = self._get_volume_node()
         if node is None:

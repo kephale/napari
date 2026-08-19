@@ -681,16 +681,21 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             self._lodstone_stream.resume()
 
     def close(self) -> None:
+        if self._closed:
+            return
         node = self._get_volume_node()
         if node is not None and node.clipmap_enabled:
             node.disable_clipmap()
         stream = self._lodstone_stream
         self._lodstone_stream = None
         self._lodstone_enabled = False
+        # Disconnect viewer callbacks and mark the loader closed before
+        # shutting down the stream. Stream cancellation can deliver queued
+        # Qt work, which must not be allowed to start another fetch pass.
+        super().close()
         if stream is not None:
             stream.close()
             self._record_execution_diagnostics(stream.diagnostics, 'closed')
-        super().close()
 
 
 def add_lodstone_loading_image(

@@ -378,7 +378,6 @@ def main(argv=None) -> None:
     )
     cache_bytes = arguments.cache_mb * 1_000_000
     viewer = napari.Viewer(title=f'Progressive: {arguments.source}')
-    viewer.dims.ndisplay = 3 if threed else 2
 
     for original_spec in preset['layers']:
         spec = dict(original_spec)
@@ -420,6 +419,9 @@ def main(argv=None) -> None:
         )
         factory(arrays, viewer=viewer, **kwargs)
 
+    # An empty viewer has only two dimensions, so requesting 3-D before
+    # adding the first layer is clamped back to 2-D.
+    viewer.dims.ndisplay = 3 if threed else 2
     viewer.reset_view()
     if arguments.screenshot is not None:
         from qtpy.QtCore import QTimer
@@ -434,7 +436,9 @@ def main(argv=None) -> None:
                 loader = layer.metadata.get('progressive_loader')
                 if loader is not None:
                     loader.close()
-            viewer.close()
+            # Let callbacks queued before loader disconnection drain before
+            # Qt tears down the viewer and its dimensions widgets.
+            QTimer.singleShot(0, viewer.close)
 
         QTimer.singleShot(
             max(0, round(arguments.screenshot_delay * 1000)),
