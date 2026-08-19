@@ -48,6 +48,12 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 import numpy as np
+from lodstone import (
+    Region,
+    anisotropic_extent_for_bytes,
+    clamp_region_to_budget,
+    isotropic_extent_for_bytes,
+)
 
 # imported at module load: a lazy first-use import inside a fetch pass
 # costs seconds of main-thread time under fetch-thread GIL pressure
@@ -388,16 +394,22 @@ def _tile_extent_3d_for(dtype: np.dtype, interval_max_bytes: int) -> int:
     bounded by the GL 3D texture size limit when available.
     Used as the cap when no per-level shape is known.
     """
-    extent = int((interval_max_bytes / np.dtype(dtype).itemsize) ** (1 / 3))
+    max_axis_extent = None
     try:
         from napari._vispy.utils.gl import get_max_texture_sizes
 
         _, max_3d = get_max_texture_sizes()
         if max_3d is not None:
-            extent = min(extent, int(max_3d))
+            max_axis_extent = int(max_3d)
     except Exception:  # pragma: no cover - no GL context  # noqa: BLE001
         pass
-    return max(extent, 32)
+    return isotropic_extent_for_bytes(
+        dtype,
+        interval_max_bytes,
+        ndim=3,
+        max_axis_extent=max_axis_extent,
+        minimum=32,
+    )
 
 
 def _anisotropic_tile_extent(
@@ -413,23 +425,15 @@ def _anisotropic_tile_extent(
     (e.g. Z=42, Y=304, X=657) uses the budget efficiently instead
     of being capped to a uniform cube.
     """
-    shape = np.asarray(shape, dtype=np.int64)
-    tile = shape.copy()
-    if gl_max is not None:
-        tile = np.minimum(tile, gl_max)
-    max_elements = max(max_bytes // max(itemsize, 1), 1)
-    for _ in range(len(shape)):
-        vol = int(np.prod(tile))
-        if vol <= max_elements:
-            break
-        over = np.where(tile > 1)[0]
-        if len(over) == 0:
-            break
-        # shrink the largest axis proportionally
-        ratio = (max_elements / vol) ** (1.0 / len(over))
-        for ax in over:
-            tile[ax] = max(int(tile[ax] * ratio), 1)
-    return np.maximum(tile, 1)
+    return np.asarray(
+        anisotropic_extent_for_bytes(
+            shape,
+            max_bytes,
+            itemsize,
+            max_axis_extent=gl_max,
+        ),
+        dtype=np.int64,
+    )
 
 
 # ---------- background fetching ----------
@@ -1133,38 +1137,21 @@ class ProgressiveLoader:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Shrink an interval around its center to respect the memory cap
         and the GL maximum texture size."""
-        min_coord = np.array(min_coord, dtype=np.int64)
-        max_coord = np.array(max_coord, dtype=np.int64)
-        requested_min, requested_max = min_coord.copy(), max_coord.copy()
-        itemsize = vdata.dtype.itemsize
-        extent = np.maximum(max_coord - min_coord, 1)
-
-        gl_max = self._gl_max_texture_size_2d
-        if gl_max is not None:
-            for d in range(len(extent)):
-                if extent[d] > gl_max:
-                    center = (min_coord[d] + max_coord[d]) // 2
-                    half = gl_max // 2
-                    min_coord[d] = max(center - half, 0)
-                    max_coord[d] = min(
-                        min_coord[d] + gl_max, int(vdata.shape[d])
-                    )
-                    min_coord[d] = max(max_coord[d] - gl_max, 0)
-                    extent[d] = max_coord[d] - min_coord[d]
-
-        max_elements = self._interval_max_bytes // itemsize
-        clamped = False
-        while np.prod(extent, dtype=np.int64) > max_elements:
-            widest = int(np.argmax(extent))
-            center = (min_coord[widest] + max_coord[widest]) // 2
-            half = max(extent[widest] // 4, 1)
-            min_coord[widest] = max(center - half, min_coord[widest])
-            max_coord[widest] = min(center + half, max_coord[widest])
-            new_extent = max(max_coord[widest] - min_coord[widest], 1)
-            if new_extent == extent[widest]:  # pragma: no cover - safety
-                break
-            extent[widest] = new_extent
-            clamped = True
+        requested_min = np.asarray(min_coord, dtype=np.int64)
+        requested_max = np.asarray(max_coord, dtype=np.int64)
+        clamped_region = clamp_region_to_budget(
+            Region(tuple(requested_min), tuple(requested_max)),
+            vdata.shape,
+            itemsize=vdata.dtype.itemsize,
+            max_bytes=self._interval_max_bytes,
+            max_axis_extent=self._gl_max_texture_size_2d,
+        )
+        min_coord = np.asarray(clamped_region.start, dtype=np.int64)
+        max_coord = np.asarray(clamped_region.stop, dtype=np.int64)
+        clamped = not (
+            np.array_equal(min_coord, requested_min)
+            and np.array_equal(max_coord, requested_max)
+        )
         if clamped:
             message = (
                 f'progressive loading: visible interval '

@@ -25,104 +25,35 @@ lock so background fetch threads and the main thread can safely interleave.
 
 from __future__ import annotations
 
-import itertools
 import logging
 import threading
 from typing import TYPE_CHECKING
 
 import numpy as np
+from lodstone import (
+    Region,
+    chunk_boundaries,
+    chunk_ids_in_region,
+    chunk_shape_for,
+    chunk_sizes_for,
+    fill_unloaded_chunks,
+    nearest_resample_region,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 LOGGER = logging.getLogger(__name__)
 
-
-def _regular_chunk_sizes(
-    shape: Sequence[int],
-    chunk_shape: Sequence[int],
-) -> tuple[tuple[int, ...], ...]:
-    """Expand a regular chunk shape into clipped per-dimension sizes."""
-    out = []
-    for size, step in zip(shape, chunk_shape, strict=True):
-        size, step = int(size), max(int(step), 1)
-        n_full, remainder = divmod(size, step)
-        out.append((step,) * n_full + ((remainder,) if remainder else ()))
-    return tuple(out)
-
-
-def chunk_sizes_for(array) -> tuple[tuple[int, ...], ...]:
-    """Per-dimension sequences of chunk data sizes, clipped to the array.
-
-    Follows the dask ``Array.chunks`` convention: one inner tuple per
-    dimension whose values sum to the array's extent along it. Supports
-    dask arrays (``chunks``), zarr arrays with regular *or* rectilinear
-    chunk grids (``read_chunk_sizes``, or ``chunks`` on zarr versions
-    without rectilinear support), and falls back to a bounded chunk
-    shape for plain ndarrays.
-    """
-    # zarr with rectilinear-chunk-grid support: regular and rectilinear
-    # grids both expose clipped per-dimension sizes (``.chunks`` raises
-    # NotImplementedError for rectilinear grids, so it comes first)
-    sizes = getattr(array, 'read_chunk_sizes', None)
-    if sizes is not None:
-        return tuple(tuple(int(c) for c in dim) for dim in sizes)
-    chunks = getattr(array, 'chunks', None)
-    if chunks is not None:
-        if all(isinstance(c, (int, np.integer)) for c in chunks):
-            # regular grid as a chunk shape (older zarr, h5py, ...)
-            return _regular_chunk_sizes(array.shape, chunks)
-        # dask-style tuple of per-dimension chunk size tuples
-        return tuple(tuple(int(c) for c in dim) for dim in chunks)
-    return _regular_chunk_sizes(
-        array.shape,
-        tuple(min(int(s), 256) for s in array.shape),
-    )
-
-
-def chunk_shape_for(array) -> tuple[int, ...]:
-    """Return a per-dimension (maximum) chunk shape for an array.
-
-    For irregular (rectilinear/dask) grids this is the largest chunk
-    along each dimension, matching dask's ``chunksize``.
-    """
-    chunksize = getattr(array, 'chunksize', None)  # dask
-    if chunksize is not None:
-        return tuple(int(c) for c in chunksize)
-    return tuple(
-        max(sizes) if sizes else 1 for sizes in chunk_sizes_for(array)
-    )
-
-
-def chunk_boundaries(array) -> list[np.ndarray]:
-    """Per-dimension sorted arrays of chunk boundary positions.
-
-    Each entry covers ``0`` through ``shape[dim]`` inclusive, so consecutive
-    pairs of values describe one chunk along that dimension. Irregular
-    (dask or zarr rectilinear) chunks are honored exactly.
-    """
-    return [
-        np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
-        for sizes in chunk_sizes_for(array)
-    ]
-
-
-def chunk_ids_in_region(boundaries, lo, hi):
-    """Iterate chunk ids (tuples of ``(start, stop)``) intersecting a region.
-
-    ``boundaries`` is the per-dimension boundary list of
-    :func:`chunk_boundaries`; ``[lo, hi)`` is a half-open region in the
-    same coordinates.
-    """
-    per_dim = []
-    for dim, bounds in enumerate(boundaries):
-        starts, stops = bounds[:-1], bounds[1:]
-        first = int(np.searchsorted(stops, int(lo[dim]), side='right'))
-        last = int(np.searchsorted(starts, int(hi[dim]), side='left'))
-        per_dim.append(
-            [(int(starts[i]), int(stops[i])) for i in range(first, last)],
-        )
-    return itertools.product(*per_dim)
+__all__ = [
+    'MultiScaleVirtualData',
+    'VirtualArrayView',
+    'VirtualData',
+    'chunk_boundaries',
+    'chunk_ids_in_region',
+    'chunk_shape_for',
+    'chunk_sizes_for',
+]
 
 
 class VirtualArrayView:
@@ -301,6 +232,7 @@ class VirtualData:
         )
         self._min_coord: list[int] | None = None
         self._max_coord: list[int] | None = None
+        self._chunk_grid = chunk_sizes_for(array)
         self._boundaries = chunk_boundaries(array)
         self._chunk_shape = chunk_shape_for(array)
         # Chunk keys (tuples of (start, stop) pairs) whose data is resident
@@ -574,7 +506,7 @@ class MultiScaleVirtualData:
 
     """
 
-    def __init__(self, arrays: Sequence, fill_value=0):
+    def __init__(self, arrays: Sequence, fill_value=0, transforms=None):
         if len(arrays) == 0:
             raise ValueError('arrays must be a non-empty sequence')
         self.arrays = list(arrays)
@@ -598,6 +530,17 @@ class MultiScaleVirtualData:
                 )
             ]
             for vdata in self._data
+        ]
+        if transforms is None:
+            transforms = []
+            for factors in self._scale_factors:
+                transform = np.eye(self.ndim + 1, dtype=float)
+                transform[:-1, :-1] = np.diag(factors)
+                transforms.append(transform)
+        if len(transforms) != len(self._data):
+            raise ValueError('one transform is required per pyramid level')
+        self._level_transforms = [
+            np.asarray(transform, dtype=float) for transform in transforms
         ]
 
     def __len__(self) -> int:
@@ -624,25 +567,17 @@ class MultiScaleVirtualData:
         if src_level == level:
             return None
         src = self._data[src_level]
-        ratio = [
-            self._scale_factors[level][d] / self._scale_factors[src_level][d]
-            for d in range(self.ndim)
-        ]
-
         def backdrop(min_coord, max_coord):
             with src.lock:
                 if src._min_coord is None or src.hyperslice.size == 0:
                     return None
-                indices = []
-                for d in range(self.ndim):
-                    coords = (
-                        np.arange(min_coord[d], max_coord[d]) + 0.5
-                    ) * ratio[d]
-                    idx = coords.astype(np.int64) - src._min_coord[d]
-                    indices.append(
-                        np.clip(idx, 0, src.hyperslice.shape[d] - 1),
-                    )
-                return src.hyperslice[np.ix_(*indices)]
+                return nearest_resample_region(
+                    src.hyperslice,
+                    Region(tuple(src._min_coord), tuple(src._max_coord)),
+                    self._level_transforms[src_level],
+                    Region(tuple(min_coord), tuple(max_coord)),
+                    self._level_transforms[level],
+                )
 
         return backdrop
 
@@ -725,75 +660,23 @@ class MultiScaleVirtualData:
             )
             if content is None or tuple(content.shape) != expected:
                 return False
-            region_key = tuple(
-                slice(mn - lo, mx - lo)
-                for mn, mx, lo in zip(
-                    fill_min, fill_max, dst._min_coord, strict=True
-                )
-            )
-            if not dst.loaded_chunks:
-                dst.hyperslice[region_key] = content
-                for chunk_id in chunk_ids_in_region(
-                    dst._boundaries,
-                    fill_min,
-                    fill_max,
-                ):
-                    dst.chunk_source[chunk_id] = src_level
-                return True
-            # per-dimension chunk extents covering the fill region, as
-            # (hyperslice_start, hyperslice_stop, absolute_id) entries
-            per_dim: list[list[tuple[int, int, tuple[int, int]]]] = []
-            for dim in range(dst.ndim):
-                bounds = dst._boundaries[dim]
-                lo = dst._min_coord[dim]
-                region_lo, region_hi = fill_min[dim], fill_max[dim]
-                first = max(
-                    int(np.searchsorted(bounds, region_lo, side='right')) - 1,
-                    0,
-                )
-                entries = []
-                start = int(bounds[first])
-                for stop in bounds[first + 1 :]:
-                    stop = int(stop)
-                    if start >= region_hi:
-                        break
-                    entries.append((start - lo, stop - lo, (start, stop)))
-                    start = stop
-                per_dim.append(entries)
-            offset = [
-                mn - lo
-                for mn, lo in zip(fill_min, dst._min_coord, strict=True)
-            ]
-            wrote = False
-            for combo in itertools.product(*per_dim):
-                chunk_id = tuple(absolute for *_rel, absolute in combo)
-                if chunk_id in dst.loaded_chunks:
-                    continue
-                dst_key = tuple(
-                    slice(max(rel_start, off), rel_stop)
-                    for (rel_start, rel_stop, _absolute), off in zip(
-                        combo,
-                        offset,
-                        strict=True,
+            filled = fill_unloaded_chunks(
+                dst.hyperslice,
+                Region(tuple(dst._min_coord), tuple(dst._max_coord)),
+                content,
+                Region(tuple(fill_min), tuple(fill_max)),
+                dst._chunk_grid,
+                {
+                    Region(
+                        tuple(start for start, _stop in chunk_id),
+                        tuple(stop for _start, stop in chunk_id),
                     )
+                    for chunk_id in dst.loaded_chunks
+                },
+            )
+            for chunk in filled:
+                chunk_id = tuple(
+                    zip(chunk.start, chunk.stop, strict=True)
                 )
-                src_key = tuple(
-                    slice(sl.start - off, sl.stop - off)
-                    for sl, off in zip(dst_key, offset, strict=True)
-                )
-                if any(sl.stop <= sl.start for sl in src_key):
-                    continue
-                src_clipped = tuple(
-                    slice(sl.start, min(sl.stop, dim_len))
-                    for sl, dim_len in zip(src_key, content.shape, strict=True)
-                )
-                if any(sl.stop <= sl.start for sl in src_clipped):
-                    continue
-                dst_clipped = tuple(
-                    slice(d.start, d.start + (sc.stop - sc.start))
-                    for d, sc in zip(dst_key, src_clipped, strict=True)
-                )
-                dst.hyperslice[dst_clipped] = content[src_clipped]
                 dst.chunk_source[chunk_id] = src_level
-                wrote = True
-            return wrote
+            return bool(filled)

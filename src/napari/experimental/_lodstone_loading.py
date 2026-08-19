@@ -12,14 +12,16 @@ from __future__ import annotations
 import itertools
 import logging
 from collections import defaultdict, deque
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 from lodstone import (
     Layout,
+    LevelDiagnosticArray,
     Plan,
+    PlanComparison as _PlanComparison,
     Planner,
+    PlanTrace,
     Region,
     Stream,
     StreamDiagnostics,
@@ -74,33 +76,19 @@ LEVEL_DIAGNOSTIC_COLOR_NAMES = (
 )
 
 
-class _LevelDiagnosticArray:
-    """Read a real array but return a solid categorical level label."""
+_LevelDiagnosticArray = LevelDiagnosticArray
 
-    def __init__(self, array, level: int) -> None:
-        self._array = array
-        self.level = int(level)
-        self.shape = tuple(int(value) for value in array.shape)
-        self.ndim = len(self.shape)
-        self.size = int(np.prod(self.shape, dtype=np.int64))
-        self.dtype = np.dtype(np.uint8)
-        self.fill_value = MISSING_LEVEL_LABEL
 
-    def __getattr__(self, name):
-        return getattr(self._array, name)
+class PlanComparison(_PlanComparison):
+    """Compatibility view naming the reference and candidate planners."""
 
-    def __getitem__(self, key):
-        result = self._array[key]
-        if hasattr(result, 'read'):
-            result = result.read().result()
-        if hasattr(result, 'compute'):
-            result = result.compute()
-        shape = np.asarray(result).shape
-        return np.full(
-            shape,
-            self.level + LEVEL_LABEL_OFFSET,
-            dtype=self.dtype,
-        )
+    @property
+    def napari(self) -> PlanTrace:
+        return self.reference
+
+    @property
+    def lodstone(self) -> PlanTrace:
+        return self.candidate
 
 
 def _level_diagnostic_color_map(levels: int) -> dict[int | None, str]:
@@ -113,56 +101,6 @@ def _level_diagnostic_color_map(levels: int) -> dict[int | None, str]:
             level % len(LEVEL_DIAGNOSTIC_COLORS)
         ]
     return colors
-
-
-@dataclass(frozen=True)
-class PlanTrace:
-    """Renderer-neutral summary used to compare two planners."""
-
-    target_level: int
-    tiles: tuple[tuple[int, tuple[int, ...], tuple[int, ...], int], ...]
-    wanted: tuple[tuple[int, tuple[int, ...], tuple[int, ...], int], ...]
-
-    @staticmethod
-    def _tiles(
-        tiles: tuple[Tile, ...],
-    ) -> tuple[tuple[int, tuple[int, ...], tuple[int, ...], int], ...]:
-        return tuple(
-            (tile.level, tile.region.start, tile.region.stop, tile.phase)
-            for tile in tiles
-        )
-
-    @classmethod
-    def from_plan(cls, plan: Plan) -> PlanTrace:
-        tiles = plan.desired or plan.wanted
-        return cls(
-            target_level=plan.target_level,
-            tiles=cls._tiles(tiles),
-            wanted=cls._tiles(plan.wanted),
-        )
-
-
-@dataclass(frozen=True)
-class PlanComparison:
-    """One napari/Lodstone planning comparison for a captured view."""
-
-    view: View
-    napari: PlanTrace
-    lodstone: PlanTrace
-
-    @property
-    def matches(self) -> bool:
-        return self.napari == self.lodstone
-
-    @property
-    def geometry_matches(self) -> bool:
-        """Whether level, regions, and ladder phases agree, ignoring order."""
-        return (
-            self.napari.target_level == self.lodstone.target_level
-            and frozenset(self.napari.tiles) == frozenset(self.lodstone.tiles)
-            and frozenset(self.napari.wanted)
-            == frozenset(self.lodstone.wanted)
-        )
 
 
 def _level_transforms(layer, data) -> list[np.ndarray]:
@@ -273,6 +211,7 @@ class _NapariTarget:
             kind='bricked',
             memory_limit=self.loader._interval_max_bytes,
             squeeze_hidden=False,
+            max_axis_extent=self.loader._gl_max_texture_size_2d,
         )
 
     def prepare(self, view, plan) -> None:
@@ -344,7 +283,14 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             2: Planner(lod_bias=1.0),
             3: Planner(lod_bias=lod_bias),
         }
+        self._bounded_planners = {
+            2: Planner(lod_bias=1.0),
+            3: Planner(lod_bias=lod_bias),
+        }
         self._plan_comparisons: deque[PlanComparison] = deque(maxlen=32)
+        self._bounded_plan_comparisons: deque[PlanComparison] = deque(
+            maxlen=32
+        )
         self._execution_diagnostics: deque[StreamDiagnostics] = deque(
             maxlen=32
         )
@@ -485,6 +431,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             target_level=target,
             desired=desired,
         )
+        plan_source = 'napari-fallback'
         view = self._pass_view(desired)
         shared = self._shared_planners[len(view.displayed_axes)].plan(
             self._lodstone_source.pyramid,
@@ -498,6 +445,29 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             PlanTrace.from_plan(shared),
         )
         self._plan_comparisons.append(comparison)
+        active = self._active
+        if active is not None:
+            _active_level, active_min, active_max = active
+            bounded = self._bounded_planners[len(view.displayed_axes)].plan_region(
+                self._lodstone_source.pyramid,
+                view,
+                self._lodstone_target.layout(
+                    view, self._lodstone_source.pyramid
+                ),
+                target_level=target,
+                target_region=Region(active_min, active_max),
+                available=self._available_keys(view),
+                fetch_intermediate=not self._uses_atomic_clipmap_page(),
+            )
+            bounded_comparison = PlanComparison(
+                view,
+                PlanTrace.from_plan(plan),
+                PlanTrace.from_plan(bounded),
+            )
+            self._bounded_plan_comparisons.append(bounded_comparison)
+            if bounded_comparison.geometry_matches:
+                plan = bounded
+                plan_source = 'lodstone-region'
         LOGGER.debug(
             'planner trace: matches=%s geometry_matches=%s '
             'napari=(level=%d tiles=%d) '
@@ -509,20 +479,20 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             comparison.lodstone.target_level,
             len(comparison.lodstone.tiles),
         )
-        # The renderer-specific napari plan is authoritative. In particular,
-        # its 3-D plan is a chunk-aligned, memory-bounded cuboid and is
-        # intentionally broader than strict view-frustum intersection on
-        # large anisotropic volumes such as Zebrahub. Lodstone executes these
-        # exact regions while the shared planner remains a diagnostic trace.
+        # Use Lodstone's renderer-constrained region plan only after checking
+        # that it describes the same target geometry. Keep the reconstructed
+        # napari plan as a compatibility fallback while the strict frustum
+        # planner remains useful as an independent diagnostic.
         self._submitted_plan = plan
         self._lodstone_target.generation = generation
         self._worker = _WorkerProxy(self._lodstone_stream)
         self._lodstone_stream.submit(view, plan)
         diagnostics = self._lodstone_stream.diagnostics
         LOGGER.info(
-            'Lodstone submitted exact napari plan: generation=%d '
+            'Lodstone submitted progressive plan: source=%s generation=%d '
             'target_level=%d desired_tiles=%d wanted_tiles=%d '
             'native_chunks=%d',
+            plan_source,
             diagnostics.generation,
             plan.target_level,
             diagnostics.desired_tiles,
@@ -638,6 +608,11 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
     def plan_comparisons(self) -> tuple[PlanComparison, ...]:
         """Recent PR/shared-planner traces, oldest first."""
         return tuple(self._plan_comparisons)
+
+    @property
+    def bounded_plan_comparisons(self) -> tuple[PlanComparison, ...]:
+        """Recent established/bounded-region traces, oldest first."""
+        return tuple(self._bounded_plan_comparisons)
 
     @property
     def execution_diagnostics(self) -> tuple[StreamDiagnostics, ...]:

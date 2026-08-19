@@ -38,6 +38,15 @@ class _VirtualData:
         return True
 
 
+def _expected_submitted_trace(loader):
+    comparison = loader.bounded_plan_comparisons[-1]
+    return (
+        comparison.lodstone
+        if comparison.geometry_matches
+        else comparison.napari
+    )
+
+
 def test_level_diagnostic_array_reads_source_and_returns_level_label() -> None:
     class RecordingArray:
         shape = (8, 8)
@@ -208,8 +217,13 @@ def test_real_fetch_pass_records_napari_and_lodstone_plans(
         assert comparison.napari.tiles
         assert comparison.lodstone.tiles
         assert comparison.geometry_matches
+        bounded = loader.bounded_plan_comparisons[-1]
+        assert bounded.geometry_matches
         assert loader._submitted_plan is not None
-        assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
+        assert (
+            PlanTrace.from_plan(loader._submitted_plan)
+            == _expected_submitted_trace(loader)
+        )
         qtbot.waitUntil(
             lambda: bool(loader.execution_diagnostics), timeout=10000
         )
@@ -260,11 +274,16 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
         )
         assert comparison.napari.tiles
         assert comparison.lodstone.tiles
+        bounded = loader.bounded_plan_comparisons[-1]
+        assert bounded.geometry_matches
         assert (
             comparison.napari.target_level == comparison.lodstone.target_level
         )
         assert loader._submitted_plan is not None
-        assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
+        assert (
+            PlanTrace.from_plan(loader._submitted_plan)
+            == _expected_submitted_trace(loader)
+        )
         assert all(
             tile.level == comparison.napari.target_level
             for tile in loader._submitted_plan.wanted
@@ -284,7 +303,10 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
         assert (
             comparison.napari.target_level == comparison.lodstone.target_level
         )
-        assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
+        assert (
+            PlanTrace.from_plan(loader._submitted_plan)
+            == _expected_submitted_trace(loader)
+        )
 
         comparison_count = len(loader.plan_comparisons)
         viewer.scene.camera.zoom = 1
@@ -298,7 +320,10 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
         comparison = loader.plan_comparisons[-1]
         assert comparison.napari.target_level == 1
         assert comparison.lodstone.target_level == 1
-        assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
+        assert (
+            PlanTrace.from_plan(loader._submitted_plan)
+            == _expected_submitted_trace(loader)
+        )
     finally:
         loader.close()
 
@@ -514,7 +539,7 @@ def test_lodstone_preserves_rectilinear_chunk_geometry(
         loader.close()
 
 
-def test_napari_plan_remains_authoritative_when_generic_plan_differs(
+def test_bounded_region_plan_is_used_when_generic_plan_differs(
     qtbot,
     make_napari_viewer,
 ) -> None:
@@ -546,6 +571,9 @@ def test_napari_plan_remains_authoritative_when_generic_plan_differs(
         assert comparison.napari.tiles
         assert not comparison.lodstone.tiles
         assert loader._submitted_plan is not None
-        assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
+        assert (
+            PlanTrace.from_plan(loader._submitted_plan)
+            == _expected_submitted_trace(loader)
+        )
     finally:
         loader.close()

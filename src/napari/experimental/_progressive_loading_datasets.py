@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import zarr
+from lodstone.sources import OMEZarrSource
 from zarr.experimental.cache_store import CacheStore
 from zarr.storage import LocalStore, MemoryStore
 
@@ -38,41 +39,6 @@ def _open_cached_multiscale(store, levels: int, cache_bytes: int):
     cached = CacheStore(store, cache_store=MemoryStore(), max_size=cache_bytes)
     group = zarr.open_group(cached, mode='r')
     return [group[str(level)] for level in range(levels)]
-
-
-def _is_remote(path: str) -> bool:
-    return str(path).startswith(('http://', 'https://', 's3://', 'gs://'))
-
-
-def _find_multiscales(group, depth: int = 0):
-    """Walk (up to a few levels) into nested groups for OME multiscales.
-
-    Returns ``(group, multiscales_dict)`` for the first group whose attrs
-    carry a ``multiscales`` list (v0.1-v0.4 or the v0.5 ``ome`` wrapper),
-    or ``(None, None)`` if none is found within ``depth`` levels.
-    """
-    attrs = dict(group.attrs)
-    ome = attrs.get('ome')
-    ms_list = attrs.get('multiscales') or (
-        ome.get('multiscales') if isinstance(ome, dict) else None
-    )
-    if ms_list:
-        return group, ms_list[0]
-    if depth > 4:
-        return None, None
-    for key in group:
-        try:
-            child = group[key]
-        except (KeyError, ValueError, OSError):
-            continue
-        # only groups can hold multiscales metadata; recursing into an
-        # array would iterate its rows and fancy-index it (BoundsCheckError)
-        if not isinstance(child, zarr.Group):
-            continue
-        found, ms = _find_multiscales(child, depth + 1)
-        if ms is not None:
-            return found, ms
-    return None, None
 
 
 def open_ome_zarr(
@@ -118,69 +84,26 @@ def open_ome_zarr(
     translate : list of float or None
         Per-axis translation from the level-0 coordinate transformations.
     """
-    if _is_remote(path):
-        from zarr.storage import FsspecStore
+    source = OMEZarrSource.open(
+        path,
+        num_levels=num_levels,
+        zarr_format=zarr_format,
+        storage_options={'anon': anon} if path.startswith('s3://') else None,
+        cache_bytes=cache_bytes if _is_remote(path) else None,
+        squeeze=squeeze,
+    )
+    transform = source.pyramid.levels[0].voxel_to_world
+    ndim = source.pyramid.ndim
+    linear = transform[:ndim, :ndim]
+    diagonal = np.diag(linear)
+    scale = diagonal.tolist() if np.any(diagonal != 1) else None
+    offset = transform[:ndim, ndim]
+    translate = offset.tolist() if np.any(offset != 0) else None
+    return list(source.arrays), scale, translate
 
-        storage_options = {'anon': anon} if path.startswith('s3://') else {}
-        store = CacheStore(
-            FsspecStore.from_url(path, storage_options=storage_options),
-            cache_store=MemoryStore(),
-            max_size=cache_bytes,
-        )
-    else:
-        store = LocalStore(str(path))
 
-    open_kw = {'mode': 'r'}
-    if zarr_format is not None:
-        open_kw['zarr_format'] = zarr_format
-    root = zarr.open_group(store, **open_kw)
-
-    group, ms = _find_multiscales(root)
-    datasets = ms.get('datasets', []) if ms is not None else []
-    if not datasets:
-        # no multiscales metadata (or an empty datasets list): treat the
-        # sorted child arrays of the group as the resolution levels
-        group = group if group is not None else root
-        datasets = [
-            {'path': k}
-            for k in sorted(group.keys(), key=lambda k: (len(k), k))
-        ]
-    if num_levels is not None:
-        datasets = datasets[:num_levels]
-    arrays = [group[ds['path']] for ds in datasets]
-
-    scale, translate = None, None
-    if datasets:
-        for t in datasets[0].get('coordinateTransformations', []):
-            if t.get('type') == 'scale':
-                scale = list(t['scale'])
-            elif t.get('type') == 'translation':
-                translate = list(t['translation'])
-
-    if squeeze and arrays and arrays[0].ndim > 3:
-        import dask.array as da
-
-        # collapse only LEADING singleton axes (the t/c axes of 5D
-        # OME-Zarr, e.g. (1,1,1,H,W)) down toward the spatial axes;
-        # interior/trailing singletons are kept so the scale/translate
-        # trim below (which drops leading entries) stays axis-aligned
-        shape0 = arrays[0].shape
-        n_lead = 0
-        while n_lead < len(shape0) - 2 and shape0[n_lead] == 1:
-            n_lead += 1
-        if n_lead:
-            collapse = (0,) * n_lead
-            arrays = [da.from_zarr(a)[collapse] for a in arrays]
-
-    # trim scale/translate to the (possibly squeezed) dimensionality
-    ndim = arrays[0].ndim if arrays else None
-    if ndim is not None:
-        if scale is not None and len(scale) > ndim:
-            scale = scale[-ndim:]
-        if translate is not None and len(translate) > ndim:
-            translate = translate[-ndim:]
-
-    return arrays, scale, translate
+def _is_remote(path: str) -> bool:
+    return str(path).startswith(('http://', 'https://', 's3://', 'gs://'))
 
 
 def mandelbrot_dataset(
