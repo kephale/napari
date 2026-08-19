@@ -5,8 +5,9 @@ When the ``experimental.progressive_loading`` setting is enabled
 chunked multiscale ``Image``/``Labels`` layers added to a viewer — by
 drag-and-drop, ``File > Open``, plugin readers, or ``viewer.add_*`` —
 are replaced with progressively loading equivalents built by
-:func:`~napari.experimental._progressive_loading.add_progressive_loading_image`
-(or ``..._labels``).
+:func:`~napari.experimental._lodstone_loading.add_lodstone_loading_image`
+(or ``..._labels``), so Lodstone owns planning and source reads while napari
+retains its progressive rendering path.
 
 This module is deliberately import-light: the progressive loading
 engine is only imported when the first layer is actually replaced, so
@@ -154,8 +155,8 @@ def add_progressive_labels_like(
     """
     import zarr
 
-    from napari.experimental._progressive_loading import (
-        add_progressive_loading_labels,
+    from napari.experimental._lodstone_loading import (
+        add_lodstone_loading_labels,
     )
     from napari.experimental._virtual_data import chunk_shape_for
 
@@ -175,7 +176,7 @@ def add_progressive_labels_like(
     # the base layer's scale is already float32-normalized; match it
     # verbatim (including a trivial one) so the two layers stay aligned
     transform['scale'] = tuple(base_layer.scale)
-    add_progressive_loading_labels(
+    add_lodstone_loading_labels(
         label_arrays,
         viewer=viewer,  # type: ignore[arg-type]
         name=base_layer.name + ' - Labels',
@@ -190,9 +191,9 @@ def _replace_with_progressive(viewer_ref: weakref.ref, layer: Layer) -> None:
     # re-check: this runs deferred, state may have changed
     if not _enabled() or not _eligible(layer):
         return
-    from napari.experimental._progressive_loading import (
-        add_progressive_loading_image,
-        add_progressive_loading_labels,
+    from napari.experimental._lodstone_loading import (
+        add_lodstone_loading_image,
+        add_lodstone_loading_labels,
     )
     from napari.layers import Labels
 
@@ -205,9 +206,9 @@ def _replace_with_progressive(viewer_ref: weakref.ref, layer: Layer) -> None:
         viewer.layers.remove(layer)
         try:
             if isinstance(layer, Labels):
-                add_progressive_loading_labels(data, viewer=viewer, **kwargs)
+                add_lodstone_loading_labels(data, viewer=viewer, **kwargs)
             else:
-                add_progressive_loading_image(data, viewer=viewer, **kwargs)
+                add_lodstone_loading_image(data, viewer=viewer, **kwargs)
         except Exception:
             _logger.exception(
                 'progressive loading failed for layer %r; '

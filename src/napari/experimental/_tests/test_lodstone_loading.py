@@ -13,6 +13,7 @@ from napari.experimental._lodstone_loading import (
     _level_transforms,
     _NapariTarget,
     add_lodstone_loading_image,
+    add_lodstone_loading_labels,
 )
 
 
@@ -170,8 +171,8 @@ def test_real_fetch_pass_records_napari_and_lodstone_plans(
         )
 
         comparison_count = len(loader.plan_comparisons)
-        viewer.camera.center = (16, 48)
-        viewer.camera.zoom = 20
+        viewer.scene.camera.center = (16, 48)
+        viewer.scene.camera.zoom = 20
         # Headless tests do not have a canvas draw to refresh corner_pixels.
         layer.corner_pixels = np.array([[0, 33], [36, 63]])
         loader._data[0].loaded_chunks.clear()
@@ -217,8 +218,8 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
         )
 
         comparison_count = len(loader.plan_comparisons)
-        viewer.camera.angles = (25, 35, 10)
-        viewer.camera.zoom = 20
+        viewer.scene.camera.angles = (25, 35, 10)
+        viewer.scene.camera.zoom = 20
         loader._data[0].loaded_chunks.clear()
         loader._active = None
         loader._check()
@@ -229,7 +230,7 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
         assert loader.plan_comparisons[-1].geometry_matches
 
         comparison_count = len(loader.plan_comparisons)
-        viewer.camera.zoom = 1
+        viewer.scene.camera.zoom = 1
         loader._data[1].loaded_chunks.clear()
         loader._active = None
         loader._check()
@@ -271,5 +272,51 @@ def test_plan_geometry_matches_after_hidden_axis_step(
 
         assert comparison.view.index == (2, None, None)
         assert comparison.geometry_matches
+    finally:
+        loader.close()
+
+
+def test_lodstone_labels_use_shared_progressive_loader(
+    qtbot,
+    make_napari_viewer,
+) -> None:
+    base = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    arrays = [
+        da.from_array(base, chunks=(16, 16)),
+        da.from_array(base[::2, ::2], chunks=(16, 16)),
+        da.from_array(base[::4, ::4], chunks=(16, 16)),
+    ]
+    viewer = make_napari_viewer()
+    layer = add_lodstone_loading_labels(arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    try:
+        qtbot.waitUntil(lambda: bool(loader.plan_comparisons), timeout=10000)
+
+        assert layer._type_string == 'labels'
+        assert loader.plan_comparisons[-1].geometry_matches
+    finally:
+        loader.close()
+
+
+def test_lodstone_preserves_rectilinear_chunk_geometry(
+    qtbot,
+    make_napari_viewer,
+) -> None:
+    base = np.arange(35 * 37, dtype=np.uint16).reshape(35, 37)
+    arrays = [
+        da.from_array(base, chunks=((8, 11, 16), (9, 13, 15))),
+        da.from_array(base[::2, ::2], chunks=((7, 11), (6, 13))),
+    ]
+    viewer = make_napari_viewer()
+    layer = add_lodstone_loading_image(arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    try:
+        qtbot.waitUntil(lambda: bool(loader.plan_comparisons), timeout=10000)
+
+        assert loader._lodstone_source.pyramid.levels[0].chunk_grid == (
+            (8, 11, 16),
+            (9, 13, 15),
+        )
+        assert loader.plan_comparisons[-1].geometry_matches
     finally:
         loader.close()

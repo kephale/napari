@@ -40,7 +40,10 @@ from napari.experimental._progressive_loading import (
     chunk_priority_2D,
     chunk_slices,
 )
-from napari.experimental._virtual_data import MultiScaleVirtualData
+from napari.experimental._virtual_data import (
+    MultiScaleVirtualData,
+    chunk_sizes_for,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -117,7 +120,8 @@ def _camera_view(
     displayed = tuple(int(axis) for axis in layer._slice_input.displayed)
     ndisplay = len(displayed)
     viewport = tuple(max(int(value), 1) for value in viewer.canvas.size)
-    camera = viewer.camera
+    scene = getattr(viewer, 'scene', None)
+    camera = scene.camera if scene is not None else viewer.camera
     center = np.asarray(camera.center, dtype=float)[-ndisplay:]
     zoom = float(camera.zoom)
     if not np.isfinite(zoom) or zoom <= 0 or not np.all(np.isfinite(center)):
@@ -265,7 +269,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
 
         source = ArrayPyramidSource(
             data.arrays,
-            chunks=[level.chunk_shape for level in data],
+            chunks=[chunk_sizes_for(array) for array in data.arrays],
             transforms=_level_transforms(layer, data),
         )
         self._lodstone_source = source
@@ -416,7 +420,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         )
         keys = set()
         for level, vdata in enumerate(self._data):
-            chunks = self._lodstone_source.pyramid.levels[level].chunks
+            source_level = self._lodstone_source.pyramid.levels[level]
             chunk_ids = set(vdata.loaded_chunks)
             if level == self._resident_level:
                 # The PR's dedicated resident worker owns these reads. Treat
@@ -435,7 +439,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             for chunk_id in chunk_ids:
                 starts = tuple(int(start) for start, _stop in chunk_id)
                 grid_index = tuple(
-                    starts[axis] // chunks[axis]
+                    source_level.chunk_index(axis, starts[axis])
                     for axis in view.displayed_axes
                 )
                 keys.add(TileKey(level, grid_index, selection))
@@ -526,6 +530,56 @@ def add_lodstone_loading_image(
         contrast_limits=contrast_limits,
         colormap=colormap,
         rendering=rendering,
+        name=name,
+        **layer_kwargs,
+    )
+    _attach_progressive_loader(
+        layer,
+        data,
+        viewer,
+        interval_max_bytes=interval_max_bytes,
+        tile_max_bytes_3d=tile_max_bytes_3d,
+        auto_level_3d=auto_level_3d,
+        max_pixel_size_3d=max_pixel_size_3d,
+        max_bytes_per_second=max_bytes_per_second,
+        interaction_hold=interaction_hold,
+        interactive_step_rate=interactive_step_rate,
+        coarse_first=coarse_first,
+        debug_overlay=debug_overlay,
+        loader_class=LodstoneProgressiveLoader,
+    )
+    return layer
+
+
+def add_lodstone_loading_labels(
+    labels,
+    viewer=None,
+    name=None,
+    auto_level_3d=True,
+    max_pixel_size_3d=2.0,
+    interval_max_bytes=DEFAULT_INTERVAL_MAX_BYTES,
+    tile_max_bytes_3d=DEFAULT_TILE_MAX_BYTES_3D,
+    max_bytes_per_second=None,
+    interaction_hold=True,
+    interactive_step_rate=4.0,
+    coarse_first=True,
+    debug_overlay=None,
+    **layer_kwargs: Any,
+):
+    """Add progressive Labels rendered by napari and loaded by Lodstone."""
+
+    viewer, tile_max_bytes_3d = _resolve_viewer_and_tile_cap(
+        viewer,
+        tile_max_bytes_3d,
+    )
+    data = MultiScaleVirtualData(labels)
+    _normalize_scale_for_float32(data, layer_kwargs, 'label')
+
+    from napari.layers import Labels
+
+    layer = Labels(
+        data._data,
+        multiscale=True,
         name=name,
         **layer_kwargs,
     )
