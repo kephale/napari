@@ -7,11 +7,15 @@ import numpy as np
 from lodstone import Plan, Region, Tile, TileKey, Update
 
 from napari.experimental._lodstone_loading import (
+    LEVEL_LABEL_OFFSET,
+    MISSING_LEVEL_LABEL,
     PlanComparison,
     PlanTrace,
     _camera_view,
     _level_transforms,
+    _LevelDiagnosticArray,
     _NapariTarget,
+    add_lodstone_level_diagnostics,
     add_lodstone_loading_image,
     add_lodstone_loading_labels,
 )
@@ -25,6 +29,34 @@ class _VirtualData:
 
     def set_offset(self, key, value) -> None:
         self.values[key] = value
+
+
+def test_level_diagnostic_array_reads_source_and_returns_level_label() -> None:
+    class RecordingArray:
+        shape = (8, 8)
+        dtype = np.dtype(np.uint16)
+        chunks = (4, 4)
+
+        def __init__(self) -> None:
+            self.reads = []
+
+        def __getitem__(self, key):
+            self.reads.append(key)
+            return np.arange(64, dtype=self.dtype).reshape(self.shape)[key]
+
+    source = RecordingArray()
+    diagnostic = _LevelDiagnosticArray(source, level=2)
+
+    result = diagnostic[1:5, 2:7]
+
+    assert source.reads == [(slice(1, 5), slice(2, 7))]
+    assert diagnostic.shape == source.shape
+    assert diagnostic.chunks == source.chunks
+    assert diagnostic.fill_value == MISSING_LEVEL_LABEL
+    np.testing.assert_array_equal(
+        result,
+        np.full((4, 5), 2 + LEVEL_LABEL_OFFSET, dtype=np.uint8),
+    )
 
 
 def test_target_applies_full_nd_chunk_before_render_callback() -> None:
@@ -299,6 +331,60 @@ def test_lodstone_labels_use_shared_progressive_loader(
         assert layer._type_string == 'labels'
         assert all(level.fill_value == 9 for level in loader._data)
         assert loader.plan_comparisons[-1].geometry_matches
+    finally:
+        loader.close()
+
+
+def test_level_diagnostic_layer_marks_loaded_blocks_by_source_level(
+    qtbot,
+    make_napari_viewer,
+) -> None:
+    base = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    arrays = [
+        da.from_array(base, chunks=(16, 16)),
+        da.from_array(base[::2, ::2], chunks=(16, 16)),
+        da.from_array(base[::4, ::4], chunks=(16, 16)),
+    ]
+    viewer = make_napari_viewer()
+    layer = add_lodstone_level_diagnostics(
+        arrays, viewer=viewer, name='level coverage'
+    )
+    loader = layer.metadata['progressive_loader']
+    try:
+        qtbot.waitUntil(
+            lambda: bool(loader.execution_diagnostics), timeout=10000
+        )
+
+        assert layer._type_string == 'labels'
+        assert layer.name == 'level coverage'
+        assert layer.metadata['level_diagnostic_labels'] == {
+            1: 'missing',
+            2: 'L0',
+            3: 'L1',
+            4: 'L2',
+        }
+        assert layer.metadata['level_diagnostic_legend'] == {
+            'missing': 'magenta',
+            'L0': 'green',
+            'L1': 'yellow',
+            'L2': 'orange',
+        }
+        assert loader._debug_overlay is not None
+        assert all(
+            vdata.fill_value == MISSING_LEVEL_LABEL for vdata in loader._data
+        )
+        for level, vdata in enumerate(loader._data):
+            for chunk_id in vdata.loaded_chunks:
+                key = tuple(
+                    slice(
+                        start - vdata.translate[axis],
+                        stop - vdata.translate[axis],
+                    )
+                    for axis, (start, stop) in enumerate(chunk_id)
+                )
+                assert np.all(
+                    vdata.hyperslice[key] == level + LEVEL_LABEL_OFFSET
+                )
     finally:
         loader.close()
 

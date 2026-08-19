@@ -49,6 +49,70 @@ from napari.experimental._virtual_data import (
 
 LOGGER = logging.getLogger(__name__)
 
+MISSING_LEVEL_LABEL = 1
+LEVEL_LABEL_OFFSET = 2
+LEVEL_DIAGNOSTIC_COLORS = (
+    '#28d34f',  # L0: green
+    '#f5d90a',  # L1: yellow
+    '#ff851b',  # L2: orange
+    '#26c6da',  # L3: cyan
+    '#7e57c2',  # L4: purple
+    '#ef5350',  # L5: red
+    '#8d6e63',  # L6: brown
+    '#bdbdbd',  # L7: grey
+)
+LEVEL_DIAGNOSTIC_COLOR_NAMES = (
+    'green',
+    'yellow',
+    'orange',
+    'cyan',
+    'purple',
+    'red',
+    'brown',
+    'grey',
+)
+
+
+class _LevelDiagnosticArray:
+    """Read a real array but return a solid categorical level label."""
+
+    def __init__(self, array, level: int) -> None:
+        self._array = array
+        self.level = int(level)
+        self.shape = tuple(int(value) for value in array.shape)
+        self.ndim = len(self.shape)
+        self.size = int(np.prod(self.shape, dtype=np.int64))
+        self.dtype = np.dtype(np.uint8)
+        self.fill_value = MISSING_LEVEL_LABEL
+
+    def __getattr__(self, name):
+        return getattr(self._array, name)
+
+    def __getitem__(self, key):
+        result = self._array[key]
+        if hasattr(result, 'read'):
+            result = result.read().result()
+        if hasattr(result, 'compute'):
+            result = result.compute()
+        shape = np.asarray(result).shape
+        return np.full(
+            shape,
+            self.level + LEVEL_LABEL_OFFSET,
+            dtype=self.dtype,
+        )
+
+
+def _level_diagnostic_color_map(levels: int) -> dict[int | None, str]:
+    colors: dict[int | None, str] = {
+        None: '#00000000',
+        MISSING_LEVEL_LABEL: '#ff00cc',
+    }
+    for level in range(levels):
+        colors[level + LEVEL_LABEL_OFFSET] = LEVEL_DIAGNOSTIC_COLORS[
+            level % len(LEVEL_DIAGNOSTIC_COLORS)
+        ]
+    return colors
+
 
 @dataclass(frozen=True)
 class PlanTrace:
@@ -617,6 +681,59 @@ def add_lodstone_loading_image(
         loader_class=LodstoneProgressiveLoader,
     )
     return layer
+
+
+def add_lodstone_level_diagnostics(
+    arrays,
+    viewer=None,
+    name=None,
+    opacity=1.0,
+    **kwargs: Any,
+):
+    """Show actual progressive reads as solid labels by source level.
+
+    The wrapped arrays still perform their normal reads. Returned values are
+    replaced with a constant categorical label after materialization, so the
+    layer exercises the same resident bootstrap, exact Lodstone plans, cache,
+    and delivery paths as the image while making coverage unambiguous.
+
+    Label 1 (magenta) is missing/unfilled content. Labels 2 onward identify
+    L0, L1, and subsequent pyramid levels using stable distinct colors.
+    """
+    diagnostic_arrays = [
+        _LevelDiagnosticArray(array, level)
+        for level, array in enumerate(arrays)
+    ]
+    metadata = dict(kwargs.pop('metadata', {}))
+    metadata['level_diagnostic_labels'] = {
+        MISSING_LEVEL_LABEL: 'missing',
+        **{
+            level + LEVEL_LABEL_OFFSET: f'L{level}'
+            for level in range(len(diagnostic_arrays))
+        },
+    }
+    metadata['level_diagnostic_legend'] = {
+        'missing': 'magenta',
+        **{
+            f'L{level}': LEVEL_DIAGNOSTIC_COLOR_NAMES[
+                level % len(LEVEL_DIAGNOSTIC_COLOR_NAMES)
+            ]
+            for level in range(len(diagnostic_arrays))
+        },
+    }
+    kwargs.setdefault(
+        'colormap', _level_diagnostic_color_map(len(diagnostic_arrays))
+    )
+    kwargs.setdefault('debug_overlay', True)
+    return add_lodstone_loading_labels(
+        diagnostic_arrays,
+        viewer=viewer,
+        fill_value=MISSING_LEVEL_LABEL,
+        name=name or 'Lodstone level provenance',
+        opacity=opacity,
+        metadata=metadata,
+        **kwargs,
+    )
 
 
 def add_lodstone_loading_labels(

@@ -144,6 +144,14 @@ class ChunkDebugOverlay:
             for lvl in range(len(loader._data))
         )
         lines.append(f'loaded chunks {counts}')
+        legend = self._layer.metadata.get('level_diagnostic_legend')
+        if legend:
+            entries = [f'{label}={color}' for label, color in legend.items()]
+            lines.append(entries[0])
+            lines.extend(
+                ', '.join(entries[start : start + 3])
+                for start in range(1, len(entries), 3)
+            )
         if self._too_dense:
             lines.append(f'chunk grid > {MAX_RECTS}: wireframes hidden')
         return '\n'.join(lines)
