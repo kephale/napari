@@ -663,12 +663,16 @@ def test_corners_adapt_tile_shape_to_rotated_viewport(
     displayed = list(layer._slice_input.displayed)
     bbox = np.array([[202.0, 750.0, 1650.0], [398.0, 1250.0, 1950.0]])
 
+    baseline = layer._corners_for_locked_level(0, displayed)
     corners = layer._corners_for_locked_level(0, displayed, bbox)
     low = corners[0, displayed]
     high = corners[1, displayed] + 1
     assert np.all(low <= np.floor(bbox[0]))
     assert np.all(high >= np.ceil(bbox[1]))
-    assert np.prod(high - low, dtype=np.int64) <= 64 * 1024**2
+    baseline_extent = baseline[1, displayed] - baseline[0, displayed] + 1
+    assert np.prod(high - low, dtype=np.int64) >= np.prod(
+        baseline_extent, dtype=np.int64
+    )
 
 
 def test_unlocked_3d_view_tiled_when_capped(
@@ -742,6 +746,35 @@ def test_corners_full_level_respects_gl_texture_limit(
     corners = layer._corners_for_locked_level(0, displayed)
     extent = (corners[1] - corners[0] + 1)[list(displayed)]
     assert np.all(extent <= 32)
+
+
+def test_rotated_viewport_margin_respects_gl_texture_limit(
+    qtbot,
+    make_napari_viewer,
+    monkeypatch,
+):
+    """Viewport margin and quantization must not exceed the 3D GL cap."""
+    monkeypatch.setattr(
+        'napari._vispy.utils.gl.get_max_texture_sizes',
+        lambda: (16384, 128),
+    )
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    arrays = [
+        da.zeros((64, 256, 256), chunks=(32, 64, 64), dtype=np.uint8),
+        da.zeros((32, 128, 128), chunks=(32, 64, 64), dtype=np.uint8),
+    ]
+    layer = viewer.add_image(arrays, multiscale=True)
+    layer._max_tile_extent_3d = 256
+    layer._tile_max_bytes_3d = 256**3
+    layer._interval_max_bytes_3d = 256**3
+    layer._tile_margin_3d = 1.25
+    displayed = list(layer._slice_input.displayed)
+    bbox = np.array([[0.0, 20.0, 20.0], [64.0, 124.0, 124.0]])
+
+    corners = layer._corners_for_locked_level(0, displayed, bbox)
+    extent = (corners[1] - corners[0] + 1)[displayed]
+    assert np.all(extent <= 128)
 
 
 def test_locked_tile_hysteresis(
@@ -1767,6 +1800,45 @@ def test_transform_applied_at_swap_not_before(
     assert np.array_equal(np.asarray(transform.matrix), new_matrix)
     assert dbuf._held_matrix is None
     assert dbuf._pending_matrix is None
+    loader.close()
+
+
+def test_clipmap_bounds_applied_at_texture_swap(
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+    monkeypatch,
+):
+    """An old front texture must retain its own clipmap coordinates."""
+    _viewer, _layer, loader = _engaged_3d_dbuf(
+        qtbot, make_napari_viewer, multiscale_3d_arrays
+    )
+    dbuf = loader._dbuf
+    monkeypatch.setattr(dbuf, '_queued_upload_bytes', lambda: 0)
+    node = loader._get_volume_node()
+    node.enable_clipmap(
+        np.zeros((8, 8, 8), dtype=np.uint8),
+        full_shape=(64, 64, 64),
+    )
+    node.set_clipmap_detail_bounds((0, 0, 0), (32, 32, 32))
+    old_bounds = node._clipmap_detail_bounds
+
+    dbuf.hold_presents(timeout=None)
+    node.set_data(np.full(dbuf.shape, 7, dtype=np.uint8))
+    node.set_clipmap_detail_bounds((16, 16, 16), (48, 48, 48))
+    new_bounds = node._clipmap_detail_bounds
+    loader._on_set_data()
+
+    assert node._clipmap_detail_bounds == old_bounds
+    assert not dbuf.present()
+    dbuf.release_presents()
+    qtbot.waitUntil(
+        lambda: dbuf.present() or node._clipmap_detail_bounds == new_bounds,
+        timeout=5000,
+    )
+    assert node._clipmap_detail_bounds == new_bounds
+    assert dbuf._held_clipmap_bounds is None
+    assert dbuf._pending_clipmap_bounds is None
     loader.close()
 
 

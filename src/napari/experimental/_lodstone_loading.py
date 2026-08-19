@@ -38,6 +38,7 @@ from napari.experimental._progressive_loading import (
     _chunk_id,
     _estimate_contrast_limits,
     _normalize_scale_for_float32,
+    _pack_upload_block,
     _resolve_viewer_and_tile_cap,
     chunk_priority_2D,
     chunk_slices,
@@ -277,18 +278,38 @@ class _NapariTarget:
     def prepare(self, view, plan) -> None:
         return None
 
-    def apply(self, updates) -> None:
+    def stage(self, updates):
+        """Write and pack chunks on Lodstone's worker thread."""
         grouped: dict[int, list[tuple[slice, ...]]] = defaultdict(list)
         for update in updates:
             vdata = self.loader._data[update.level]
             key = update.region.slices()
             if vdata.set_chunk(key, update.data, update.level):
                 grouped[update.level].append(key)
-        for level, batch in grouped.items():
+        active = getattr(self.loader, '_active', None)
+        target = active[0] if active is not None else None
+        return tuple(
+            (
+                level,
+                batch,
+                _pack_upload_block(self.loader._data[level], batch)
+                if level == target
+                else None,
+            )
+            for level, batch in grouped.items()
+        )
+
+    def apply(self, staged) -> None:
+        # Keep direct calls useful for adapters and tests; Stream calls
+        # ``stage`` before dispatching here, so production CPU work remains
+        # off the Qt thread.
+        if staged and not isinstance(staged[0], tuple):
+            staged = self.stage(staged)
+        for level, batch, block in staged:
             self.loader._on_chunks(
                 self.generation,
                 self.loader._data[level],
-                batch,
+                (batch, block) if block is not None else batch,
             )
 
     def discard(self, keys) -> None:
@@ -340,6 +361,83 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         self._lodstone_stream.on_status_changed(self._on_lodstone_status)
         self._lodstone_enabled = True
         self._check()
+
+    def _ensure_persistent_overview(self) -> None:
+        """Attach the full coarsest level as the volume's fallback texture."""
+        if self._viewer.dims.ndisplay != 3 or self._data.ndim != 3:
+            return
+        node = self._get_volume_node()
+        if node is None or node.clipmap_enabled:
+            return
+        target = self._resident_target_interval()
+        if target is None:
+            return
+        overview = self._data[self._resident_level]
+        low, high = target
+        if np.any(low) or np.any(high != np.asarray(overview.shape)):
+            return
+        with overview.lock:
+            if overview.interval is None:
+                data = np.full(
+                    overview.shape,
+                    overview.fill_value,
+                    dtype=overview.dtype,
+                )
+            else:
+                data = np.ascontiguousarray(overview.hyperslice)
+                if data.shape != overview.shape:
+                    full = np.full(
+                        overview.shape,
+                        overview.fill_value,
+                        dtype=overview.dtype,
+                    )
+                    low, high = overview.interval
+                    full[
+                        tuple(
+                            slice(a, b) for a, b in zip(low, high, strict=True)
+                        )
+                    ] = data
+                    data = full
+        node.enable_clipmap(data, self._data[0].shape)
+        displayed = list(self._layer._slice_input.displayed)
+        if len(displayed) == 3:
+            scale = self._layer.downsample_factors[self._layer.data_level][
+                displayed
+            ]
+            node.set_clipmap_detail_bounds(
+                self._layer.corner_pixels[0, displayed],
+                self._layer.corner_pixels[1, displayed] + 1,
+                scale=scale,
+            )
+        try:
+            visual = self._viewer.window._qt_viewer.layer_to_visual[
+                self._layer
+            ]
+            visual._on_matrix_change()
+        except (KeyError, AttributeError, RuntimeError):
+            pass
+
+    def _pack_resident_batch(self, vdata, keys):
+        if (
+            self._closed
+            or self._viewer is None
+            or not isinstance(self._data, MultiScaleVirtualData)
+            or self._viewer.dims.ndisplay != 3
+            or self._data.ndim != 3
+        ):
+            return keys
+        return keys, _pack_upload_block(vdata, keys)
+
+    def _on_resident_chunks(self, vdata, batch) -> None:
+        block = None
+        if isinstance(batch, tuple):
+            _keys, block = batch
+        node = self._get_volume_node()
+        if node is not None and node.clipmap_enabled and block is not None:
+            low, _high, data = block
+            node.set_overview_data(data, offset=low)
+        if self._layer.data_level == self._resident_level:
+            self._refresh()
 
     def _start_resident_fill(self, min_coord, max_coord) -> None:
         vdata = self._data[self._resident_level]
@@ -608,6 +706,9 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             self._lodstone_stream.resume()
 
     def close(self) -> None:
+        node = self._get_volume_node()
+        if node is not None and node.clipmap_enabled:
+            node.disable_clipmap()
         stream = self._lodstone_stream
         self._lodstone_stream = None
         self._lodstone_enabled = False

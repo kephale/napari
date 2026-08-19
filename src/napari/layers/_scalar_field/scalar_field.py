@@ -748,10 +748,10 @@ class ScalarFieldBase(Layer, ABC):
         # budget is distributed to larger axes so anisotropic data
         # (e.g. Z=42, Y=304, X=657) shows more of the volume.
         tile_bytes = self._tile_max_bytes_3d
+        gl_max = gl_max_3d if gl_max_3d is not None else extent_cap
         if tile_bytes is not None:
             itemsize = max(int(self.dtype.itemsize), 1)
             max_elements = max(tile_bytes // itemsize, 1)
-            gl_max = gl_max_3d if gl_max_3d is not None else extent_cap
             tile_extent = np.minimum(shape_at_level, gl_max).astype(np.int64)
             for _ in range(len(tile_extent)):
                 vol = int(np.prod(tile_extent))
@@ -791,9 +791,16 @@ class ScalarFieldBase(Layer, ABC):
                 )
                 if int(np.prod(base, dtype=np.int64)) <= max_elements:
                     margin = float(getattr(self, '_tile_margin_3d', 1.25))
+                    # Preserve the PR's budget-sized high-resolution
+                    # subvolume. The viewport footprint may redistribute
+                    # that budget across axes, but must not shrink the tile
+                    # merely because the current view is smaller.
                     tile_extent = np.minimum(
-                        np.ceil(base * margin).astype(np.int64),
-                        shape_at_level,
+                        np.maximum(
+                            tile_extent,
+                            np.ceil(base * margin).astype(np.int64),
+                        ),
+                        np.minimum(shape_at_level, gl_max),
                     )
         else:
             center = shape_at_level / 2
@@ -801,29 +808,8 @@ class ScalarFieldBase(Layer, ABC):
         tile_extent = np.asarray(tile_extent, dtype=np.int64)
         tile_extent = np.minimum(
             -(-tile_extent // quantum) * quantum,
-            shape_at_level,
+            np.minimum(shape_at_level, gl_max),
         )
-        if tile_bytes is not None:
-            # Quantization supplies stable tile dimensions but can push a
-            # viewport-adaptive candidate over budget.  Remove only margin
-            # slack; never shrink below the visible footprint here.
-            minimum = (
-                np.minimum(
-                    -(-base // quantum) * quantum,
-                    shape_at_level,
-                )
-                if base is not None
-                else np.minimum(_MIN_TILE_EXTENT_3D, shape_at_level)
-            )
-            while int(
-                np.prod(tile_extent, dtype=np.int64)
-            ) > max_elements and np.any(tile_extent > minimum):
-                slack = tile_extent - minimum
-                axis = int(np.argmax(slack))
-                tile_extent[axis] = max(
-                    int(tile_extent[axis]) - quantum,
-                    int(minimum[axis]),
-                )
         center = np.clip(center, 0, shape_at_level - 1)
         if np.all(tile_extent >= shape_at_level):
             return corners

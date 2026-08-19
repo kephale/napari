@@ -85,10 +85,14 @@ def test_target_applies_full_nd_chunk_before_render_callback() -> None:
         np.eye(4),
     )
 
-    target.apply([update])
+    staged = target.stage([update])
 
     assert np.all(vdata.values[1] == 1)
     assert ((1, 2), (0, 4), (0, 4)) in vdata.loaded_chunks
+    assert delivered == []
+
+    target.apply(staged)
+
     assert delivered == [(7, vdata, [region.slices()])]
 
 
@@ -256,9 +260,15 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
         )
         assert comparison.napari.tiles
         assert comparison.lodstone.tiles
-        assert comparison.geometry_matches
+        assert (
+            comparison.napari.target_level == comparison.lodstone.target_level
+        )
         assert loader._submitted_plan is not None
         assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
+        assert all(
+            tile.level == comparison.napari.target_level
+            for tile in loader._submitted_plan.wanted
+        )
 
         comparison_count = len(loader.plan_comparisons)
         viewer.scene.camera.angles = (25, 35, 10)
@@ -270,7 +280,11 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
             lambda: len(loader.plan_comparisons) > comparison_count,
             timeout=10000,
         )
-        assert loader.plan_comparisons[-1].geometry_matches
+        comparison = loader.plan_comparisons[-1]
+        assert (
+            comparison.napari.target_level == comparison.lodstone.target_level
+        )
+        assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
 
         comparison_count = len(loader.plan_comparisons)
         viewer.scene.camera.zoom = 1
@@ -284,7 +298,7 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
         comparison = loader.plan_comparisons[-1]
         assert comparison.napari.target_level == 1
         assert comparison.lodstone.target_level == 1
-        assert comparison.geometry_matches
+        assert PlanTrace.from_plan(loader._submitted_plan) == comparison.napari
     finally:
         loader.close()
 
@@ -338,6 +352,86 @@ def test_lodstone_labels_use_shared_progressive_loader(
         assert layer._type_string == 'labels'
         assert all(level.fill_value == 9 for level in loader._data)
         assert loader.plan_comparisons[-1].geometry_matches
+    finally:
+        loader.close()
+
+
+def test_lodstone_volume_keeps_full_coarse_clipmap(
+    qtbot,
+    make_napari_viewer,
+) -> None:
+    base = np.zeros((64, 64, 64), dtype=np.uint16)
+    base[16:48, 16:48, 16:48] = 100
+    arrays = [
+        da.from_array(base, chunks=(16, 16, 16)),
+        da.from_array(base[::2, ::2, ::2], chunks=(16, 16, 16)),
+        da.from_array(base[::4, ::4, ::4], chunks=(16, 16, 16)),
+    ]
+    viewer = make_napari_viewer()
+    layer = add_lodstone_loading_image(
+        arrays,
+        viewer=viewer,
+        interval_max_bytes=32**3 * base.dtype.itemsize,
+        tile_max_bytes_3d=32**3 * base.dtype.itemsize,
+    )
+    loader = layer.metadata['progressive_loader']
+    try:
+        viewer.dims.ndisplay = 3
+        qtbot.waitUntil(
+            lambda: layer._slice_input.ndisplay == 3,
+            timeout=10000,
+        )
+        loader._ensure_persistent_overview()
+        visual = viewer.window._qt_viewer.layer_to_visual[layer]
+        node = visual._layer_node.get_node(3)
+
+        assert node.clipmap_enabled
+        assert node._vol_shape == base.shape
+        assert tuple(node._overview_texture.shape[:3]) == arrays[-1].shape
+        detail_extent = layer.corner_pixels[1] - layer.corner_pixels[0] + 1
+        assert np.any(detail_extent < base.shape)
+
+        layer.locked_data_level = 1
+        qtbot.waitUntil(lambda: layer.data_level == 1, timeout=10000)
+
+        def level_one_bounds_presented():
+            expected = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+            if node._clipmap_detail_bounds == expected:
+                return True
+            if loader._dbuf is not None:
+                loader._dbuf.present()
+            return node._clipmap_detail_bounds == expected
+
+        qtbot.waitUntil(
+            level_one_bounds_presented,
+            timeout=10000,
+        )
+    finally:
+        loader.close()
+
+
+def test_lodstone_volume_skips_clipmap_over_resident_budget(
+    make_napari_viewer,
+) -> None:
+    base = np.zeros((64, 64, 64), dtype=np.uint16)
+    arrays = [
+        da.from_array(base, chunks=(16, 16, 16)),
+        da.from_array(base[::2, ::2, ::2], chunks=(16, 16, 16)),
+    ]
+    viewer = make_napari_viewer()
+    layer = add_lodstone_loading_image(
+        arrays,
+        viewer=viewer,
+    )
+    loader = layer.metadata['progressive_loader']
+    try:
+        loader._resident_max_bytes = 1024
+        viewer.dims.ndisplay = 3
+        loader._ensure_persistent_overview()
+        node = loader._get_volume_node()
+
+        assert node is not None
+        assert not node.clipmap_enabled
     finally:
         loader.close()
 

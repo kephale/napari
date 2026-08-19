@@ -211,7 +211,15 @@ class VispyBaseLayer(ABC, Generic[_L]):
             self._world_to_layer_units_scale = (1,) * self.layer.ndim
 
         # mypy: self.layer._transforms.simplified cannot be None
-        transform = self.layer._transforms.simplified.set_slice(dims_displayed)
+        clipmap = bool(
+            self.layer._slice_input.ndisplay == 3
+            and getattr(self.node, 'clipmap_enabled', False)
+        )
+        transform = (
+            self.layer._data_to_world.set_slice(dims_displayed)
+            if clipmap
+            else self.layer._transforms.simplified.set_slice(dims_displayed)
+        )
         # convert NumPy axis ordering to VisPy axis ordering
         # by reversing the axes order and flipping the linear
         # matrix
@@ -227,7 +235,8 @@ class VispyBaseLayer(ABC, Generic[_L]):
         # (multiple levels, partial field-of-view) that also currently interacts
         # with how pixels are centered (see further below).
         if (
-            self._array_like
+            not clipmap
+            and self._array_like
             and self.layer._slice_input.ndisplay == 3
             and self.layer.multiscale
             and hasattr(self.layer, 'downsample_factors')
@@ -254,7 +263,8 @@ class VispyBaseLayer(ABC, Generic[_L]):
         child_offset = np.zeros(len(dims_displayed))
 
         if (
-            self._array_like
+            not clipmap
+            and self._array_like
             and self.layer._slice_input.ndisplay == 3
             and self.layer.multiscale
         ):

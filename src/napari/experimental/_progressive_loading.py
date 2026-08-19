@@ -1650,6 +1650,7 @@ class ProgressiveLoader:
         if not layer.visible:
             self._cancel_active()
             return
+        self._ensure_persistent_overview()
         self._apply_auto_level()
         self._ensure_resident()
         level = int(layer.data_level)
@@ -1750,6 +1751,7 @@ class ProgressiveLoader:
         """
         if self._closed or self._viewer.dims.ndisplay != 3:
             return
+        self._ensure_persistent_overview()
         layer = self._layer
         displayed = list(layer._slice_input.displayed)
         if len(displayed) not in (2, 3):
@@ -1884,6 +1886,11 @@ class ProgressiveLoader:
             # the still-rendered old tile never draws misplaced. Runs
             # inside the emission — nothing can paint in between.
             dbuf.capture_transform()
+        if self._uses_atomic_clipmap_page():
+            # The persistent coarse texture is the backdrop. A detail page
+            # remains hidden until all of its real chunks are staged, so no
+            # dense coarse-to-fine expansion is needed here.
+            return
         if self._backdrop_pending:
             return
         level = int(self._layer.data_level)
@@ -2112,6 +2119,8 @@ class ProgressiveLoader:
         self._backdrop_pending = False
         if self._closed or not self._layer.visible:
             return
+        if self._uses_atomic_clipmap_page():
+            return
         level = int(self._layer.data_level)
         min_coord, max_coord = self._level_interval(level)
         if np.any(max_coord <= min_coord):
@@ -2173,7 +2182,9 @@ class ProgressiveLoader:
                     [int(c) for c in min_coord],
                     [int(c) for c in max_coord],
                 )
-        self._repair_backdrop()
+        atomic_clipmap = self._uses_atomic_clipmap_page()
+        if not atomic_clipmap:
+            self._repair_backdrop()
         self._active = (level, tuple(min_coord), tuple(max_coord))
 
         queue = self._stage_queue(level)
@@ -2203,7 +2214,7 @@ class ProgressiveLoader:
             return
 
         stages = [(level, queue)]
-        if self._coarse_first:
+        if self._coarse_first and not atomic_clipmap:
             stages = self._ladder_stages(level, min_coord, max_coord) + stages
 
         LOGGER.debug(
@@ -2262,7 +2273,7 @@ class ProgressiveLoader:
             # repair worker lands its backdrop; the front (previous
             # tile, correctly placed via the transform hold) renders
             # meanwhile
-            dbuf.hold_presents()
+            dbuf.hold_presents(timeout=None if atomic_clipmap else 1.5)
         self._degrade_render_quality()
         self._refresh(force=True)
 
@@ -2652,6 +2663,13 @@ class ProgressiveLoader:
     def _get_volume_node(self):
         return self._get_display_node(3)
 
+    def _uses_atomic_clipmap_page(self) -> bool:
+        """Whether coarse context replaces partial 3D detail pages."""
+        if self._closed or self._viewer.dims.ndisplay != 3:
+            return False
+        node = self._get_volume_node()
+        return bool(node is not None and node.clipmap_enabled)
+
     def _displayed_plane(self, level: int):
         """The displayed dims and the fixed level-coordinate steps of
         every other dim for the current slice.
@@ -2943,6 +2961,8 @@ class ProgressiveLoader:
         """
         if self._closed:
             return
+        if self._uses_atomic_clipmap_page():
+            return
         level = int(self._layer.data_level)
         if level == self._resident_level:
             return
@@ -3107,6 +3127,7 @@ class ProgressiveLoader:
             queue,
             num_workers=self._fetch_workers,
             apply=apply,
+            pack=lambda keys: self._pack_resident_batch(vdata, keys),
             limiter=self._resident_limiter,
         )
 
@@ -3115,8 +3136,7 @@ class ProgressiveLoader:
                 return
             if self._resident_pbar is not None:
                 self._advance_progress(len(batch), resident=True)
-            if self._layer.data_level == self._resident_level:
-                self._refresh()
+            self._on_resident_chunks(vdata, batch)
 
         def on_finished():
             if self._closed or self._resident_worker is not worker:
@@ -3137,6 +3157,18 @@ class ProgressiveLoader:
         worker.finished.connect(on_finished)
         self._resident_worker = worker
         worker.start()
+
+    def _ensure_persistent_overview(self) -> None:
+        """Optional renderer hook for persistent coarse coverage."""
+
+    def _pack_resident_batch(self, vdata: VirtualData, keys):
+        """Prepare one resident batch away from the Qt thread."""
+        return keys
+
+    def _on_resident_chunks(self, vdata: VirtualData, batch) -> None:
+        """Present resident data on the Qt thread."""
+        if self._layer.data_level == self._resident_level:
+            self._refresh()
 
 
 # ---------- public entry point ----------

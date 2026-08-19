@@ -87,6 +87,8 @@ class _TransformHoldMixin:
     _node = None
     _held_matrix = None
     _pending_matrix = None
+    _held_clipmap_bounds = None
+    _pending_clipmap_bounds = None
 
     def _node_matrix_transform(self):
         transform = getattr(self._node, 'transform', None)
@@ -101,11 +103,14 @@ class _TransformHoldMixin:
         Idempotent while already holding: the front content does not
         change between holds, so the first snapshot stays authoritative.
         """
-        if self._held_matrix is not None:
-            return
-        transform = self._node_matrix_transform()
-        if transform is not None:
-            self._held_matrix = np.array(transform.matrix, copy=True)
+        if self._held_matrix is None:
+            transform = self._node_matrix_transform()
+            if transform is not None:
+                self._held_matrix = np.array(transform.matrix, copy=True)
+        if self._held_clipmap_bounds is None:
+            bounds = getattr(self._node, '_clipmap_detail_bounds', None)
+            if bounds is not None:
+                self._held_clipmap_bounds = bounds
 
     def capture_transform(self) -> None:
         """Capture napari's new matrix; keep the front-matching one.
@@ -116,16 +121,20 @@ class _TransformHoldMixin:
         the swap) and the matrix matching the still-rendered front
         content is restored, so the old tile never renders misplaced.
         """
-        if self._held_matrix is None:
-            return
-        transform = self._node_matrix_transform()
-        if transform is None:
-            return
-        current = np.asarray(transform.matrix)
-        if np.array_equal(current, self._held_matrix):
-            return
-        self._pending_matrix = np.array(current, copy=True)
-        transform.matrix = self._held_matrix
+        if self._held_matrix is not None:
+            transform = self._node_matrix_transform()
+            if transform is not None:
+                current = np.asarray(transform.matrix)
+                if not np.array_equal(current, self._held_matrix):
+                    self._pending_matrix = np.array(current, copy=True)
+                    transform.matrix = self._held_matrix
+        if self._held_clipmap_bounds is not None:
+            current = getattr(self._node, '_clipmap_detail_bounds', None)
+            if current != self._held_clipmap_bounds:
+                self._pending_clipmap_bounds = current
+                self._node._set_clipmap_detail_bounds_normalized(
+                    *self._held_clipmap_bounds
+                )
 
     def _apply_pending_transform(self) -> None:
         """Apply the captured matrix at the swap (content now matches).
@@ -144,11 +153,23 @@ class _TransformHoldMixin:
             transform.matrix = self._pending_matrix
         self._pending_matrix = None
         self._held_matrix = None
+        current = getattr(self._node, '_clipmap_detail_bounds', None)
+        if (
+            self._pending_clipmap_bounds is not None
+            and current == self._held_clipmap_bounds
+        ):
+            self._node._set_clipmap_detail_bounds_normalized(
+                *self._pending_clipmap_bounds
+            )
+        self._pending_clipmap_bounds = None
+        self._held_clipmap_bounds = None
 
     def _drop_transform_hold(self) -> None:
         """Forget the hold without touching the node (fallback paths)."""
         self._pending_matrix = None
         self._held_matrix = None
+        self._pending_clipmap_bounds = None
+        self._held_clipmap_bounds = None
 
 
 class _DoubleBufferedTexture(_TransformHoldMixin):
@@ -184,6 +205,8 @@ class _DoubleBufferedTexture(_TransformHoldMixin):
         self._reshape_pending = False
         self._held_matrix = None
         self._pending_matrix = None
+        self._held_clipmap_bounds = None
+        self._pending_clipmap_bounds = None
         self._present_hold_until = 0.0
 
     def _sync_aux_state(self, tex):
@@ -272,14 +295,18 @@ class _DoubleBufferedTexture(_TransformHoldMixin):
 
     # -- loader present veto --
 
-    def hold_presents(self, timeout: float = 1.5) -> None:
+    def hold_presents(self, timeout: float | None = 1.5) -> None:
         """Veto presents while staged content is known to be junk.
 
         Keeps the front texture on screen (e.g. during a time-step
         change where the new step's data has not arrived yet).
-        Deadline-bounded so a lost release can never starve presents.
+        ``None`` holds until an explicit :meth:`release_presents`; this is
+        used for atomic clipmap pages, whose complete coarse texture remains
+        visible while the page loads.
         """
-        self._present_hold_until = time.monotonic() + timeout
+        self._present_hold_until = (
+            float('inf') if timeout is None else time.monotonic() + timeout
+        )
 
     def release_presents(self) -> None:
         self._present_hold_until = 0.0
@@ -534,6 +561,8 @@ class DoubleBufferedVolumeTexture(_DoubleBufferedTexture):
             node.shared_program['u_shape'] = (x, y, z)
             node._vol_shape = self._shape
             node._need_vertex_update = True
+            if getattr(node, 'clipmap_enabled', False):
+                node.set_clipmap_geometry()
         except RuntimeError:
             return False
         self._front = back
@@ -573,6 +602,8 @@ class DoubleBufferedVolumeTexture(_DoubleBufferedTexture):
             node._data_lookup_fn['texture'] = texture
         node.shared_program['clim'] = texture.clim_normalized
         node._texture = texture
+        if hasattr(node, 'rebind_clipmap_detail_texture'):
+            node.rebind_clipmap_detail_texture()
 
     def _front_pending_full(self) -> bool:
         """Whether the front is behind a staged full rewrite."""
