@@ -750,7 +750,9 @@ class ScalarFieldBase(Layer, ABC):
         tile_bytes = self._tile_max_bytes_3d
         gl_max = gl_max_3d if gl_max_3d is not None else extent_cap
         if tile_bytes is not None:
-            itemsize = max(int(self.dtype.itemsize), 1)
+            # Vispy keeps uint8 volume textures compact but normalizes
+            # other source dtypes into float32 textures.
+            itemsize = 1 if self.dtype == np.uint8 else 4
             max_elements = max(tile_bytes // itemsize, 1)
             tile_extent = np.minimum(shape_at_level, gl_max).astype(np.int64)
             for _ in range(len(tile_extent)):

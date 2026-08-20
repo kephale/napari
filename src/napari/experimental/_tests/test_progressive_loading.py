@@ -7,6 +7,7 @@ import dask.array as da
 import numpy as np
 import pytest
 
+pytest.importorskip('lodstone', reason='requires the progressive extra')
 qtpy = pytest.importorskip('qtpy', reason='requires Qt backend')
 
 pytestmark = [
@@ -418,11 +419,65 @@ def test_camera_bbox_covers_rotated_screen_plane(
     center = bbox.mean(axis=0)
     for up_sign, right_sign in itertools.product((-1, 1), repeat=2):
         corner = center + (
-            up_sign * screen_half[0] * data_directions[0]
-            + right_sign * screen_half[1] * data_directions[1]
+            up_sign * screen_half[1] * data_directions[0]
+            + right_sign * screen_half[0] * data_directions[1]
         )
         assert np.all(corner >= bbox[0] - 1e-9)
         assert np.all(corner <= bbox[1] + 1e-9)
+    loader.close()
+
+
+def test_camera_bbox_covers_non_square_anisotropic_canvas(
+    make_napari_viewer,
+    multiscale_3d_arrays,
+):
+    """Width follows camera-right and height follows camera-up."""
+    from types import SimpleNamespace
+
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(
+        multiscale_3d_arrays,
+        viewer=viewer,
+        scale=(1.24, 0.439, 0.439),
+    )
+    loader = layer.metadata['progressive_loader']
+    camera = viewer.scene.camera
+    camera.angles = (37.0, 61.0, 19.0)
+    real_viewer = loader._viewer
+    loader._viewer = SimpleNamespace(
+        scene=real_viewer.scene,
+        dims=real_viewer.dims,
+        canvas=SimpleNamespace(size=(1200, 400)),
+    )
+    displayed = list(layer._slice_input.displayed)
+    bbox = loader._camera_bbox_level0(displayed)
+    assert bbox is not None
+
+    view = np.asarray(camera.view_direction, dtype=float)
+    up = np.asarray(camera.up_direction, dtype=float)
+    directions = []
+    for direction in (up, np.cross(up, view)):
+        full = np.zeros(layer.ndim, dtype=float)
+        full[displayed] = direction[-len(displayed) :]
+        directions.append(
+            np.asarray(layer._world_to_data_ray(full))[displayed]
+        )
+    half_width = 1200 / (2 * camera.zoom)
+    half_height = 400 / (2 * camera.zoom)
+    center = bbox.mean(axis=0)
+    for up_sign, right_sign in itertools.product((-1, 1), repeat=2):
+        corner = center + (
+            up_sign * half_height * directions[0]
+            + right_sign * half_width * directions[1]
+        )
+        assert np.all(corner >= bbox[0] - 1e-9)
+        assert np.all(corner <= bbox[1] + 1e-9)
+
+    # The transformed camera center remains inside the chosen footprint.
+    assert np.all(center >= bbox[0])
+    assert np.all(center <= bbox[1])
+    loader._viewer = real_viewer
     loader.close()
 
 

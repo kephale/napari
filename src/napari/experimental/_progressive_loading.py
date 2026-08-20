@@ -49,9 +49,12 @@ from lodstone import (
     Region,
     anisotropic_extent_for_bytes,
     chunk_key_id,
+    chunk_sizes_for,
     chunk_slices_for,
     clamp_region_to_budget,
+    expand_region_to_chunk_grid,
     isotropic_extent_for_bytes,
+    native_chunks_in_region,
 )
 
 # imported at module load: a lazy first-use import inside a fetch pass
@@ -368,6 +371,12 @@ def _tile_extent_3d_for(dtype: np.dtype, interval_max_bytes: int) -> int:
         max_axis_extent=max_axis_extent,
         minimum=32,
     )
+
+
+def _texture_dtype_3d(dtype: np.dtype) -> np.dtype:
+    """Return the dtype occupying a volume detail texture."""
+    dtype = np.dtype(dtype)
+    return dtype if dtype == np.dtype(np.uint8) else np.dtype(np.float32)
 
 
 def _anisotropic_tile_extent(
@@ -704,7 +713,7 @@ class ProgressiveLoader:
         # this size, so even the finest levels of huge volumes are usable
         # in 3D. Bounded by the memory budget and the GL 3D texture limit.
         self._tile_extent_3d = _tile_extent_3d_for(
-            data.dtype,
+            _texture_dtype_3d(data.dtype),
             min(interval_max_bytes, tile_max_bytes_3d),
         )
         layer._max_tile_extent_3d = self._tile_extent_3d
@@ -885,7 +894,21 @@ class ProgressiveLoader:
 
         min_coord = np.clip(min_coord, 0, shape)
         max_coord = np.clip(max_coord, 0, shape)
-        return self._clamp_interval(vdata, min_coord, max_coord)
+        min_coord, max_coord = self._clamp_interval(
+            vdata, min_coord, max_coord
+        )
+        aligned = expand_region_to_chunk_grid(
+            Region(tuple(min_coord), tuple(max_coord)),
+            vdata.shape,
+            chunk_sizes_for(vdata),
+            itemsize=vdata.dtype.itemsize,
+            max_bytes=self._interval_max_bytes,
+            max_axis_extent=self._gl_max_texture_size_2d,
+        )
+        return (
+            np.asarray(aligned.start, dtype=np.int64),
+            np.asarray(aligned.stop, dtype=np.int64),
+        )
 
     def _restrict_to_current_step(
         self,
@@ -1082,15 +1105,20 @@ class ProgressiveLoader:
                     level_extent,
                 )
                 extent = np.minimum(extent, wanted.astype(np.int64))
-            nbytes = np.prod(extent, dtype=np.int64) * vdata.dtype.itemsize
-            chunk_shape = np.take(
-                np.asarray(vdata.chunk_shape, dtype=np.int64),
-                displayed,
+            texture_itemsize = _texture_dtype_3d(vdata.dtype).itemsize
+            nbytes = np.prod(extent, dtype=np.int64) * texture_itemsize
+            display_shape = tuple(int(vdata.shape[axis]) for axis in displayed)
+            display_chunks = tuple(
+                chunk_sizes_for(vdata)[axis] for axis in displayed
             )
-            n_chunks = np.prod(
-                -(-extent // chunk_shape),
-                dtype=np.int64,
-            )  # ceil-div
+            n_chunks = native_chunks_in_region(
+                Region(
+                    tuple(int(value) for value in render_low),
+                    tuple(int(value) for value in render_high),
+                ),
+                display_shape,
+                display_chunks,
+            )
             if (
                 nbytes <= self._interval_max_bytes
                 and n_chunks <= self._max_chunks_per_pass
@@ -1140,6 +1168,9 @@ class ProgressiveLoader:
             np.asarray(self._layer.scale, dtype=float),
             list(displayed_axes),
         )
+        # Canvas size is (width, height), while the camera basis is
+        # (up, right). Keep those spans paired correctly on non-square
+        # canvases.
         screen_half = canvas_size[:2] / (2 * zoom)
         screen_radius = float(np.max(screen_half))
         half_extent = screen_radius / np.maximum(layer_scale, 1e-12)
@@ -1161,8 +1192,8 @@ class ProgressiveLoader:
                     directions.append(data_direction)
                 up_data, right_data, view_data = directions
                 half_extent = (
-                    screen_half[0] * np.abs(up_data)
-                    + screen_half[1] * np.abs(right_data)
+                    screen_half[1] * np.abs(up_data)
+                    + screen_half[0] * np.abs(right_data)
                     + 0.35 * screen_radius * np.abs(view_data)
                 )
             except Exception:  # noqa: BLE001
@@ -1661,11 +1692,6 @@ class ProgressiveLoader:
             # the still-rendered old tile never draws misplaced. Runs
             # inside the emission — nothing can paint in between.
             dbuf.capture_transform()
-        if self._uses_atomic_clipmap_page():
-            # The persistent coarse texture is the backdrop. A detail page
-            # remains hidden until all of its real chunks are staged, so no
-            # dense coarse-to-fine expansion is needed here.
-            return
         if self._backdrop_pending:
             return
         level = int(self._layer.data_level)
@@ -1894,8 +1920,6 @@ class ProgressiveLoader:
         self._backdrop_pending = False
         if self._closed or not self._layer.visible:
             return
-        if self._uses_atomic_clipmap_page():
-            return
         level = int(self._layer.data_level)
         min_coord, max_coord = self._level_interval(level)
         if np.any(max_coord <= min_coord):
@@ -1922,7 +1946,9 @@ class ProgressiveLoader:
         if dbuf is not None and hasattr(dbuf, 'hold_presents'):
             # the refresh below stages zeros + carry-over; keep the
             # front on screen until the repair worker lands content
-            dbuf.hold_presents()
+            dbuf.hold_presents(
+                timeout=None if self._has_clipmap_overview() else 1.5
+            )
         self._repair_backdrop()
         self._refresh(force=True)
 
@@ -1957,9 +1983,7 @@ class ProgressiveLoader:
                     [int(c) for c in min_coord],
                     [int(c) for c in max_coord],
                 )
-        atomic_clipmap = self._uses_atomic_clipmap_page()
-        if not atomic_clipmap:
-            self._repair_backdrop()
+        self._repair_backdrop()
         self._active = (level, tuple(min_coord), tuple(max_coord))
 
         queue = self._stage_queue(level)
@@ -1989,7 +2013,7 @@ class ProgressiveLoader:
             return
 
         stages = [(level, queue)]
-        if self._coarse_first and not atomic_clipmap:
+        if self._coarse_first:
             stages = self._ladder_stages(level, min_coord, max_coord) + stages
 
         LOGGER.debug(
@@ -2048,7 +2072,9 @@ class ProgressiveLoader:
             # repair worker lands its backdrop; the front (previous
             # tile, correctly placed via the transform hold) renders
             # meanwhile
-            dbuf.hold_presents(timeout=None if atomic_clipmap else 1.5)
+            dbuf.hold_presents(
+                timeout=None if self._has_clipmap_overview() else 1.5
+            )
         self._degrade_render_quality()
         self._refresh(force=True)
 
@@ -2371,8 +2397,8 @@ class ProgressiveLoader:
     def _get_volume_node(self):
         return self._get_display_node(3)
 
-    def _uses_atomic_clipmap_page(self) -> bool:
-        """Whether coarse context replaces partial 3D detail pages."""
+    def _has_clipmap_overview(self) -> bool:
+        """Whether a persistent coarse texture can seed the detail page."""
         if self._closed or self._viewer.dims.ndisplay != 3:
             return False
         node = self._get_volume_node()
@@ -2669,8 +2695,6 @@ class ProgressiveLoader:
         """
         if self._closed:
             return
-        if self._uses_atomic_clipmap_page():
-            return
         level = int(self._layer.data_level)
         if level == self._resident_level:
             return
@@ -2691,29 +2715,59 @@ class ProgressiveLoader:
         # worker (a plain function, so quit() only sets a flag nothing
         # polls), so the worker must not read state teardown invalidates.
         data = self._data
+        clipmap_prefill = self._has_clipmap_overview()
 
         @thread_worker
         def repair():
             if self._closed:
-                return False
-            return self._backdrop_fill_layered(
+                return False, None
+            wrote = self._backdrop_fill_layered(
                 level,
                 min_coord,
                 max_coord,
                 data=data,
             )
+            packed = None
+            if wrote and clipmap_prefill:
+                key = tuple(
+                    slice(int(low), int(high))
+                    for low, high in zip(min_coord, max_coord, strict=True)
+                )
+                packed = data[level].copy_chunk_union((key,))
+            return wrote, packed
 
         worker = repair()
 
-        def on_done(wrote):
+        def on_done(result):
             if self._repair_worker is worker:
                 self._repair_worker = None
             if self._closed:
                 return
+            wrote, packed = result
             dbuf = self._dbuf
-            if dbuf is not None and hasattr(dbuf, 'release_presents'):
+            clipmap = self._has_clipmap_overview()
+            patched = False
+            if clipmap and packed is not None:
+                region, block = packed
+                patched = self._patch_texture_region(
+                    data[level],
+                    region.start,
+                    region.stop,
+                    block=block,
+                )
+            # A clipmap hold is indefinite until the complete detail page
+            # contains either real fine data or spatially correct coarse
+            # data. If staging that prefill fails, pass completion remains
+            # the safe fallback that releases the old page.
+            if (
+                dbuf is not None
+                and hasattr(dbuf, 'release_presents')
+                and (not clipmap or patched or not wrote)
+            ):
                 dbuf.release_presents()
-            if wrote:
+            if patched:
+                self._update_node()
+            elif wrote:
                 self._refresh(force=True)
             elif dbuf is not None:
                 # nothing to fill (fully carried over): present whatever
@@ -2727,7 +2781,9 @@ class ProgressiveLoader:
                 self._repair_backdrop()
 
         worker.returned.connect(on_done)
-        worker.errored.connect(lambda _e: on_done(False))  # pragma: no cover
+        worker.errored.connect(
+            lambda _e: on_done((False, None))
+        )  # pragma: no cover
         self._repair_worker = worker
         worker.start()
 
@@ -2859,7 +2915,9 @@ def _attach_progressive_loader(
     the loader, and register window-close teardown.
     """
     tile_bytes = min(interval_max_bytes, tile_max_bytes_3d)
-    layer._max_tile_extent_3d = _tile_extent_3d_for(data.dtype, tile_bytes)
+    layer._max_tile_extent_3d = _tile_extent_3d_for(
+        _texture_dtype_3d(data.dtype), tile_bytes
+    )
     layer._tile_max_bytes_3d = tile_bytes
     viewer.layers.append(layer)
     # Slice off the main thread: refreshes materialize the visible tile

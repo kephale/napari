@@ -5,6 +5,7 @@ import numpy as np
 import numpy.testing as npt
 import pytest
 
+pytest.importorskip('lodstone', reason='requires the progressive extra')
 qtpy = pytest.importorskip('qtpy', reason='requires Qt backend')
 
 from napari.experimental._tests.test_progressive_loading import (  # noqa: E402

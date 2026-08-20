@@ -2,7 +2,12 @@
 
 import pytest
 
-from napari.experimental import _progressive_loading
+try:
+    from napari.experimental import _progressive_loading
+except ModuleNotFoundError as error:
+    if error.name != 'lodstone':
+        raise
+    _progressive_loading = None
 
 
 @pytest.fixture(autouse=True)
@@ -17,8 +22,9 @@ def _no_progress_bars(monkeypatch):
     does matter is tested with an injected fake bar (see
     ``test_progress_updates_deferred``).
     """
-    monkeypatch.setattr(
-        _progressive_loading.ProgressiveLoader,
-        '_make_progress',
-        lambda self, total, description: None,
-    )
+    if _progressive_loading is not None:
+        monkeypatch.setattr(
+            _progressive_loading.ProgressiveLoader,
+            '_make_progress',
+            lambda self, total, description: None,
+        )

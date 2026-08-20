@@ -1,3 +1,6 @@
+from collections.abc import Sequence
+from typing import Any
+
 import numpy as np
 from vispy.scene.visuals import Volume as BaseVolume
 from vispy.visuals.shaders import Function
@@ -347,8 +350,8 @@ class Volume(TextureMixin, BaseVolume):
         super().__init__(*args, **kwargs)
         self.unfreeze()
         self._clipmap_enabled = False
-        self._clipmap_shape = None
-        self._overview_texture = None
+        self._clipmap_shape: tuple[int, ...] | None = None
+        self._overview_texture: Any | None = None
         self._clipmap_lookup = None
         self._clipmap_detail_bounds = None
         self.clamp_at_border = False
@@ -359,7 +362,9 @@ class Volume(TextureMixin, BaseVolume):
     def clipmap_enabled(self) -> bool:
         return self._clipmap_enabled
 
-    def enable_clipmap(self, overview: np.ndarray, full_shape) -> None:
+    def enable_clipmap(
+        self, overview: np.ndarray, full_shape: Sequence[int]
+    ) -> None:
         """Use ``overview`` outside the movable detail texture bounds."""
         overview = np.ascontiguousarray(overview)
         self.unfreeze()
@@ -385,7 +390,12 @@ class Volume(TextureMixin, BaseVolume):
         self._need_interpolation_update = True
         self.update()
 
-    def set_clipmap_detail_bounds(self, low, high, scale=None) -> None:
+    def set_clipmap_detail_bounds(
+        self,
+        low: Sequence[float],
+        high: Sequence[float],
+        scale: float | Sequence[float] | None = None,
+    ) -> None:
         """Set detail bounds in normalized full-volume xyz coordinates."""
         if not self._clipmap_enabled or self._clipmap_lookup is None:
             return
@@ -400,7 +410,9 @@ class Volume(TextureMixin, BaseVolume):
         self.set_clipmap_geometry()
 
     def _set_clipmap_detail_bounds_normalized(
-        self, detail_min, detail_max
+        self,
+        detail_min: Sequence[float],
+        detail_max: Sequence[float],
     ) -> None:
         """Apply already-normalized bounds without changing geometry."""
         if not self._clipmap_enabled or self._clipmap_lookup is None:
@@ -411,7 +423,9 @@ class Volume(TextureMixin, BaseVolume):
         self._clipmap_lookup['detail_max'] = detail_max
         self._clipmap_detail_bounds = (detail_min, detail_max)
 
-    def set_overview_data(self, data: np.ndarray, offset=(0, 0, 0)) -> None:
+    def set_overview_data(
+        self, data: np.ndarray, offset: Sequence[int] = (0, 0, 0)
+    ) -> None:
         """Patch the persistent coarse texture."""
         if not self._clipmap_enabled or self._overview_texture is None:
             return
@@ -433,7 +447,7 @@ class Volume(TextureMixin, BaseVolume):
             return
         shape = self._clipmap_shape
         self.shared_program['u_shape'] = (shape[2], shape[1], shape[0])
-        if self._vol_shape != shape:
+        if getattr(self, '_vol_shape', None) != shape:
             self._vol_shape = shape
             self._need_vertex_update = True
         self.update()
@@ -455,7 +469,7 @@ class Volume(TextureMixin, BaseVolume):
 
     def _build_interpolation(self) -> None:
         super()._build_interpolation()
-        if self._clipmap_enabled:
+        if self._clipmap_enabled and self._overview_texture is not None:
             self._overview_texture.interpolation = self._texture.interpolation
             self._install_clipmap_lookup()
 

@@ -4,6 +4,9 @@ from types import SimpleNamespace
 
 import dask.array as da
 import numpy as np
+import pytest
+
+pytest.importorskip('lodstone', reason='requires the progressive extra')
 from lodstone import Plan, Region, TileKey, Update
 
 from napari.experimental._lodstone_loading import (
@@ -13,10 +16,22 @@ from napari.experimental._lodstone_loading import (
     _camera_view,
     _level_transforms,
     _NapariTarget,
+    _QtDispatcher,
     add_lodstone_level_diagnostics,
     add_lodstone_loading_image,
     add_lodstone_loading_labels,
 )
+
+
+def test_qt_dispatcher_tolerates_teardown_before_delivery(qtbot) -> None:
+    from qtpy.QtCore import QCoreApplication, QEvent
+
+    dispatcher = _QtDispatcher()
+    dispatcher.deleteLater()
+    QCoreApplication.sendPostedEvents(dispatcher, QEvent.Type.DeferredDelete)
+
+    # A late Stream.close() status callback becomes a harmless no-op.
+    dispatcher.dispatch(lambda: None)
 
 
 class _VirtualData:
@@ -237,10 +252,14 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
         )
         assert loader._submitted_plan is not None
         _assert_submitted_uses_selected_geometry(loader)
-        assert {tile.level for tile in loader._submitted_plan.wanted} <= {
-            comparison.napari.target_level,
-            loader._resident_level,
-        }
+        # Coarse-prefilled clipmap pages refine through every available
+        # intermediate level instead of waiting for one atomic fine page.
+        assert {tile.level for tile in loader._submitted_plan.wanted} <= set(
+            range(
+                comparison.napari.target_level,
+                loader._resident_level + 1,
+            )
+        )
 
         comparison_count = len(loader.plan_comparisons)
         viewer.scene.camera.angles = (25, 35, 10)
@@ -358,6 +377,7 @@ def test_lodstone_volume_keeps_full_coarse_clipmap(
         node = visual._layer_node.get_node(3)
 
         assert node.clipmap_enabled
+        assert loader._has_clipmap_overview()
         assert node._vol_shape == base.shape
         assert tuple(node._overview_texture.shape[:3]) == arrays[-1].shape
         detail_extent = layer.corner_pixels[1] - layer.corner_pixels[0] + 1

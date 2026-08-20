@@ -50,6 +50,7 @@ import dask.array as da
 import numpy as np
 import pytest
 
+pytest.importorskip('lodstone', reason='requires the progressive extra')
 qtpy = pytest.importorskip('qtpy', reason='requires Qt backend')
 
 pytestmark = [

@@ -37,6 +37,8 @@ import time
 import numpy as np
 import pytest
 
+pytest.importorskip('lodstone', reason='requires the progressive extra')
+
 pytest.importorskip('qtpy', reason='requires Qt backend')
 pytest.importorskip('zarr', reason='requires zarr for generative data')
 

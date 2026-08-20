@@ -71,6 +71,7 @@ def _remote(
     zarr_format=None,
     name=None,
     transform=None,
+    fixed_index=None,
 ):
     return {
         'description': description,
@@ -85,6 +86,7 @@ def _remote(
                 'zarr_format': zarr_format,
                 'name': name,
                 'transform': transform,
+                'fixed_index': fixed_index,
             }
         ],
     }
@@ -125,6 +127,8 @@ PRESETS = {
         'single-objective/ZSNS002.ome.zarr/',
         levels=4,
         contrast=(0, 1000),
+        threed=True,
+        fixed_index={'t': 0, 'c': 0},
         name='Zebrahub ZSNS002',
     ),
     'hela': _remote(
@@ -336,6 +340,7 @@ def _open_layer(spec, arguments, cache_bytes):
         cache_bytes=cache_bytes,
         zarr_format=arguments.zarr_format or spec.get('zarr_format'),
         squeeze=not arguments.no_squeeze,
+        fixed_index=spec.get('fixed_index'),
     )
     if spec.get('transform') == 'channels-first-rgb':
         import dask.array as da

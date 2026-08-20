@@ -196,7 +196,13 @@ class _QtDispatcher(QObject):
         callback()
 
     def dispatch(self, callback) -> None:
-        self.requested.emit(callback)
+        try:
+            self.requested.emit(callback)
+        except RuntimeError:
+            # Qt may destroy the dispatcher before a late Stream.close()
+            # status delivery during application teardown. There is no
+            # event loop left to receive the callback in that state.
+            LOGGER.debug('dropping callback after Qt dispatcher teardown')
 
 
 class _WorkerProxy:
@@ -339,7 +345,9 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             workers=self._fetch_workers,
             bytes_per_second=self._max_bytes_per_second,
         )
-        self._lodstone_stream.on_status_changed(self._on_lodstone_status)
+        self._disconnect_lodstone_status = (
+            self._lodstone_stream.on_status_changed(self._on_lodstone_status)
+        )
         self._lodstone_enabled = True
         self._check()
 
@@ -423,9 +431,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             desired_stages,
             target_level=target,
             available=available,
-            fetch_levels={target}
-            if self._uses_atomic_clipmap_page()
-            else None,
+            fetch_levels=None,
         )
         plan_source = 'napari-fallback'
         shared = self._shared_planners[len(view.displayed_axes)].plan(
@@ -454,7 +460,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
                 target_level=target,
                 target_region=Region(active_min, active_max),
                 available=available,
-                fetch_intermediate=not self._uses_atomic_clipmap_page(),
+                fetch_intermediate=True,
             )
             bounded_comparison = PlanComparison(
                 view,
@@ -679,6 +685,9 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         stream = self._lodstone_stream
         self._lodstone_stream = None
         self._lodstone_enabled = False
+        disconnect_status = self._disconnect_lodstone_status
+        self._disconnect_lodstone_status = lambda: None
+        disconnect_status()
         # Disconnect viewer callbacks and mark the loader closed before
         # shutting down the stream. Stream cancellation can deliver queued
         # Qt work, which must not be allowed to start another fetch pass.

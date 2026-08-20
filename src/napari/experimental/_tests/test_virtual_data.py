@@ -1,5 +1,8 @@
 import dask.array as da
 import numpy as np
+import pytest
+
+pytest.importorskip('lodstone', reason='requires the progressive extra')
 
 from napari.experimental._virtual_data import (
     MultiScaleVirtualData,
