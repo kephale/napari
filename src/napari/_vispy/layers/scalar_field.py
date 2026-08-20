@@ -157,8 +157,8 @@ class VispyScalarFieldBaseLayer(VispyBaseLayer[ScalarFieldBase]):
                 displayed
             ]
             node.set_clipmap_detail_bounds(
-                corners[0, displayed],
-                corners[1, displayed] + 1,
+                corners[0, displayed].tolist(),
+                (corners[1, displayed] + 1).tolist(),
                 scale=scale,
             )
 

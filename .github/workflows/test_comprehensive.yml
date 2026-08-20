@@ -111,6 +111,10 @@ jobs:
     uses: napari/shared-workflows/.github/workflows/upload_coverage.yml@main
     with:
       artifact-pattern: 'coverage reports*'
+      # Forks cannot provide the protected-branch Codecov token to the
+      # reusable workflow. Preserve the report while keeping authentication
+      # failures non-gating outside the canonical repository.
+      fail-on-coverage-error: ${{ github.repository == 'napari/napari' }}
 
   synchronize_bot_repository:
     name: Synchronize bot repository

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -217,6 +218,7 @@ class _NapariTarget:
     def __init__(self, loader: LodstoneProgressiveLoader) -> None:
         self.loader = loader
         self.generation = 0
+        self._prepare_lock = Lock()
         self.prepared_regions: dict[int, Region] = {}
 
     def layout(self, view, pyramid) -> Layout:
@@ -227,7 +229,8 @@ class _NapariTarget:
             max_axis_extent=self.loader._gl_max_texture_size_2d,
         )
 
-    def prepare(self, view, plan) -> None:
+    def stage_prepare(self, view, plan) -> dict[int, Region]:
+        """Compute pass intervals on Lodstone's runtime thread."""
         bounds: dict[int, tuple[list[int], list[int]]] = {}
         for tile in plan.desired:
             if tile.level not in bounds:
@@ -240,17 +243,25 @@ class _NapariTarget:
             for axis in range(tile.region.ndim):
                 start[axis] = min(start[axis], tile.region.start[axis])
                 stop[axis] = max(stop[axis], tile.region.stop[axis])
-        self.prepared_regions = {
+        return {
             level: Region(tuple(start), tuple(stop))
             for level, (start, stop) in bounds.items()
         }
 
+    def prepare(self, view, plan, prepared=None) -> None:
+        if prepared is None:
+            prepared = self.stage_prepare(view, plan)
+        with self._prepare_lock:
+            self.prepared_regions = prepared
+
     def stage(self, updates):
         """Write and pack chunks on Lodstone's worker thread."""
+        with self._prepare_lock:
+            prepared_regions = self.prepared_regions.copy()
         grouped: dict[int, list[tuple[slice, ...]]] = defaultdict(list)
         for update in updates:
             vdata = self.loader._data[update.level]
-            prepared = self.prepared_regions.get(update.level)
+            prepared = prepared_regions.get(update.level)
             if prepared is not None and not vdata.covers(
                 prepared.start, prepared.stop
             ):
