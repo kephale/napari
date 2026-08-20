@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict, deque
 from threading import Lock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from lodstone import (
@@ -50,6 +50,9 @@ from napari.experimental._virtual_data import (
     MultiScaleVirtualData,
     chunk_sizes_for,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 LOGGER = logging.getLogger(__name__)
 
@@ -126,6 +129,7 @@ def _camera_view(
     layer,
     shape: tuple[int, ...],
     depth_span: float,
+    depth_center: Sequence[float] | None = None,
 ) -> View:
     """Capture napari's orthographic camera as a Lodstone ``View``."""
     ndim = len(shape)
@@ -157,6 +161,13 @@ def _camera_view(
         right_direction = np.cross(up_direction, view_direction)
         right_direction /= max(np.linalg.norm(right_direction), 1e-12)
         rows = (up_direction, right_direction, view_direction)
+        projection_center = center
+        if depth_center is not None:
+            projection_center = np.asarray(depth_center, dtype=float)
+            if projection_center.shape != (3,) or not np.all(
+                np.isfinite(projection_center)
+            ):
+                projection_center = center
         scales = (
             2.0 * zoom / viewport[0],
             2.0 * zoom / viewport[1],
@@ -166,7 +177,8 @@ def _camera_view(
             zip(rows, scales, strict=True)
         ):
             matrix[row, :3] = direction * scale
-            matrix[row, 3] = -float(np.dot(direction, center)) * scale
+            row_center = center if row < 2 else projection_center
+            matrix[row, 3] = -float(np.dot(direction, row_center)) * scale
         eye = tuple(float(value) for value in center)
 
     index = tuple(None if axis in displayed else 0 for axis in range(ndim))
@@ -604,11 +616,17 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         world_extent = np.abs(transforms[:-1, :-1]) @ extent
         displayed = self._layer._slice_input.displayed
         depth_span = float(np.linalg.norm(np.take(world_extent, displayed)))
+        data_center = np.concatenate(
+            [np.asarray(self._data.shape, dtype=float) / 2.0, [1.0]]
+        )
+        world_center = (transforms @ data_center)[:-1]
+        depth_center = tuple(float(world_center[axis]) for axis in displayed)
         return _camera_view(
             self._viewer,
             self._layer,
             self._data.shape,
             depth_span,
+            depth_center,
         )
 
     @property

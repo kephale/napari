@@ -26,6 +26,7 @@ from napari.experimental._lodstone_loading import (  # noqa: E402
 )
 from napari.experimental._progressive_loading import (  # noqa: E402
     ProgressiveLoader,
+    _front_depth_segment,
     add_progressive_loading_image,
     chunk_priority_3D,
     chunk_slices,
@@ -59,6 +60,27 @@ def _wait_for_idle_loader(qtbot, loader, timeout=30000):
 
 
 # ---------- chunk geometry ----------
+
+
+@pytest.mark.parametrize(
+    ('direction', 'expected_center'),
+    [((1, 0, 0), (10, 50, 50)), ((-1, 0, 0), (90, 50, 50))],
+)
+def test_front_depth_segment_starts_at_camera_facing_surface(
+    direction,
+    expected_center,
+):
+    segment = _front_depth_segment(
+        np.array((50, 50, 50)),
+        np.array(direction),
+        np.array((100, 100, 100)),
+        length=20,
+    )
+
+    assert segment is not None
+    center, half = segment
+    np.testing.assert_allclose(center, expected_center)
+    assert half == 10
 
 
 def test_add_progressive_loading_image(

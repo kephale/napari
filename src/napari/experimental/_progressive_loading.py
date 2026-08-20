@@ -210,6 +210,53 @@ def distance_from_camera_center_line(points, camera) -> np.ndarray:
     return distances
 
 
+def _front_depth_segment(
+    center: np.ndarray,
+    direction: np.ndarray,
+    shape: np.ndarray,
+    length: float,
+) -> tuple[np.ndarray, float] | None:
+    """Center and half-length of a camera-facing ray segment in a box.
+
+    ``direction`` points from the camera into the scene. The returned
+    segment starts where the center ray enters the data and extends inward,
+    rather than straddling the orbit center. This keeps a bounded 3-D focus
+    texture on foreground data that can occlude its coarse context.
+    """
+    center = np.asarray(center, dtype=float)
+    direction = np.asarray(direction, dtype=float)
+    shape = np.asarray(shape, dtype=float)
+    if (
+        center.shape != direction.shape
+        or center.shape != shape.shape
+        or not np.all(np.isfinite(center))
+        or not np.all(np.isfinite(direction))
+        or not np.all(np.isfinite(shape))
+        or not np.isfinite(length)
+        or length <= 0
+    ):
+        return None
+
+    moving = np.abs(direction) >= 1e-12
+    if not np.any(moving):
+        return None
+    if np.any(~moving & ((center < 0) | (center > shape))):
+        return None
+
+    lower = np.full(center.shape, -np.inf, dtype=float)
+    upper = np.full(center.shape, np.inf, dtype=float)
+    lower[moving] = (0.0 - center[moving]) / direction[moving]
+    upper[moving] = (shape[moving] - center[moving]) / direction[moving]
+    enter = float(np.max(np.minimum(lower, upper)))
+    leave = float(np.min(np.maximum(lower, upper)))
+    if not np.isfinite(enter) or not np.isfinite(leave) or enter >= leave:
+        return None
+
+    stop = min(enter + length, leave)
+    half = (stop - enter) / 2.0
+    return center + (enter + half) * direction, half
+
+
 def _chunk_keys_product(
     chunk_keys: list[list[slice]],
 ) -> list[tuple[slice, ...]]:
@@ -1132,7 +1179,9 @@ class ProgressiveLoader:
         Sized from the canvas dimensions and zoom so 3D sub-volume tiles
         cover what is on screen rather than the whole memory budget.  In 3D
         this is the data-axis-aligned bound of the camera's oriented screen
-        plane, plus a smaller depth extent along the viewing ray.
+        plane, plus a bounded camera-facing depth segment along the viewing
+        ray. Anchoring depth at the front of the dataset prevents coarse
+        context voxels from occluding a fine tile centered farther back.
         """
         camera = self._viewer.scene.camera
         camera_center = np.asarray(camera.center, dtype=float)
@@ -1191,11 +1240,25 @@ class ProgressiveLoader:
                     )[list(displayed_axes)]
                     directions.append(data_direction)
                 up_data, right_data, view_data = directions
-                half_extent = (
-                    screen_half[1] * np.abs(up_data)
-                    + screen_half[0] * np.abs(right_data)
-                    + 0.35 * screen_radius * np.abs(view_data)
+                lateral_half_extent = screen_half[1] * np.abs(
+                    up_data
+                ) + screen_half[0] * np.abs(right_data)
+                depth_length = 0.7 * screen_radius
+                front = _front_depth_segment(
+                    center,
+                    view_data,
+                    np.take(np.asarray(self._data.shape), displayed_axes),
+                    depth_length,
                 )
+                if front is None:
+                    half_extent = lateral_half_extent + (
+                        0.5 * depth_length * np.abs(view_data)
+                    )
+                else:
+                    center, depth_half = front
+                    half_extent = lateral_half_extent + (
+                        depth_half * np.abs(view_data)
+                    )
             except Exception:  # noqa: BLE001
                 pass
         return np.stack([center - half_extent, center + half_extent])

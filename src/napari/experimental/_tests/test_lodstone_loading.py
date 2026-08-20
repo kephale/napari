@@ -156,13 +156,23 @@ def test_camera_view_captures_3d_orientation_and_hidden_index() -> None:
         world_to_data=lambda point: point,
     )
 
-    view = _camera_view(viewer, layer, (10, 20, 30, 40), depth_span=80)
+    view = _camera_view(
+        viewer,
+        layer,
+        (10, 20, 30, 40),
+        depth_span=80,
+        depth_center=(10, 15, 20),
+    )
 
     assert view.index == (9, None, None, None)
     np.testing.assert_allclose(
         view.world_to_clip @ np.array([8, 16, 24, 1]),
-        (0, 0, 0, 1),
+        (0, 0, 0.05, 1),
     )
+    # Depth clipping is centered on the data, not the orbit point. This
+    # keeps a panned foreground slab from falling outside the synthetic
+    # Lodstone frustum while napari still renders it.
+    assert (view.world_to_clip @ np.array([20, 15, 20, 1]))[2] == -0.25
     # Moving with the view direction moves from the camera into the scene.
     assert (view.world_to_clip @ np.array([7, 16, 24, 1]))[2] > 0
 
