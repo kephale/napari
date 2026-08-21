@@ -229,6 +229,11 @@ def test_real_fetch_pass_records_napari_and_lodstone_plans(
         assert diagnostics.wanted_tiles == len(comparison.napari.wanted)
         assert diagnostics.unique_native_chunks > 0
         assert diagnostics.source_reads > 0
+        assert loader._lodstone_stream.batch_size == 1
+        assert loader._lodstone_stream.cpu_cache_limit == max(
+            loader._interval_max_bytes,
+            loader._resident_max_bytes,
+        )
 
         comparison_count = len(loader.plan_comparisons)
         viewer.scene.camera.center = (16, 48)
@@ -489,6 +494,7 @@ def test_level_diagnostic_layer_marks_loaded_blocks_by_source_level(
             'L2': 'orange',
         }
         assert loader._debug_overlay is not None
+        assert layer.dtype == base.dtype
         assert all(
             vdata.fill_value == MISSING_LEVEL_LABEL for vdata in loader._data
         )

@@ -1154,6 +1154,18 @@ class ProgressiveLoader:
                 extent = np.minimum(extent, wanted.astype(np.int64))
             texture_itemsize = _texture_dtype_3d(vdata.dtype).itemsize
             nbytes = np.prod(extent, dtype=np.int64) * texture_itemsize
+            # ``interval_max_bytes`` bounds CPU residency, but the visible
+            # texture page must also fit the much smaller interaction-tuned
+            # GPU tile budget.  Selecting a finer level whose viewport page
+            # is hundreds of MiB makes its atomic upload take tens of seconds;
+            # the coarse front remains visible and the level appears not to
+            # refine.  Stay coarse until zoom makes the finer page genuinely
+            # presentable.  One quantum of rounding slack is already reflected
+            # by the computed extent, so compare its actual bytes directly.
+            texture_budget = min(
+                self._interval_max_bytes,
+                int(self._layer._tile_max_bytes_3d),
+            )
             display_shape = tuple(int(vdata.shape[axis]) for axis in displayed)
             display_chunks = tuple(
                 chunk_sizes_for(vdata)[axis] for axis in displayed
@@ -1167,7 +1179,7 @@ class ProgressiveLoader:
                 display_chunks,
             )
             if (
-                nbytes <= self._interval_max_bytes
+                nbytes <= texture_budget
                 and n_chunks <= self._max_chunks_per_pass
             ):
                 return level

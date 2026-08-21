@@ -62,6 +62,7 @@ LEVEL_LABEL_OFFSET = 2
 _RUNTIME_LOCK = Lock()
 _RUNTIME_ATTRIBUTE = '_lodstone_runtime'
 _RUNTIME_REFS_ATTRIBUTE = '_lodstone_runtime_refs'
+LODSTONE_GPU_BATCH_SIZE = 1
 
 
 def _acquire_viewer_runtime(viewer) -> Runtime:
@@ -88,6 +89,8 @@ def _release_viewer_runtime(viewer, runtime: Runtime) -> None:
         runtime.close()
         delattr(viewer, _RUNTIME_ATTRIBUTE)
         delattr(viewer, _RUNTIME_REFS_ATTRIBUTE)
+
+
 LEVEL_DIAGNOSTIC_COLORS = (
     '#28d34f',  # L0: green
     '#f5d90a',  # L1: yellow
@@ -400,6 +403,20 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
                 self._lodstone_target,
                 dispatch=self._lodstone_dispatcher.dispatch,
                 workers=self._fetch_workers,
+                # A decoded ZebraHub chunk is roughly 32 MiB.  Core's
+                # throughput-oriented default of eight tiles can therefore
+                # create a 256+ MiB contiguous upload block and one equally
+                # large Qt delivery.  GPU targets need latency-oriented
+                # delivery: one independently presentable brick at a time.
+                batch_size=LODSTONE_GPU_BATCH_SIZE,
+                # The movable interval already bounds napari's CPU working
+                # set.  Do not retain a second, multi-gigabyte decoded cache
+                # behind it merely because Stream's viewer-neutral default is
+                # sized for reuse-heavy non-GPU consumers.
+                cpu_cache=max(
+                    self._interval_max_bytes,
+                    self._resident_max_bytes,
+                ),
                 bytes_per_second=self._max_bytes_per_second,
                 runtime=runtime,
             )
@@ -689,6 +706,28 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             diagnostics = stream.diagnostics
             if diagnostics.generation == status.generation:
                 self._record_execution_diagnostics(diagnostics, status.state)
+                node = self._get_volume_node()
+                if node is not None and node.clipmap_enabled:
+                    LOGGER.info(
+                        'Lodstone clipmap trace: level=%d active=%s '
+                        'corners=%s texture_shape=%s detail_bounds=%s',
+                        self._layer.data_level,
+                        self._active,
+                        self._layer.corner_pixels.tolist(),
+                        tuple(node._texture.shape[:3]),
+                        node._clipmap_detail_bounds,
+                    )
+                    LOGGER.info(
+                        'Lodstone tile budget trace: dtype=%s '
+                        'tile_bytes=%s interval_bytes=%s extent_cap=%s '
+                        'camera_center=%s view_direction=%s',
+                        self._layer.dtype,
+                        self._layer._tile_max_bytes_3d,
+                        self._layer._interval_max_bytes_3d,
+                        self._layer._max_tile_extent_3d,
+                        self._viewer.scene.camera.center,
+                        self._viewer.scene.camera.view_direction,
+                    )
         if status.state == 'failed':
             LOGGER.error(
                 'Lodstone progressive pass failed: %s',
@@ -845,7 +884,12 @@ def add_lodstone_level_diagnostics(
     L0, L1, and subsequent pyramid levels using stable distinct colors.
     """
     diagnostic_arrays = [
-        _LevelDiagnosticArray(array, level)
+        # Preserve the source dtype so this diagnostic exercises the same
+        # texture allocation and tiling decisions as the real image.  The
+        # generic wrapper defaults to uint8, which can make a 295 MiB level
+        # appear to fit while the corresponding uint16 image becomes a
+        # 1.18 GiB float32 texture in vispy.
+        _LevelDiagnosticArray(array, level, dtype=array.dtype)
         for level, array in enumerate(arrays)
     ]
     metadata = dict(kwargs.pop('metadata', {}))

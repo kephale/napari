@@ -794,6 +794,33 @@ def test_locked_tile_hysteresis(
     assert layer._locked_tile_moved(far, displayed)
 
 
+@pytest.mark.parametrize(
+    ('direction', 'expected'),
+    [((1, 0, 0), (0, 31)), ((-1, 0, 0), (32, 63))],
+)
+def test_locked_tile_anchors_to_camera_facing_surface(
+    make_napari_viewer,
+    multiscale_3d_arrays,
+    direction,
+    expected,
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = viewer.add_image(list(multiscale_3d_arrays), multiscale=True)
+    layer._max_tile_extent_3d = 32
+    layer._tile_max_bytes_3d = None
+    displayed = list(layer._slice_input.displayed)
+
+    corners = layer._corners_for_locked_level(
+        0,
+        displayed,
+        np.array([[32, 32, 32]] * 2),
+        direction,
+    )
+
+    assert tuple(corners[:, displayed[0]]) == expected
+
+
 def test_progressive_loading_3d_subvolume_tile(
     qtbot,
     make_napari_viewer,

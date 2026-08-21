@@ -820,6 +820,26 @@ class ScalarFieldBase(Layer, ABC):
             0,
             shape_at_level - tile_extent,
         )
+        # A coarse clipmap supplies context outside this bounded page.  If
+        # the page remains centered through the volume, coarse samples in
+        # front of it dominate attenuated/MIP and categorical raycasts, so
+        # successfully loaded fine data still looks coarse.  Anchor the page
+        # at the camera-facing surface along the dominant viewing axis.  The
+        # other axes remain centered on the viewport, preserving pan and
+        # rotated-footprint coverage.
+        if view_direction is not None:
+            direction = np.asarray(view_direction, dtype=float)
+            if direction.shape == shape_at_level.shape and np.all(
+                np.isfinite(direction)
+            ):
+                depth_axis = int(np.argmax(np.abs(direction)))
+                if abs(direction[depth_axis]) >= 1e-12:
+                    low[depth_axis] = (
+                        0
+                        if direction[depth_axis] > 0
+                        else shape_at_level[depth_axis]
+                        - tile_extent[depth_axis]
+                    )
         high = low + tile_extent
         corners[0, displayed_axes] = low
         corners[1, displayed_axes] = high - 1
