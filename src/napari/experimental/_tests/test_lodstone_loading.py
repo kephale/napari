@@ -13,14 +13,30 @@ from napari.experimental._lodstone_loading import (
     LEVEL_LABEL_OFFSET,
     MISSING_LEVEL_LABEL,
     PlanTrace,
+    _acquire_viewer_runtime,
     _camera_view,
     _level_transforms,
     _NapariTarget,
     _QtDispatcher,
+    _release_viewer_runtime,
     add_lodstone_level_diagnostics,
     add_lodstone_loading_image,
     add_lodstone_loading_labels,
 )
+
+
+def test_viewer_layers_share_lodstone_runtime() -> None:
+    viewer = SimpleNamespace()
+
+    first = _acquire_viewer_runtime(viewer)
+    second = _acquire_viewer_runtime(viewer)
+
+    assert first is second
+    _release_viewer_runtime(viewer, first)
+    assert not first.closed
+    _release_viewer_runtime(viewer, second)
+    assert first.closed
+    assert not hasattr(viewer, '_lodstone_runtime')
 
 
 def test_qt_dispatcher_tolerates_teardown_before_delivery(qtbot) -> None:

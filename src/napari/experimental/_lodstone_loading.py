@@ -23,6 +23,7 @@ from lodstone import (
     Planner,
     PlanTrace,
     Region,
+    Runtime,
     Stream,
     StreamDiagnostics,
     TileKey,
@@ -58,6 +59,35 @@ LOGGER = logging.getLogger(__name__)
 
 MISSING_LEVEL_LABEL = 1
 LEVEL_LABEL_OFFSET = 2
+_RUNTIME_LOCK = Lock()
+_RUNTIME_ATTRIBUTE = '_lodstone_runtime'
+_RUNTIME_REFS_ATTRIBUTE = '_lodstone_runtime_refs'
+
+
+def _acquire_viewer_runtime(viewer) -> Runtime:
+    """Share bounded Lodstone scheduling resources across viewer layers."""
+    with _RUNTIME_LOCK:
+        runtime = getattr(viewer, _RUNTIME_ATTRIBUTE, None)
+        if runtime is None or runtime.closed:
+            runtime = Runtime(compute_workers=2)
+            setattr(viewer, _RUNTIME_ATTRIBUTE, runtime)
+            setattr(viewer, _RUNTIME_REFS_ATTRIBUTE, 0)
+        refs = int(getattr(viewer, _RUNTIME_REFS_ATTRIBUTE, 0)) + 1
+        setattr(viewer, _RUNTIME_REFS_ATTRIBUTE, refs)
+        return runtime
+
+
+def _release_viewer_runtime(viewer, runtime: Runtime) -> None:
+    with _RUNTIME_LOCK:
+        if getattr(viewer, _RUNTIME_ATTRIBUTE, None) is not runtime:
+            return
+        refs = max(0, int(getattr(viewer, _RUNTIME_REFS_ATTRIBUTE, 1)) - 1)
+        if refs:
+            setattr(viewer, _RUNTIME_REFS_ATTRIBUTE, refs)
+            return
+        runtime.close()
+        delattr(viewer, _RUNTIME_ATTRIBUTE)
+        delattr(viewer, _RUNTIME_REFS_ATTRIBUTE)
 LEVEL_DIAGNOSTIC_COLORS = (
     '#28d34f',  # L0: green
     '#f5d90a',  # L1: yellow
@@ -333,6 +363,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
     def __init__(self, viewer, layer, data, **kwargs) -> None:
         self._lodstone_enabled = False
         self._lodstone_stream: Stream | None = None
+        self._lodstone_runtime: Runtime | None = None
         lod_bias = float(kwargs.get('max_pixel_size_3d', 2.0))
         kwargs['_start_immediately'] = False
         super().__init__(viewer, layer, data, **kwargs)
@@ -361,13 +392,21 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         self._lodstone_dispatcher = _QtDispatcher()
         self._submitted_plan: Plan | None = None
         self._lodstone_target = _NapariTarget(self)
-        self._lodstone_stream = Stream(
-            source,
-            self._lodstone_target,
-            dispatch=self._lodstone_dispatcher.dispatch,
-            workers=self._fetch_workers,
-            bytes_per_second=self._max_bytes_per_second,
-        )
+        runtime = _acquire_viewer_runtime(viewer)
+        self._lodstone_runtime = runtime
+        try:
+            self._lodstone_stream = Stream(
+                source,
+                self._lodstone_target,
+                dispatch=self._lodstone_dispatcher.dispatch,
+                workers=self._fetch_workers,
+                bytes_per_second=self._max_bytes_per_second,
+                runtime=runtime,
+            )
+        except Exception:
+            self._lodstone_runtime = None
+            _release_viewer_runtime(viewer, runtime)
+            raise
         self._disconnect_lodstone_status = (
             self._lodstone_stream.on_status_changed(self._on_lodstone_status)
         )
@@ -724,6 +763,10 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         if stream is not None:
             stream.close()
             self._record_execution_diagnostics(stream.diagnostics, 'closed')
+        runtime = self._lodstone_runtime
+        self._lodstone_runtime = None
+        if runtime is not None:
+            _release_viewer_runtime(self._viewer, runtime)
 
 
 def add_lodstone_loading_image(
