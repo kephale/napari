@@ -125,7 +125,7 @@ optional-base = [
     "rapidfuzz>=3",  # fuzzy search in command palette
 ]
 progressive = [
-    "lodstone @ git+https://github.com/kephale/lodstone@3b773af4bb8089671b352cfa83aab9a3d69f4b7e",
+    "lodstone @ git+https://github.com/kephale/lodstone@c8e5f88dcd5ad175fb6e2569dcc1aa672c9099f4",
 ]
 optional-numba = [
     "numba>=0.58.0,<=0.62.1 ; platform_system == 'Darwin' and platform_machine == 'x86_64'",
