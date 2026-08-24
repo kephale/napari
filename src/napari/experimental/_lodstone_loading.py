@@ -272,6 +272,11 @@ class _NapariTarget:
             memory_limit=self.loader._interval_max_bytes,
             squeeze_hidden=False,
             max_axis_extent=self.loader._gl_max_texture_size_2d,
+            # Match volume refinement to the crosshair instead of exhausting
+            # each near depth slab before reaching central interior content.
+            focus_depth_weight=(
+                0.5 if len(view.displayed_axes) == 3 else None
+            ),
         )
 
     def stage_prepare(self, view, plan) -> dict[int, Region]:
