@@ -277,6 +277,9 @@ class _NapariTarget:
             focus_depth_weight=(
                 0.5 if len(view.displayed_axes) == 3 else None
             ),
+            focus_depth_target=(
+                0.5 if len(view.displayed_axes) == 3 else None
+            ),
         )
 
     def stage_prepare(self, view, plan) -> dict[int, Region]:

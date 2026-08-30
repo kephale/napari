@@ -282,6 +282,12 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
             ).focus_depth_weight
             == 0.5
         )
+        assert (
+            loader._lodstone_target.layout(
+                comparison.view, loader._lodstone_source.pyramid
+            ).focus_depth_target
+            == 0.5
+        )
         bounded = loader.bounded_plan_comparisons[-1]
         assert bounded.geometry_matches
         assert (
