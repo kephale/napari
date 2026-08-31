@@ -1,4 +1,9 @@
+from collections.abc import Sequence
+from typing import Any
+
+import numpy as np
 from vispy.scene.visuals import Volume as BaseVolume
+from vispy.visuals.shaders import Function
 
 from napari._vispy.visuals.util import TextureMixin
 from napari.layers.labels._labels_constants import IsoCategoricalGradientMode
@@ -319,6 +324,21 @@ rendering_methods['iso_categorical'] = ISO_CATEGORICAL_SNIPPETS
 rendering_methods['translucent_categorical'] = TRANSLUCENT_CATEGORICAL_SNIPPETS
 
 
+CLIPMAP_LOOKUP = """
+vec4 clipmap_lookup(vec3 texcoord) {
+    bool in_detail = all(greaterThanEqual(texcoord, $detail_min))
+        && all(lessThan(texcoord, $detail_max));
+    if (in_detail) {
+        vec3 span = max($detail_max - $detail_min, vec3(1e-12));
+        return texture3D(
+            $detail_texture, (texcoord - $detail_min) / span
+        );
+    }
+    return texture3D($overview_texture, texcoord);
+}
+"""
+
+
 class Volume(TextureMixin, BaseVolume):
     """This class extends the vispy Volume visual to add categorical isosurface rendering."""
 
@@ -329,9 +349,129 @@ class Volume(TextureMixin, BaseVolume):
     def __init__(self, *args, **kwargs) -> None:  # type: ignore [no-untyped-def]
         super().__init__(*args, **kwargs)
         self.unfreeze()
+        self._clipmap_enabled = False
+        self._clipmap_shape: tuple[int, ...] | None = None
+        self._overview_texture: Any | None = None
+        self._clipmap_lookup = None
+        self._clipmap_detail_bounds = None
         self.clamp_at_border = False
         self.iso_gradient_mode = IsoCategoricalGradientMode.FAST.value
         self.freeze()
+
+    @property
+    def clipmap_enabled(self) -> bool:
+        return self._clipmap_enabled
+
+    def enable_clipmap(
+        self, overview: np.ndarray, full_shape: Sequence[int]
+    ) -> None:
+        """Use ``overview`` outside the movable detail texture bounds."""
+        overview = np.ascontiguousarray(overview)
+        self.unfreeze()
+        self._overview_texture = self._create_texture(
+            self.texture_format, overview
+        )
+        self._overview_texture.set_clim(self._texture.clim)
+        self._overview_texture.scale_and_set_data(overview, copy=False)
+        self._clipmap_shape = tuple(int(value) for value in full_shape)
+        self._clipmap_enabled = True
+        self.freeze()
+        self._install_clipmap_lookup()
+        self.set_clipmap_geometry()
+
+    def disable_clipmap(self) -> None:
+        self.unfreeze()
+        self._clipmap_enabled = False
+        self._clipmap_shape = None
+        self._overview_texture = None
+        self._clipmap_lookup = None
+        self._clipmap_detail_bounds = None
+        self.freeze()
+        self._need_interpolation_update = True
+        self.update()
+
+    def set_clipmap_detail_bounds(
+        self,
+        low: Sequence[float],
+        high: Sequence[float],
+        scale: float | Sequence[float] | None = None,
+    ) -> None:
+        """Set detail bounds in normalized full-volume xyz coordinates."""
+        if not self._clipmap_enabled or self._clipmap_lookup is None:
+            return
+        if scale is None:
+            scale = 1
+        shape = np.asarray(self._clipmap_shape, dtype=float)[::-1]
+        detail_min = np.asarray(low, dtype=float) * np.asarray(scale)
+        detail_max = np.asarray(high, dtype=float) * np.asarray(scale)
+        detail_min = tuple(detail_min[::-1] / shape)
+        detail_max = tuple(detail_max[::-1] / shape)
+        self._set_clipmap_detail_bounds_normalized(detail_min, detail_max)
+        self.set_clipmap_geometry()
+
+    def _set_clipmap_detail_bounds_normalized(
+        self,
+        detail_min: Sequence[float],
+        detail_max: Sequence[float],
+    ) -> None:
+        """Apply already-normalized bounds without changing geometry."""
+        if not self._clipmap_enabled or self._clipmap_lookup is None:
+            return
+        detail_min = tuple(float(value) for value in detail_min)
+        detail_max = tuple(float(value) for value in detail_max)
+        self._clipmap_lookup['detail_min'] = detail_min
+        self._clipmap_lookup['detail_max'] = detail_max
+        self._clipmap_detail_bounds = (detail_min, detail_max)
+
+    def set_overview_data(
+        self, data: np.ndarray, offset: Sequence[int] = (0, 0, 0)
+    ) -> None:
+        """Patch the persistent coarse texture."""
+        if not self._clipmap_enabled or self._overview_texture is None:
+            return
+        data = np.ascontiguousarray(data)
+        texture_dtype = getattr(self._overview_texture, '_data_dtype', None)
+        if texture_dtype is not None and data.dtype != texture_dtype:
+            data = data.astype(texture_dtype)
+        self._overview_texture.set_data(data, offset=tuple(offset))
+        self.update()
+
+    def rebind_clipmap_detail_texture(self) -> None:
+        """Point the clipmap lookup at the currently presented detail."""
+        if self._clipmap_lookup is not None:
+            self._clipmap_lookup['detail_texture'] = self._texture
+
+    def set_clipmap_geometry(self) -> None:
+        """Keep the ray box in full-resolution level-zero coordinates."""
+        if not self._clipmap_enabled or self._clipmap_shape is None:
+            return
+        shape = self._clipmap_shape
+        self.shared_program['u_shape'] = (shape[2], shape[1], shape[0])
+        if getattr(self, '_vol_shape', None) != shape:
+            self._vol_shape = shape
+            self._need_vertex_update = True
+        self.update()
+
+    def _install_clipmap_lookup(self) -> None:
+        if not self._clipmap_enabled or self._overview_texture is None:
+            return
+        lookup = Function(CLIPMAP_LOOKUP)
+        lookup['detail_texture'] = self._texture
+        lookup['overview_texture'] = self._overview_texture
+        detail_min, detail_max = self._clipmap_detail_bounds or (
+            (0.0, 0.0, 0.0),
+            (1.0, 1.0, 1.0),
+        )
+        lookup['detail_min'] = detail_min
+        lookup['detail_max'] = detail_max
+        self._clipmap_lookup = lookup
+        self.shared_program.frag['get_data'] = lookup
+
+    def _build_interpolation(self) -> None:
+        super()._build_interpolation()
+        if self._clipmap_enabled and self._overview_texture is not None:
+            self._overview_texture.interpolation = self._texture.interpolation
+            self._install_clipmap_lookup()
 
     @property
     def iso_gradient_mode(self) -> str:

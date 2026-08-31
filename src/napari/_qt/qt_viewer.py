@@ -231,6 +231,14 @@ class QtViewer(QSplitter):
 
         self.viewer.layers.events.inserted.connect(self._on_add_layer_change)
 
+        # experimental: stream new multiscale layers progressively when
+        # the setting is enabled (Preferences > Experimental)
+        from napari.experimental._auto_progressive import (
+            connect_viewer as _connect_progressive_loading,
+        )
+
+        _connect_progressive_loading(self.viewer)
+
         self.setAcceptDrops(True)
 
         # Create the experimental QtPool for the monitor.
@@ -333,6 +341,7 @@ class QtViewer(QSplitter):
             layerListLayout.addWidget(self.viewerButtons)
             layerListLayout.setContentsMargins(8, 4, 8, 6)
             layerList.setLayout(layerListLayout)
+            prev_policy = layerList.sizePolicy()
             self._dockLayerList = QtViewerDockWidget(
                 self,
                 layerList,
@@ -342,6 +351,9 @@ class QtViewer(QSplitter):
                 object_name='layer list',
                 close_btn=False,
             )
+            # restore policy to avoid empty space below buttons
+            # See https://github.com/napari/napari/pull/9447
+            layerList.setSizePolicy(prev_policy)
         return self._dockLayerList
 
     @property

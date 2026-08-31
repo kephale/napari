@@ -1,5 +1,4 @@
 from enum import StrEnum
-from typing import Any
 
 from pydantic import AliasChoices, Field
 
@@ -28,9 +27,8 @@ class PaletteFuzzySearch(StrEnum):
 # this class inherits from EventedSettings instead of EventedModel because
 # it uses Field(validation_alias=...) for some of its attributes
 class ExperimentalSettings(EventedSettings):
-    def __init__(self, **data: dict[str, Any]):
-        super().__init__(**data)
-
+    def _connect_events(self) -> None:
+        """Connects the events for the triangulation and colormap backends to their respective update functions."""
         self.events.triangulation_backend.connect(
             _update_triangulation_backend
         )
@@ -45,6 +43,20 @@ class ExperimentalSettings(EventedSettings):
         validation_alias=AliasChoices('async_', 'async', 'napari_async'),
         json_schema_extra={'requires_restart': False},
     )
+    progressive_loading: bool = Field(
+        False,
+        title='Progressive loading of multiscale data',
+        description='Stream newly added multiscale layers progressively, '
+        'viewport-first, instead of loading whole levels at once. '
+        'Applies to chunked (zarr/dask) multiscale layers added '
+        'after enabling. \nEnabling this also turns on asynchronous '
+        'rendering.',
+        validation_alias=AliasChoices(
+            'progressive_loading', 'napari_progressive_loading'
+        ),
+        json_schema_extra={'requires_restart': False},
+    )
+
     autoswap_buffers: bool = Field(
         False,
         title='Enable autoswapping rendering buffers.',

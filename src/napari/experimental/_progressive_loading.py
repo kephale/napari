@@ -1,0 +1,3108 @@
+"""Progressive (chunk-wise) loading for multiscale images.
+
+This module implements progressive loading on top of napari's standard
+multiscale ``Image`` layer. A single layer is added to the viewer; its
+per-level data objects are :class:`~napari.experimental._virtual_data.VirtualData`
+instances that present the full array shape while only keeping the visible,
+chunk-aligned region in memory.
+
+A :class:`ProgressiveLoader` watches the camera and dims, and on every view
+change it:
+
+1. reads the data level napari selected (respecting
+   ``layer.locked_data_level``) and the visible ``corner_pixels``,
+2. moves the level's resident interval to cover the view, initializing
+   newly exposed regions from a coarser resident level (so the canvas is
+   never empty),
+3. fetches the missing chunks on a background thread in priority order
+   (view-center first in 2D; camera depth/center-line in 3D) — first a
+   coarse-to-fine ladder over the levels between the resident coarsest
+   and the target, each upsampled into the target's unloaded regions as
+   it arrives so the view sharpens progressively, then the target level
+   itself — writing each chunk into the virtual data and refreshing the
+   layer through napari's normal slicing pipeline.
+
+The lowest-resolution level is kept fully resident (up to a size limit),
+which provides instant low-resolution context everywhere, powers layer
+thumbnails, and serves as the backdrop source for finer levels.
+
+Use :func:`add_progressive_loading_image` to add a progressively loading
+image to a viewer, or :func:`add_progressive_loading_labels` for a labels
+layer.
+
+This is experimental: expect breaking changes and rough edges, and please
+report issues to https://github.com/napari/napari/issues.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import itertools
+import logging
+import os
+import time
+import weakref
+from typing import TYPE_CHECKING
+
+import numpy as np
+from lodstone import (
+    Region,
+    anisotropic_extent_for_bytes,
+    chunk_key_id,
+    chunk_sizes_for,
+    chunk_slices_for,
+    clamp_region_to_budget,
+    expand_region_to_chunk_grid,
+    isotropic_extent_for_bytes,
+    native_chunks_in_region,
+)
+
+# imported at module load: a lazy first-use import inside a fetch pass
+# costs seconds of main-thread time under fetch-thread GIL pressure
+from napari.experimental._texture_swap import (
+    DoubleBufferedImageTexture,
+    DoubleBufferedVolumeTexture,
+)
+from napari.experimental._virtual_data import (
+    MultiScaleVirtualData,
+    VirtualData,
+    chunk_shape_for,
+)
+from napari.utils import progress
+
+# Qt imports are deferred so the module can be imported in headless
+# environments (no Qt backend) — the tests and pure-data helpers
+# (chunk_slices, chunk_priority_*, VirtualData) remain usable.
+try:
+    from qtpy.QtCore import QCoreApplication, QEvent, QTimer
+
+    # the implementation module, not the public ``napari.qt.threading``
+    # re-export: import-linter forbids ``napari.qt`` in import chains
+    # reachable from ``napari.components``
+    from napari._qt.qthreading import thread_worker
+except ImportError:
+    QCoreApplication = None  # type: ignore[assignment,misc]
+    QEvent = None  # type: ignore[assignment,misc]
+    QTimer = None  # type: ignore[assignment,misc]
+
+    def thread_worker(func=None, **kwargs):  # type: ignore[misc]
+        """No-op stand-in so ``@thread_worker`` doesn't crash at import."""
+        return func if func is not None else lambda f: f
+
+
+if TYPE_CHECKING:
+    import napari
+
+LOGGER = logging.getLogger(__name__)
+
+#: Maximum size of the always-resident coarsest level, in bytes.
+DEFAULT_RESIDENT_MAX_BYTES = 256 * 1024**2
+#: Maximum size of a single level's resident interval, in bytes.
+DEFAULT_INTERVAL_MAX_BYTES = 512 * 1024**2
+#: Show a progress bar (activity dock) for fetch passes with at least this
+#: many chunks; short interactive passes stay silent.
+PROGRESS_MIN_CHUNKS = 16
+#: 3D auto level selection coarsens until the viewport tile needs at most
+#: this many chunks, so a pass completes in seconds rather than minutes.
+#: Sized so the BYTE cap (TILE_MAX_BYTES_3D) is the binding constraint
+#: for ordinary chunkings: a 16e6 tile (251^3) of 32^3 chunks is 512
+#: chunks; a 33e6 tile (320^3) is 1000. The old default (384) silently
+#: vetoed the level the byte cap was tuned to allow — resolution arrived
+#: a full level late. The guard still protects against pathological
+#: chunkings (deep pyramids with tiny chunks).
+DEFAULT_MAX_CHUNKS_PER_PASS = 1024
+#: Maximum size of a 3D sub-volume tile, in bytes. Full-tile GPU uploads
+#: (pass start/end) block the GUI for roughly size / 125 MB/s on slow GL
+#: drivers, so this is deliberately much smaller than the memory budget.
+#: Swept on macOS GL-over-Metal: 16e6 (251^3 tiles) vs 33e6 (322^3) gave
+#: 2.8x cheaper raycast draws (21.9 vs 61.5 ms/DRAW) and ~400ms vs
+#: ~700ms typical interaction stalls, at the cost of a wider tile-shape
+#: vocabulary (covered by the texture pool).
+DEFAULT_TILE_MAX_BYTES_3D = int(16e6)
+#: Largest world extent (per axis) that vispy's float32 render path keeps
+#: pixel-accurate; measured — vanilla 3D rendering goes blank at/beyond
+#: 2**22, so deep pyramids without an explicit scale are downscaled to
+#: keep the largest axis under this.
+FLOAT32_EXTENT_LIMIT = 2**21
+
+
+# ---------- chunk geometry ----------
+
+
+def chunk_slices(data, interval: tuple | None = None) -> list[list[slice]]:
+    """Per-dimension lists of chunk slices, optionally clipped to a region.
+
+    Parameters
+    ----------
+    data : VirtualData or array-like
+        Object whose chunk grid should be enumerated.
+    interval : tuple of (min_coord, max_coord), optional
+        Half-open bounds per dimension. Only chunks intersecting the
+        interval are returned.
+
+    Returns
+    -------
+    list of list of slice
+        For each dimension, the slices of every chunk along it. The full
+        set of chunk keys is the cartesian product across dimensions.
+
+    """
+    return [list(axis) for axis in chunk_slices_for(data, interval)]
+
+
+def get_chunk_center(chunk_key: tuple[slice, ...]) -> np.ndarray:
+    """Return the center coordinate of a tuple-of-slices chunk key."""
+    return np.array([(sl.start + sl.stop) * 0.5 for sl in chunk_key])
+
+
+def visual_depth(points, camera) -> np.ndarray:
+    """Compute visual depth from camera position to a(n array of) point(s).
+
+    Parameters
+    ----------
+    points : (N, D) array of float
+        An array of N points. This can be one point or many thanks to NumPy
+        broadcasting.
+    camera : napari.components.Camera
+        A camera model specifying a view direction and a center or focus
+        point.
+
+    Returns
+    -------
+    projected_length : (N,) array of float
+        Position of the points along the view vector of the camera. These
+        can be negative (in front of the center) or positive (behind the
+        center).
+
+    """
+    view_direction = camera.view_direction
+    points_relative_to_camera = points - camera.center
+    projected_length = points_relative_to_camera @ view_direction
+    return projected_length
+
+
+def distance_from_camera_center_line(points, camera) -> np.ndarray:
+    """Compute distance from a point or array of points to camera center line.
+
+    This is the line aligned to the camera view direction and passing
+    through the camera's center point.
+
+    Parameters
+    ----------
+    points : (N, D) array of float
+        An array of N points. This can be one point or many thanks to NumPy
+        broadcasting.
+    camera : napari.components.Camera
+        A camera model specifying a view direction and a center or focus
+        point.
+
+    Returns
+    -------
+    distances : (N,) array of float
+        Distances from points to the center line of the camera.
+
+    """
+    view_direction = camera.view_direction
+    projected_length = visual_depth(points, camera)
+    projected = view_direction * np.reshape(projected_length, (-1, 1))
+    points_relative_to_camera = points - camera.center
+    distances = np.linalg.norm(projected - points_relative_to_camera, axis=-1)
+    return distances
+
+
+def _front_depth_segment(
+    center: np.ndarray,
+    direction: np.ndarray,
+    shape: np.ndarray,
+    length: float,
+) -> tuple[np.ndarray, float] | None:
+    """Center and half-length of a camera-facing ray segment in a box.
+
+    ``direction`` points from the camera into the scene. The returned
+    segment starts where the center ray enters the data and extends inward,
+    rather than straddling the orbit center. This keeps a bounded 3-D focus
+    texture on foreground data that can occlude its coarse context.
+    """
+    center = np.asarray(center, dtype=float)
+    direction = np.asarray(direction, dtype=float)
+    shape = np.asarray(shape, dtype=float)
+    if (
+        center.shape != direction.shape
+        or center.shape != shape.shape
+        or not np.all(np.isfinite(center))
+        or not np.all(np.isfinite(direction))
+        or not np.all(np.isfinite(shape))
+        or not np.isfinite(length)
+        or length <= 0
+    ):
+        return None
+
+    moving = np.abs(direction) >= 1e-12
+    if not np.any(moving):
+        return None
+    if np.any(~moving & ((center < 0) | (center > shape))):
+        return None
+
+    lower = np.full(center.shape, -np.inf, dtype=float)
+    upper = np.full(center.shape, np.inf, dtype=float)
+    lower[moving] = (0.0 - center[moving]) / direction[moving]
+    upper[moving] = (shape[moving] - center[moving]) / direction[moving]
+    enter = float(np.max(np.minimum(lower, upper)))
+    leave = float(np.min(np.maximum(lower, upper)))
+    if not np.isfinite(enter) or not np.isfinite(leave) or enter >= leave:
+        return None
+
+    stop = min(enter + length, leave)
+    half = (stop - enter) / 2.0
+    return center + (enter + half) * direction, half
+
+
+def _chunk_keys_product(
+    chunk_keys: list[list[slice]],
+) -> list[tuple[slice, ...]]:
+    return list(itertools.product(*chunk_keys))
+
+
+def chunk_priority_2D(
+    chunk_keys: list[list[slice]],
+    min_coord,
+    max_coord,
+) -> list[tuple[slice, ...]]:
+    """Order chunk keys by distance from the center of the view.
+
+    Parameters
+    ----------
+    chunk_keys : list of list of slice
+        Per-dimension chunk slices (see :func:`chunk_slices`).
+    min_coord, max_coord : sequence of int
+        The visible interval in this level's coordinates.
+
+    Returns
+    -------
+    list of tuple of slice
+        Chunk keys sorted with the most central chunks first.
+
+    """
+    view_center = (np.asarray(min_coord) + np.asarray(max_coord)) / 2
+    keys = _chunk_keys_product(chunk_keys)
+    centers = np.array([get_chunk_center(key) for key in keys])
+    if centers.size == 0:
+        return []
+    distances = np.linalg.norm(centers - view_center, axis=1)
+    return [keys[i] for i in np.argsort(distances, kind='stable')]
+
+
+def chunk_priority_3D(
+    chunk_keys: list[list[slice]],
+    min_coord,
+    max_coord,
+    camera_center,
+    view_direction,
+    center_line_weight: float = 0.5,
+) -> list[tuple[slice, ...]]:
+    """Order chunk keys front-to-back for 3D rendering.
+
+    Chunks are ordered primarily by depth along the camera's view
+    direction — with napari's orthographic camera, the chunk closest to
+    the viewer loads first — with the distance from the camera's center
+    line as a (down-weighted) secondary term so on-axis chunks lead at
+    equal depth.
+
+    Parameters
+    ----------
+    chunk_keys : list of list of slice
+        Per-dimension chunk slices (see :func:`chunk_slices`).
+    min_coord, max_coord : sequence of int
+        The visible interval in this level's coordinates.
+    camera_center : sequence of float
+        Camera center in this level's coordinates (displayed dimensions,
+        i.e. the last 3 dimensions of the chunk keys).
+    view_direction : sequence of float
+        Camera view direction (3-vector over the displayed dimensions).
+    center_line_weight : float
+        Weight of the center-line distance term relative to depth (both
+        are in this level's data units).
+
+    Returns
+    -------
+    list of tuple of slice
+        Chunk keys sorted from highest to lowest priority.
+
+    Notes
+    -----
+    The camera state is sanitized: a degenerate (zero/non-finite) view
+    direction, a non-finite camera center/zoom, or values so large that
+    the arithmetic overflows — all of which can occur before the 3D
+    camera is fully initialized — fall back to plain
+    view-center-distance ordering instead of producing NaN priorities.
+
+    """
+    keys = _chunk_keys_product(chunk_keys)
+    if not keys:
+        return []
+    centers = np.array([get_chunk_center(key)[-3:] for key in keys])
+
+    view_center = (
+        (np.asarray(min_coord, dtype=float) + np.asarray(max_coord)) / 2
+    )[-3:]
+    center_view_dist = np.linalg.norm(centers - view_center, axis=-1)
+
+    camera_center = np.asarray(camera_center, dtype=float)[-3:]
+    view_direction = np.asarray(view_direction, dtype=float)[-3:]
+    direction_norm = (
+        float(np.linalg.norm(view_direction))
+        if np.all(np.isfinite(view_direction))
+        else 0.0
+    )
+    priority = None
+    if (
+        camera_center.shape == (3,)
+        and np.all(np.isfinite(camera_center))
+        and direction_norm >= 1e-12
+    ):
+        view_direction = view_direction / direction_norm
+        # Large-magnitude (but finite) camera coordinates can overflow
+        # the arithmetic below; compute silently and validate the result.
+        with np.errstate(all='ignore'):
+            relative = centers - camera_center
+            depth = relative @ view_direction
+            projected = view_direction * depth[:, np.newaxis]
+            center_line_dist = np.linalg.norm(projected - relative, axis=-1)
+            candidate = depth + center_line_weight * center_line_dist
+        if np.all(np.isfinite(candidate)):
+            priority = candidate
+    if priority is None:
+        # Camera not (yet) in a usable 3D state: order by view center only.
+        priority = center_view_dist
+    return [keys[i] for i in np.argsort(priority, kind='stable')]
+
+
+def _chunk_id(chunk_key: tuple[slice, ...]) -> tuple[tuple[int, int], ...]:
+    """Hashable identifier for a chunk key."""
+    return chunk_key_id(chunk_key)
+
+
+def _pack_upload_block(vdata: VirtualData, keys) -> tuple | None:
+    """Contiguous copy of the union region of ``keys`` (worker thread).
+
+    Returns ``(low, high, block)`` in absolute coordinates, or ``None``
+    when the region is outside the resident interval.
+    """
+    copied = vdata.copy_chunk_union(keys)
+    if copied is None:
+        return None
+    region, block = copied
+    return list(region.start), list(region.stop), block
+
+
+def _tile_extent_3d_for(dtype: np.dtype, interval_max_bytes: int) -> int:
+    """Per-axis extent of 3D sub-volume tiles (isotropic fallback).
+
+    The largest cube that fits the interval memory budget, further
+    bounded by the GL 3D texture size limit when available.
+    Used as the cap when no per-level shape is known.
+    """
+    max_axis_extent = None
+    try:
+        from napari._vispy.utils.gl import get_max_texture_sizes
+
+        _, max_3d = get_max_texture_sizes()
+        if max_3d is not None:
+            max_axis_extent = int(max_3d)
+    except Exception:  # pragma: no cover - no GL context  # noqa: BLE001
+        pass
+    return isotropic_extent_for_bytes(
+        dtype,
+        interval_max_bytes,
+        ndim=3,
+        max_axis_extent=max_axis_extent,
+        minimum=32,
+    )
+
+
+def _texture_dtype_3d(dtype: np.dtype) -> np.dtype:
+    """Return the dtype occupying a volume detail texture."""
+    dtype = np.dtype(dtype)
+    return dtype if dtype == np.dtype(np.uint8) else np.dtype(np.float32)
+
+
+def _anisotropic_tile_extent(
+    shape: np.ndarray,
+    max_bytes: int,
+    itemsize: int,
+    gl_max: int | None = None,
+) -> np.ndarray:
+    """Compute a per-axis tile extent that fits the byte budget.
+
+    Axes whose full size already fits are kept whole; the remaining
+    budget is distributed to the larger axes so anisotropic data
+    (e.g. Z=42, Y=304, X=657) uses the budget efficiently instead
+    of being capped to a uniform cube.
+    """
+    return np.asarray(
+        anisotropic_extent_for_bytes(
+            shape,
+            max_bytes,
+            itemsize,
+            max_axis_extent=gl_max,
+        ),
+        dtype=np.int64,
+    )
+
+
+# ---------- background fetching ----------
+
+
+class ProgressiveLoader:
+    """Stream visible chunks into a multiscale image layer.
+
+    Connects to the viewer's camera and dims events and keeps the layer's
+    per-level :class:`VirtualData` intervals in sync with the visible
+    region, fetching missing chunks on a background thread in priority
+    order. Respects ``layer.locked_data_level`` (the resolution selector in
+    the layer controls) because it always loads the level napari selected
+    for rendering.
+
+    Normally constructed by :func:`add_progressive_loading_image`; the
+    instance is stored in ``layer.metadata['progressive_loader']``.
+
+    Parameters
+    ----------
+    viewer : napari.Viewer
+        The viewer the layer belongs to.
+    layer : napari.layers.Image
+        A multiscale image layer whose levels are ``VirtualData`` objects.
+    data : MultiScaleVirtualData
+        The coordinating multiscale wrapper for the layer's levels.
+    debounce_ms : int
+        Debounce interval for camera/dims events.
+    refresh_interval_s : float
+        Minimum time between layer refreshes while chunks stream in. The
+        effective interval adapts upward when refreshes are expensive
+        (e.g. full 3D texture uploads).
+    resident_max_bytes : int
+        Keep the coarsest level fully in memory if it is at most this big.
+    interval_max_bytes : int
+        Upper bound for a single level's resident interval.
+    auto_level_3d : bool
+        In 3D, automatically select the data level from the camera zoom
+        (napari itself always renders the coarsest level in 3D). The level
+        is driven through the layer's internal level lock without emitting
+        events, so the resolution selector still reads "Auto"; choosing an
+        explicit level in the selector suspends automatic selection until
+        it is set back to "Auto". Levels too large for
+        ``interval_max_bytes`` are skipped in favor of coarser ones.
+    max_pixel_size_3d : float
+        In 3D auto mode, target the coarsest level whose voxels project
+        to at most this many screen pixels. Lower values choose finer
+        (more expensive) levels sooner when zooming in.
+    fetch_workers : int, optional
+        Number of threads fetching chunks concurrently within a pass
+        (default: up to 4, leaving at least two cores for the GUI).
+        Completion order stays close to priority order. Raise this for
+        high-latency remote data; lower it (or pace the store, see
+        ``GenerativeZarrStore.cpu_relief``) for compute-bound sources.
+    max_chunks_per_pass : int
+        3D auto level selection coarsens until the viewport tile needs
+        at most this many chunks, keeping pass duration reasonable.
+    texture_patching : bool
+        In 3D, write arriving chunks directly into the existing GPU
+        texture (a partial glTexSubImage3D upload) instead of re-slicing
+        and re-uploading the whole tile per refresh. The normal slicing
+        pipeline still reconciles periodically and at the end of each
+        pass. Greatly reduces main-thread blocking for large tiles.
+    tile_max_bytes_3d : int
+        Upper bound for a 3D sub-volume tile. Each pass performs a full
+        tile GPU upload at its boundaries, which blocks the GUI roughly
+        in proportion to this size; raise it on fast GPUs for larger
+        high-resolution tiles.
+    max_bytes_per_second : float, optional
+        Rate-limit chunk loading to this many bytes per second (shared
+        across all fetch workers). Pacing happens on the worker threads
+        before each fetch, so it bounds every per-chunk cost in one
+        knob: fetch compute (GIL pressure), slice/refresh event
+        cascades, and GPU upload traffic. Loading takes proportionally
+        longer; interaction stays smooth. ``None`` (default) is
+        unlimited.
+    interaction_hold : bool
+        Suspend all streaming work while the user interacts (camera
+        motion, slider scrubbing): fetch workers pause, arriving chunk
+        batches are buffered instead of patched, throttled refreshes
+        are deferred, and metered GLIR texture uploads hold. Everything
+        resumes when interaction settles (the debounced check). This
+        keeps interaction frames free of upload work, slice-completion
+        event cascades, and fetch-thread GIL pressure.
+    coarse_first : bool
+        Resolve a fresh view coarse-to-fine: before fetching the target
+        level, fetch the (few, cheap) missing chunks of every level
+        between the resident coarsest and the target, coarsest first,
+        upsampling each into the target's unloaded regions as it
+        arrives. The view sharpens through the intermediate resolutions
+        while the (possibly slow, e.g. remote) target level streams,
+        instead of jumping straight from the coarsest backdrop to the
+        target. Chunk counts shrink geometrically with coarseness, so
+        the ladder adds roughly 1/3 extra fetch volume in 2D and 1/7
+        in 3D.
+    interactive_step_rate : float
+        Multiply the volume raycast step size by this factor while the
+        user interacts, restoring full quality when interaction
+        settles (interactive level-of-detail, as in ParaView/Slicer).
+        Raycast cost scales inversely with step size, so 2.0 means
+        roughly 2x cheaper GPU frames during drags. 1.0 (or 0)
+        disables.
+
+    """
+
+    def __init__(
+        self,
+        viewer: napari.Viewer,
+        layer,
+        data: MultiScaleVirtualData,
+        *,
+        debounce_ms: int = 100,
+        refresh_interval_s: float = 0.03,
+        resident_max_bytes: int = DEFAULT_RESIDENT_MAX_BYTES,
+        interval_max_bytes: int = DEFAULT_INTERVAL_MAX_BYTES,
+        auto_level_3d: bool = True,
+        max_pixel_size_3d: float = 2.0,
+        fetch_workers: int | None = None,
+        max_chunks_per_pass: int = DEFAULT_MAX_CHUNKS_PER_PASS,
+        texture_patching: bool = True,
+        tile_max_bytes_3d: int = DEFAULT_TILE_MAX_BYTES_3D,
+        max_bytes_per_second: float | None = None,
+        interaction_hold: bool = True,
+        interactive_step_rate: float = 4.0,
+        coarse_first: bool = True,
+        _start_immediately: bool = True,
+    ):
+        self._viewer = viewer
+        self._layer = layer
+        self._data = data
+        self._coarse_first = bool(coarse_first)
+        # (level, chunk queue) fetch stages of the active pass, coarse
+        # to fine, the target level last; _stage_index is the running one
+        self._stages: list[tuple[int, list]] = []
+        self._stage_index = 0
+        self._refresh_interval_s = refresh_interval_s
+        self._interval_max_bytes = interval_max_bytes
+        self._auto_level_3d = auto_level_3d
+        self._max_pixel_size_3d = float(max_pixel_size_3d)
+        self._max_chunks_per_pass = max(int(max_chunks_per_pass), 1)
+        self._texture_patching = texture_patching
+        self._texture_patches = 0
+        self._pass_all_patched = False
+        self._needs_final_reconcile = False
+        self._last_node_update = 0.0
+        env_workers = os.environ.get('NAPARI_PROGRESSIVE_FETCH_WORKERS')
+        if env_workers:
+            fetch_workers = int(env_workers)
+        if fetch_workers is None:
+            # leave cores for the GUI event loop: saturating every core
+            # with chunk fetches makes the UI unresponsive on CPU-bound
+            # (e.g. generative) stores
+            try:
+                n_cpus = len(os.sched_getaffinity(0))
+            except AttributeError:  # pragma: no cover - macOS/Windows
+                n_cpus = os.cpu_count() or 3
+            fetch_workers = min(4, n_cpus - 2)
+        self._fetch_workers = max(int(fetch_workers), 1)
+        self._max_bytes_per_second = (
+            float(max_bytes_per_second) if max_bytes_per_second else None
+        )
+        self._interaction_hold = bool(interaction_hold)
+        self._double_buffer = True
+        self._dbuf = None
+        self._interactive_step_rate = (
+            float(interactive_step_rate)
+            if interactive_step_rate and float(interactive_step_rate) > 1.0
+            else None
+        )
+        # (weakref to volume node, saved relative_step_size) while the
+        # interactive quality reduction is applied
+        self._saved_step: tuple | None = None
+        # interaction hold: extended by every camera/scrub event, ended
+        # by the debounced _check once interaction settles
+        self._hold_until = 0.0
+        self._hold_s = max(0.15, 1.5 * debounce_ms / 1000.0)
+        self._held_batches: list[tuple] = []
+        self._last_step_change_time = 0.0
+        self._step_change_min_interval = 0.2
+        self._held_refresh = False
+        # Level we set through layer._locked_data_level for 3D auto mode
+        # (None when we are not driving the level).
+        self._auto_locked: int | None = None
+        # True while the user has pinned an explicit level in the
+        # resolution selector; suspends 3D auto level selection.
+        self._user_locked = layer.locked_data_level is not None
+        self._closed = False
+
+        self._worker = None
+        self._generation = 0
+        self._active: tuple | None = None
+        self._chunks_done = 0
+        self._chunks_total = 0
+        self._last_refresh = 0.0
+        self._last_refresh_duration = 0.0
+        self._pbar = None
+        # (experimental.async_, slicer._force_sync) as they were before
+        # this layer switched the viewer to async slicing; restored by
+        # close(). Set by _attach_progressive_loader.
+        self._slicing_restore: tuple[bool, bool] | None = None
+        # napari's Qt progress bar calls QApplication.processEvents() on
+        # every update, which re-enters event handling *inside* the
+        # caller; chunk handlers therefore only accumulate counts here
+        # and a timer flushes them from the top of the event loop
+        # (see _advance_progress/_flush_progress)
+        self._pbar_pending = 0
+        self._pbar_flushing = False
+        self._pbar_scheduled = False
+        self._pbar_last_flush = 0.0
+        self._backdrop_pending = False
+        # (level, min, max) of the last synchronous 2D backdrop, whose
+        # patches left the GPU texture equal to the hyperslice; lets the
+        # matching fetch pass skip its pass-start full-tile upload
+        self._synced_backdrop_key: tuple | None = None
+
+        self._repair_worker = None
+        # a repair was requested while one was running: chain a
+        # follow-up over the (possibly moved) region when it finishes
+        self._repair_again = False
+        self._debug_overlay = None
+        self._chunk_warned = False
+        self._resident_level = len(data) - 1
+        self._resident_max_bytes = resident_max_bytes
+        self._resident_disabled = False
+        self._last_clamp_message: str | None = None
+
+        # QTimer-based debounce: continuous camera motion only triggers a
+        # fetch pass once interaction settles.  Using QTimer keeps the
+        # callback on the main thread (psygnal's debounced fires from a
+        # threading.Timer, which crashes PySide6 when it touches Qt
+        # objects).
+        self._debounce_timer = QTimer()
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(debounce_ms)
+        self._debounce_timer.timeout.connect(self._check)
+
+        def _debounced_check(event=None):
+            self._debounce_timer.start()
+
+        _debounced_check.cancel = self._debounce_timer.stop
+        self._debounced_check = _debounced_check
+        self._connections = [
+            # fast (non-debounced) path: suspend streaming work the
+            # moment interaction starts, so drag frames stay free of
+            # uploads, slice cascades and fetch GIL pressure
+            (viewer.scene.camera.events, self._on_interaction),
+            (viewer.dims.events.current_step, self._on_dims_step_change),
+            (viewer.scene.camera.events, self._debounced_check),
+            (viewer.dims.events.current_step, self._debounced_check),
+            # fast path first: cap the crop to the driver's 3D texture
+            # limit before anything re-slices for the new display mode,
+            # so no oversized volume upload is ever attempted
+            (viewer.dims.events.ndisplay, self._on_ndisplay_change),
+            (viewer.dims.events.ndisplay, self._debounced_check),
+            (layer.events.locked_data_level, self._debounced_check),
+            # the locked_data_level event only fires for user/API writes
+            # (3D auto mode bypasses the setter), so it reliably tells us
+            # whether the user has pinned a level
+            (layer.events.locked_data_level, self._on_user_locked_change),
+            (layer.events.visible, self._debounced_check),
+            # set_data fires after every (re-)slice, including the ones
+            # napari runs when the data level or corners change; _check is
+            # a cheap no-op when the view is already covered.
+            (layer.events.set_data, self._debounced_check),
+            # fast (non-debounced) path: the instant napari slices a level
+            # whose interval does not cover the view (i.e. the canvas just
+            # went blank), put a backdrop up rather than waiting for the
+            # debounced fetch pass
+            (layer.events.set_data, self._on_set_data),
+        ]
+        for emitter, callback in self._connections:
+            if callback is self._on_dims_step_change:
+                emitter.connect(callback, position='first')
+            else:
+                emitter.connect(callback)
+        viewer.layers.events.removed.connect(self._on_layer_removed)
+        # engage the interaction hold on the raw pointer events too:
+        # a press/wheel precedes the first camera event by one event,
+        # so the fetch workers pause before the gesture needs the GIL
+        self._canvas_events = []
+        with contextlib.suppress(AttributeError):  # headless ViewerModel
+            canvas_events = viewer.window._qt_viewer.canvas.events
+            for name in ('mouse_press', 'mouse_wheel'):
+                emitter = getattr(canvas_events, name, None)
+                if emitter is not None:
+                    emitter.connect(self._on_interaction)
+                    # a click without camera motion must still resume
+                    # the paused workers once it settles
+                    emitter.connect(self._debounced_check)
+                    self._canvas_events.append(emitter)
+
+        # 2D multiscale slicing caches a one-time materialization of the
+        # thumbnail (coarsest) level, which would freeze this layer's
+        # pre-load (all-zero) content. Disable it: materializing a resident
+        # VirtualData is a plain memory copy.
+        layer._level_materializer = None
+
+        # GL texture size limits: clamp intervals so no axis exceeds
+        # what the driver can allocate in glTexImage2D / glTexImage3D.
+        try:
+            from napari._vispy.utils.gl import get_max_texture_sizes
+
+            max_2d, _ = get_max_texture_sizes()
+        except Exception:  # noqa: BLE001
+            max_2d = None
+        self._gl_max_texture_size_2d = max_2d
+
+        # Enable 3D sub-volume tiles: locking (or auto-selecting) a level
+        # larger than this extent renders a view-centered tile of at most
+        # this size, so even the finest levels of huge volumes are usable
+        # in 3D. Bounded by the memory budget and the GL 3D texture limit.
+        self._tile_extent_3d = _tile_extent_3d_for(
+            _texture_dtype_3d(data.dtype),
+            min(interval_max_bytes, tile_max_bytes_3d),
+        )
+        layer._max_tile_extent_3d = self._tile_extent_3d
+        layer._tile_max_bytes_3d = min(interval_max_bytes, tile_max_bytes_3d)
+        layer._interval_max_bytes_3d = interval_max_bytes
+
+        layer._render_margin_2d = 2.0
+        self._tile_margin_3d = 1.25
+        layer._tile_margin_3d = self._tile_margin_3d
+
+        if _start_immediately:
+            self._check()
+
+    # -- lifecycle --
+
+    def _on_layer_removed(self, event) -> None:
+        if event.value is self._layer:
+            self.close()
+
+    def enable_debug_overlay(self):
+        """Show chunk wireframes and a resolution HUD for this layer.
+
+        Draws one rectangle per chunk of the rendered level's resident
+        interval, colored by content state (real data, backdrop source
+        distance, or unfilled), and reports the rendered/target levels
+        and fetch-ladder progress in the viewer's text overlay. Also
+        enabled by ``NAPARI_PROGRESSIVE_DEBUG=1`` or
+        ``add_progressive_loading_image(..., debug_overlay=True)``.
+
+        Returns the :class:`~napari.experimental._debug_overlay.ChunkDebugOverlay`.
+        """
+        if self._closed:
+            return None
+        if self._debug_overlay is None:
+            from napari.experimental._debug_overlay import ChunkDebugOverlay
+
+            self._debug_overlay = ChunkDebugOverlay(self)
+        return self._debug_overlay
+
+    def disable_debug_overlay(self) -> None:
+        """Remove the chunk debug overlay (no-op when not enabled)."""
+        overlay, self._debug_overlay = self._debug_overlay, None
+        if overlay is not None:
+            with contextlib.suppress(Exception):
+                overlay.close()
+
+    def close(self) -> None:
+        """Disconnect from the viewer and stop all background fetching."""
+        if self._closed:
+            return
+        self.disable_debug_overlay()
+        self._closed = True
+        with contextlib.suppress(Exception):
+            # kill any pending debounced trigger so no fetch pass can
+            # start after close
+            self._debounced_check.cancel()
+        with contextlib.suppress(Exception):
+            self._debounce_timer.timeout.disconnect(self._check)
+        self._release_auto_level()
+        self._cancel_active()
+        from napari.experimental import _glir_metering
+
+        _glir_metering.remove_drain_callback(self._on_uploads_drained)
+        self._restore_render_quality()
+        if self._dbuf is not None:
+            with contextlib.suppress(Exception):
+                self._dbuf.close()
+            self._dbuf = None
+        if self._repair_worker is not None:
+            # quit() only requests abort, and nothing polls it for a
+            # non-generator worker: an in-flight gather runs to
+            # completion. It is safe because it holds its own reference
+            # to the pyramid (see _repair_backdrop) rather than reading
+            # self._data, which is dropped below.
+            with contextlib.suppress(Exception):
+                self._repair_worker.quit()
+            self._repair_worker = None
+        for emitter, callback in self._connections:
+            # RuntimeError: napari emitters can fail to normalize a
+            # callback while its owner is mid-teardown
+            with contextlib.suppress(ValueError, TypeError, RuntimeError):
+                emitter.disconnect(callback)
+        self._connections = []
+        for emitter in self._canvas_events:
+            with contextlib.suppress(Exception):
+                emitter.disconnect(self._on_interaction)
+            with contextlib.suppress(Exception):
+                emitter.disconnect(self._debounced_check)
+        self._canvas_events = []
+        with contextlib.suppress(ValueError, TypeError, RuntimeError):
+            self._viewer.layers.events.removed.disconnect(
+                self._on_layer_removed,
+            )
+        with contextlib.suppress(Exception):
+            self._debounce_timer.stop()
+        self._restore_slicing()
+        self._data = []
+        self._viewer = None  # type: ignore[assignment]
+        self._layer = None  # type: ignore[assignment]
+
+    def _restore_slicing(self) -> None:
+        """Put async slicing back the way this layer found it.
+
+        Progressive loading switches the whole viewer to async slicing;
+        leaving it on once the last progressive layer is gone changes
+        behavior for unrelated layers. It also keeps slice responses
+        coming from the slicing thread while the viewer is being torn
+        down, and ``QtViewer._on_slice_ready`` is ``@ensure_main_thread``:
+        superqt wraps such a call in a ``CallCallable`` held by a global
+        list until the main thread runs it. One posted during teardown is
+        never run, so the list keeps the whole ``QtViewer`` alive.
+        """
+        restore, self._slicing_restore = self._slicing_restore, None
+        if restore is None or self._viewer is None:
+            return
+        if any(
+            other is not self for other in _progressive_loaders(self._viewer)
+        ):
+            # another progressive layer still needs async slicing
+            return
+        async_, force_sync = restore
+        from napari.settings import get_settings
+
+        # the settings event drives every viewer's _force_sync, so put
+        # the setting back first and this viewer's flag back after
+        get_settings().experimental.async_ = async_
+        with contextlib.suppress(AttributeError):
+            self._viewer._layer_slicer._force_sync = force_sync
+        # A slice that finished on the worker thread just before the switch
+        # above may have queued QtViewer._on_slice_ready through superqt's
+        # ensure_main_thread wrapper.  The queued CallCallable owns the
+        # QtViewer until its MetaCall runs, which leaks the whole viewer when
+        # close() is immediately followed by viewer teardown.  Wait for all
+        # slice workers, then deliver those already-posted callbacks while the
+        # viewer is still alive.
+        with contextlib.suppress(AttributeError, TimeoutError):
+            self._viewer._layer_slicer.wait_until_idle(timeout=5)
+        if QCoreApplication is not None and QEvent is not None:
+            with contextlib.suppress(
+                ImportError, AttributeError, RuntimeError
+            ):
+                from superqt.utils._ensure_thread import CallCallable
+
+                qt_viewer = self._viewer.window._qt_viewer
+                for call in tuple(CallCallable.instances):
+                    if qt_viewer in call._args:
+                        QCoreApplication.sendPostedEvents(
+                            call, QEvent.Type.MetaCall
+                        )
+
+    # -- view tracking --
+
+    def _level_interval(self, level: int) -> tuple[np.ndarray, np.ndarray]:
+        """Visible half-open interval for ``level``, in level coordinates.
+
+        Displayed dimensions come from the layer's ``corner_pixels`` (which
+        napari maintains in the coordinates of the current data level);
+        non-displayed dimensions cover only the current dims step.
+        """
+        layer = self._layer
+        vdata = self._data[level]
+        ndim = vdata.ndim
+        shape = np.asarray(vdata.shape, dtype=np.int64)
+
+        min_coord = np.zeros(ndim, dtype=np.int64)
+        max_coord = shape.copy()
+
+        # corner_pixels bound the displayed dimensions in both 2D (the
+        # visible canvas region) and 3D (the full level or a sub-volume
+        # tile when _max_tile_extent_3d applies)
+        displayed = set(layer._slice_input.displayed)
+        corners = layer.corner_pixels
+        for d in displayed:
+            min_coord[d] = corners[0, d]
+            max_coord[d] = corners[1, d] + 1
+
+        self._restrict_to_current_step(level, displayed, min_coord, max_coord)
+
+        min_coord = np.clip(min_coord, 0, shape)
+        max_coord = np.clip(max_coord, 0, shape)
+        min_coord, max_coord = self._clamp_interval(
+            vdata, min_coord, max_coord
+        )
+        aligned = expand_region_to_chunk_grid(
+            Region(tuple(min_coord), tuple(max_coord)),
+            vdata.shape,
+            chunk_sizes_for(vdata),
+            itemsize=vdata.dtype.itemsize,
+            max_bytes=self._interval_max_bytes,
+            max_axis_extent=self._gl_max_texture_size_2d,
+        )
+        return (
+            np.asarray(aligned.start, dtype=np.int64),
+            np.asarray(aligned.stop, dtype=np.int64),
+        )
+
+    def _restrict_to_current_step(
+        self,
+        level: int,
+        displayed: set,
+        min_coord,
+        max_coord,
+    ) -> None:
+        """Restrict non-displayed dims to the current dims step (in place)."""
+        layer = self._layer
+        vdata = self._data[level]
+        ndim = vdata.ndim
+        factors = np.asarray(self._data._scale_factors[level])
+        try:
+            data_point = np.asarray(
+                layer.world_to_data(self._viewer.dims.point),
+                dtype=float,
+            )
+        except (ValueError, IndexError, TypeError):
+            # pragma: no cover - layer/viewer dims mismatch fallback
+            data_point = np.asarray(self._viewer.dims.point, dtype=float)[
+                -ndim:
+            ]
+        n_point = len(data_point)
+        for d in range(ndim):
+            if d not in displayed:
+                if d >= n_point:
+                    # Dimension not tracked by viewer.dims (e.g. RGB
+                    # channel): keep the full extent.
+                    continue
+                point = int(np.round(data_point[d] / factors[d]))
+                point = min(max(point, 0), int(vdata.shape[d]) - 1)
+                min_coord[d] = point
+                max_coord[d] = point + 1
+
+    def _clamp_interval(
+        self,
+        vdata: VirtualData,
+        min_coord,
+        max_coord,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Shrink an interval around its center to respect the memory cap
+        and the GL maximum texture size."""
+        requested_min = np.asarray(min_coord, dtype=np.int64)
+        requested_max = np.asarray(max_coord, dtype=np.int64)
+        clamped_region = clamp_region_to_budget(
+            Region(tuple(requested_min), tuple(requested_max)),
+            vdata.shape,
+            itemsize=vdata.dtype.itemsize,
+            max_bytes=self._interval_max_bytes,
+            max_axis_extent=self._gl_max_texture_size_2d,
+        )
+        min_coord = np.asarray(clamped_region.start, dtype=np.int64)
+        max_coord = np.asarray(clamped_region.stop, dtype=np.int64)
+        clamped = not (
+            np.array_equal(min_coord, requested_min)
+            and np.array_equal(max_coord, requested_max)
+        )
+        if clamped:
+            message = (
+                f'progressive loading: visible interval '
+                f'[{requested_min.tolist()}, {requested_max.tolist()}) '
+                f'exceeds {self._interval_max_bytes} bytes; clamped to '
+                f'[{min_coord.tolist()}, {max_coord.tolist()})'
+            )
+            if message != self._last_clamp_message:
+                self._last_clamp_message = message
+                LOGGER.warning(message)
+        return min_coord, max_coord
+
+    # -- 3D automatic level selection --
+
+    def _on_user_locked_change(self, event=None) -> None:
+        """Track explicit level pins made through the resolution selector.
+
+        This only fires for writes through the public
+        ``locked_data_level`` setter (3D auto mode writes the private
+        attribute directly). The resolution selector widget may *echo*
+        the auto-driven value back through the setter when its items are
+        rebuilt, so a value equal to the current auto level is not
+        treated as a user pin — otherwise auto mode would silently
+        suspend itself after the first level change.
+        """
+        locked = self._layer.locked_data_level
+        if locked is None:
+            self._user_locked = False
+        elif locked != self._auto_locked:
+            self._user_locked = True
+            self._auto_locked = None
+        # else: an echo of the level auto mode set; keep auto mode active.
+
+    def _zoom_target_level_3d(self) -> int:
+        """Pick the 3D data level appropriate for the current camera zoom.
+
+        Chooses the coarsest level whose voxels project to at most
+        ``max_pixel_size_3d`` screen pixels (so the displayed resolution
+        roughly matches the screen, like napari's 2D level selection),
+        then falls back to coarser levels until the visible volume fits
+        the memory budget. A camera that is not yet initialized (zoom of
+        zero, NaN, or inf — e.g. before the window is first shown)
+        selects the coarsest level.
+        """
+        layer = self._layer
+        if self._viewer is None:
+            return len(self._data) - 1
+        zoom = float(self._viewer.scene.camera.zoom)
+        displayed = list(layer._slice_input.displayed)
+        n_levels = len(self._data)
+
+        if not np.isfinite(zoom) or zoom <= 0:
+            return n_levels - 1
+
+        # screen pixels per level-0 data pixel (layer scale maps data to
+        # world; zoom maps world to screen)
+        layer_scale = float(
+            np.max(np.take(np.asarray(layer.scale), displayed)),
+        )
+        data_zoom = zoom * layer_scale
+
+        target = 0
+        for level in range(n_levels - 1, -1, -1):
+            factors = np.take(
+                np.asarray(self._data._scale_factors[level]),
+                displayed,
+            )
+            pixel_size = data_zoom * float(np.max(factors))
+            if pixel_size <= self._max_pixel_size_3d:
+                target = level
+                break
+
+        bbox = self._camera_bbox_level0(displayed)
+
+        # Coarsen until the viewport tile fits the memory budget AND can
+        # be fetched in a reasonable number of chunks — a fully zoomed-out
+        # view of a deep pyramid would otherwise pick a level needing
+        # thousands of chunks, taking minutes to sharpen. Finer levels
+        # unlock progressively as zooming shrinks the viewport tile.
+        for level in range(target, n_levels):
+            vdata = self._data[level]
+            level_extent = np.take(
+                np.asarray(vdata.shape, dtype=np.int64),
+                displayed,
+            )
+            view_dir = getattr(layer, '_view_direction_data', lambda _d: None)(
+                displayed
+            )
+            render_corners = layer._corners_for_locked_level(
+                level,
+                displayed,
+                bbox,
+                view_dir,
+            )
+            extent = (
+                render_corners[1, displayed] - render_corners[0, displayed] + 1
+            )
+            if bbox is not None:
+                downsample = np.take(
+                    np.asarray(self._data._scale_factors[level]),
+                    displayed,
+                )
+                level_bbox = np.stack(
+                    [
+                        np.clip(bbox[0] / downsample, 0, level_extent),
+                        np.clip(bbox[1] / downsample, 0, level_extent),
+                    ]
+                )
+                required_low = np.floor(level_bbox[0]).astype(np.int64)
+                required_high = np.ceil(level_bbox[1]).astype(np.int64)
+                view_extent = np.maximum(required_high - required_low, 1)
+                visible = np.minimum(
+                    np.maximum(view_extent, 1),
+                    level_extent,
+                )
+                render_low = render_corners[0, displayed]
+                render_high = render_corners[1, displayed] + 1
+                if (
+                    np.any(visible > extent)
+                    or np.any(render_low > required_low)
+                    or np.any(render_high < required_high)
+                ):
+                    # the tile cap cannot cover the canvas at this
+                    # level: a finer-but-partial tile reads as the
+                    # volume shrinking while you zoom in — coverage
+                    # beats sharpness, prefer the next coarser level.
+                    # NOTE feasibility uses the bare visible footprint:
+                    # requiring the pan-slack margin too held levels
+                    # back a full step (resolution arrived ~2x late);
+                    # instead the slack below shrinks to whatever fits
+                    # under the cap near the switch boundary and grows
+                    # back as zooming shrinks the footprint
+                    continue
+                wanted = np.minimum(
+                    np.ceil(visible * self._tile_margin_3d),
+                    level_extent,
+                )
+                extent = np.minimum(extent, wanted.astype(np.int64))
+            texture_itemsize = _texture_dtype_3d(vdata.dtype).itemsize
+            nbytes = np.prod(extent, dtype=np.int64) * texture_itemsize
+            # ``interval_max_bytes`` bounds CPU residency, but the visible
+            # texture page must also fit the much smaller interaction-tuned
+            # GPU tile budget.  Selecting a finer level whose viewport page
+            # is hundreds of MiB makes its atomic upload take tens of seconds;
+            # the coarse front remains visible and the level appears not to
+            # refine.  Stay coarse until zoom makes the finer page genuinely
+            # presentable.  One quantum of rounding slack is already reflected
+            # by the computed extent, so compare its actual bytes directly.
+            texture_budget = min(
+                self._interval_max_bytes,
+                int(self._layer._tile_max_bytes_3d),
+            )
+            display_shape = tuple(int(vdata.shape[axis]) for axis in displayed)
+            display_chunks = tuple(
+                chunk_sizes_for(vdata)[axis] for axis in displayed
+            )
+            n_chunks = native_chunks_in_region(
+                Region(
+                    tuple(int(value) for value in render_low),
+                    tuple(int(value) for value in render_high),
+                ),
+                display_shape,
+                display_chunks,
+            )
+            if (
+                nbytes <= texture_budget
+                and n_chunks <= self._max_chunks_per_pass
+            ):
+                return level
+        return n_levels - 1
+
+    def _camera_bbox_level0(self, displayed_axes) -> np.ndarray | None:
+        """Approximate visible bbox around the camera, in level-0 coords.
+
+        Sized from the canvas dimensions and zoom so 3D sub-volume tiles
+        cover what is on screen rather than the whole memory budget.  In 3D
+        this is the data-axis-aligned bound of the camera's oriented screen
+        plane, plus a bounded camera-facing depth segment along the viewing
+        ray. Anchoring depth at the front of the dataset prevents coarse
+        context voxels from occluding a fine tile centered farther back.
+        """
+        camera = self._viewer.scene.camera
+        camera_center = np.asarray(camera.center, dtype=float)
+        if not np.all(np.isfinite(camera_center)):
+            return None
+        try:
+            world_point = np.array(self._viewer.dims.point, dtype=float)
+            world_point[list(displayed_axes)] = camera_center[
+                -len(displayed_axes) :
+            ]
+            data_point = np.asarray(
+                self._layer.world_to_data(world_point),
+                dtype=float,
+            )
+        except Exception:  # pragma: no cover - dims mismatch  # noqa: BLE001
+            return None
+        center = data_point[list(displayed_axes)]
+        if not np.all(np.isfinite(center)):
+            return None
+        zoom = float(camera.zoom)
+        try:
+            canvas_size = np.asarray(self._viewer.canvas.size, dtype=float)
+        except Exception:  # pragma: no cover - headless  # noqa: BLE001
+            canvas_size = np.array([800.0, 800.0])
+        if (
+            not np.isfinite(zoom)
+            or zoom <= 0
+            or canvas_size.size < 2
+            or np.any(canvas_size[:2] <= 0)
+        ):
+            return np.stack([center, center])
+        layer_scale = np.take(
+            np.asarray(self._layer.scale, dtype=float),
+            list(displayed_axes),
+        )
+        # Canvas size is (width, height), while the camera basis is
+        # (up, right). Keep those spans paired correctly on non-square
+        # canvases.
+        screen_half = canvas_size[:2] / (2 * zoom)
+        screen_radius = float(np.max(screen_half))
+        half_extent = screen_radius / np.maximum(layer_scale, 1e-12)
+        if self._viewer.dims.ndisplay == 3:
+            try:
+                directions = []
+                view_world = np.asarray(camera.view_direction, dtype=float)
+                up_world = np.asarray(camera.up_direction, dtype=float)
+                right_world = np.cross(up_world, view_world)
+                for world_direction in (up_world, right_world, view_world):
+                    full_direction = np.zeros(self._layer.ndim, dtype=float)
+                    full_direction[list(displayed_axes)] = world_direction[
+                        -len(displayed_axes) :
+                    ]
+                    data_direction = np.asarray(
+                        self._layer._world_to_data_ray(full_direction),
+                        dtype=float,
+                    )[list(displayed_axes)]
+                    directions.append(data_direction)
+                up_data, right_data, view_data = directions
+                lateral_half_extent = screen_half[1] * np.abs(
+                    up_data
+                ) + screen_half[0] * np.abs(right_data)
+                depth_length = 0.7 * screen_radius
+                front = _front_depth_segment(
+                    center,
+                    view_data,
+                    np.take(np.asarray(self._data.shape), displayed_axes),
+                    depth_length,
+                )
+                if front is None:
+                    half_extent = lateral_half_extent + (
+                        0.5 * depth_length * np.abs(view_data)
+                    )
+                else:
+                    center, depth_half = front
+                    half_extent = lateral_half_extent + (
+                        depth_half * np.abs(view_data)
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+        return np.stack([center - half_extent, center + half_extent])
+
+    def _apply_auto_level(self) -> None:
+        """Drive the layer's data level from zoom while in 3D Auto mode.
+
+        Writes ``layer._locked_data_level`` directly (not the public
+        setter) so no ``locked_data_level`` event is emitted and the
+        resolution selector keeps displaying "Auto".
+        """
+        layer = self._layer
+        if not self._auto_level_3d or self._user_locked:
+            return
+        if self._viewer.dims.ndisplay != 3:
+            self._release_auto_level()
+            return
+        displayed_axes = layer._slice_input.displayed
+        camera_bbox = self._camera_bbox_level0(displayed_axes)
+        if camera_bbox is None:
+            # camera not in a usable state (e.g. before the first draw):
+            # without a viewport bbox the tile would fall back to the full
+            # memory-budget cube, whose synchronous slice can stall the UI
+            # for seconds; wait for a valid camera instead
+            return
+        target = self._zoom_target_level_3d()
+        if target == self._auto_locked and layer._locked_data_level == target:
+            return
+        self._auto_locked = target
+        layer._locked_data_level = target
+        layer._data_level = target
+        # Mirror the corner_pixels update of the locked_data_level setter,
+        # centering any sub-volume tile on the camera.
+        view_dir = layer._view_direction_data(displayed_axes)
+        layer.corner_pixels = layer._corners_for_locked_level(
+            target,
+            displayed_axes,
+            camera_bbox,
+            view_dir,
+        )
+        # Prepare the new level's interval with a backdrop from the level
+        # that was just displayed BEFORE napari re-slices, so the previous
+        # resolution stays on screen until new chunks replace it.
+        min_coord, max_coord = self._level_interval(target)
+        if not np.any(max_coord <= min_coord):
+            self._data.set_interval(
+                target,
+                min_coord,
+                max_coord,
+                backdrop_level=self._backdrop_level(
+                    target,
+                    min_coord,
+                    max_coord,
+                ),
+            )
+        # Attach the double buffer BEFORE the level-switch re-slice: the
+        # FIRST switch of a session otherwise goes through vanilla
+        # set_data, where the node matrix applies instantly while the
+        # metered content upload lands frames later — old content under
+        # the new transform, a one-time visible jump.
+        if self._double_buffer and self._viewer.dims.ndisplay == 3:
+            node = self._get_display_node()
+            if (
+                node is not None
+                and getattr(node, '_texture', None) is not None
+            ):
+                with contextlib.suppress(Exception):
+                    dbuf = self._ensure_dbuf(node)
+                    if dbuf is not None:
+                        dbuf.hold_presents()
+        layer.refresh(extent=False)
+
+    def _release_auto_level(self) -> None:
+        """Give level control back to napari (e.g. on 2D or teardown)."""
+        layer = self._layer
+        if (
+            self._auto_locked is not None
+            and not self._user_locked
+            and layer._locked_data_level == self._auto_locked
+        ):
+            layer._locked_data_level = None
+            layer._reset_data_level()
+            # _reset_data_level cleared the lock state; preserve our flag
+            self._auto_locked = None
+            # the handover re-slice is a one-time full-pipeline refresh
+            # (~300ms on large 2D data): run it as its own event instead
+            # of inside whatever handler triggered the release
+            QTimer.singleShot(
+                0,
+                lambda: (
+                    None if self._closed else self._layer.refresh(extent=False)
+                ),
+            )
+        else:
+            self._auto_locked = None
+
+    # -- fetch passes --
+
+    @property
+    def _holding(self) -> bool:
+        return time.monotonic() < self._hold_until
+
+    def _on_interaction(self, event=None) -> None:
+        """Suspend streaming work while the user interacts.
+
+        Fires on every camera/scrub event. The hold window is extended
+        each time; the debounced ``_check`` (which fires once
+        interaction settles) ends it. Rate limiting alone does not keep
+        interaction smooth on slow GL drivers — any upload or slice
+        cascade landing in a drag frame stalls it — so during the hold
+        nothing lands at all: fetch workers pause, arriving batches are
+        buffered, throttled refreshes defer, and the GLIR upload meter
+        holds its carry.
+        """
+        if self._closed or not self._interaction_hold:
+            return
+        first = not self._holding
+        self._hold_until = time.monotonic() + self._hold_s
+        if first:
+            self._degrade_render_quality()
+        from napari.experimental import _glir_metering
+
+        if _glir_metering.is_installed():
+            _glir_metering.hold_uploads_until(self._hold_until)
+
+    def _on_dims_step_change(self, event=None) -> None:
+        """Handle a non-displayed dimension change (e.g. time step).
+
+        Unlike camera interaction, each step is a discrete new view.
+        Hold the double buffer so the old frame stays visible through
+        the re-slice, cancel the old fetch, and start loading the new
+        time step immediately.
+        """
+        if self._closed:
+            return
+        # Always hold presents on a step change — even while
+        # _holding (camera interaction).  The interaction hold
+        # pauses fetch work; the present hold keeps the old frame
+        # visible so the re-slice cannot flash zeros.
+        dbuf = self._dbuf
+        if dbuf is not None and hasattr(dbuf, 'hold_presents'):
+            dbuf.hold_presents()
+        if self._holding:
+            return
+        now = time.monotonic()
+        if now - self._last_step_change_time < self._step_change_min_interval:
+            return
+        self._last_step_change_time = now
+        self._cancel_active()
+        self._degrade_render_quality()
+        self._check()
+
+    def _degrade_render_quality(self) -> None:
+        """Coarsen the raycast step while frames must stay cheap.
+
+        Raycast cost scales inversely with the step size; on a
+        saturated GPU the deep command queue behind expensive frames is
+        what blocks the main thread in otherwise-cheap GL calls
+        (glBufferSubData, glFlush). Applied during interaction AND
+        while a texture upload backlog is draining (level switches
+        stage a full tile, which the GLIR meter spreads over many
+        frames — those frames must be cheap or the drain takes tens of
+        seconds). Quality is restored by :meth:`_maybe_restore_quality`
+        once interaction has settled and the backlog is gone.
+        """
+        viewer = self._viewer
+        if (
+            self._closed
+            or viewer is None
+            or self._interactive_step_rate is None
+            or self._saved_step is not None
+        ):
+            return
+        if viewer.dims.ndisplay != 3:
+            return
+        node = self._get_volume_node()
+        if node is None:
+            return
+        try:
+            saved = float(node.relative_step_size)
+            node.relative_step_size = saved * self._interactive_step_rate
+        except Exception:  # noqa: BLE001 # pragma: no cover - node variant
+            return
+        self._saved_step = (weakref.ref(node), saved)
+        # restore is event-driven, not polled: checked at hold end, per
+        # delivered batch (_update_node), at pass end, and when the
+        # GLIR meter reports its carry fully drained
+        from napari.experimental import _glir_metering
+
+        _glir_metering.add_drain_callback(self._on_uploads_drained)
+
+    def _on_uploads_drained(self) -> None:
+        """GLIR carry fully drained: swap pending textures, restore LOD."""
+        if self._closed:
+            return
+        if self._dbuf is not None:
+            node = self._get_display_node()
+            if (
+                node is not None
+                and self._dbuf.matches(node)
+                and self._dbuf.dirty
+            ):
+                with contextlib.suppress(Exception):
+                    self._dbuf.present()
+        self._maybe_restore_quality()
+
+    def _upload_backlog_bytes(self) -> int:
+        from napari.experimental import _glir_metering
+
+        if not _glir_metering.is_installed():
+            return 0
+        return _glir_metering.pending_upload_bytes()
+
+    def _maybe_restore_quality(self) -> None:
+        """Restore full render quality once frames can afford it."""
+        if self._saved_step is None:
+            return
+        if self._holding and not self._closed:
+            return
+        from napari.experimental import _glir_metering
+
+        if not self._closed and (
+            self._upload_backlog_bytes()
+            > _glir_metering.DEFAULT_FRAME_BUDGET_BYTES
+        ):
+            return  # still draining a big upload; keep frames cheap
+        self._restore_render_quality()
+
+    def _restore_render_quality(self) -> None:
+        if self._saved_step is None:
+            return
+        node_ref, saved = self._saved_step
+        self._saved_step = None
+        node = node_ref()
+        if node is None:
+            return
+        with contextlib.suppress(Exception):  # pragma: no cover - GL
+            node.relative_step_size = saved
+            node.update()
+
+    def _end_hold(self) -> None:
+        self._hold_until = 0.0
+        # quality restores via the poll once the upload backlog (e.g.
+        # batches buffered during the drag, or a level switch's full
+        # tile) has drained — not the instant the pointer stops
+        self._maybe_restore_quality()
+        if self._held_batches:
+            held, self._held_batches = self._held_batches, []
+            for generation, vdata, batch in held:
+                # stale generations are dropped inside _on_chunks
+                self._on_chunks(generation, vdata, batch)
+        if self._held_refresh:
+            self._held_refresh = False
+            self._refresh()
+
+    def _check(self, event=None) -> None:
+        """Start a fetch pass if the current view is not fully loaded."""
+        if self._closed:
+            return
+        self._end_hold()
+        layer = self._layer
+        if not layer.visible:
+            self._cancel_active()
+            return
+        self._ensure_persistent_overview()
+        self._apply_auto_level()
+        level = int(layer.data_level)
+        self._ensure_renderable_corners_3d(level)
+        min_coord, max_coord = self._level_interval(level)
+        if np.any(max_coord <= min_coord):
+            return
+        view_key = (level, tuple(min_coord), tuple(max_coord))
+        if view_key == self._active:
+            # A pass for exactly this view is in flight or already done.
+            if self._needs_final_reconcile and self._worker is None:
+                self._needs_final_reconcile = False
+                if self._dbuf is not None:
+                    # every chunk of the pass was patched, so the GPU
+                    # texture already matches what this refresh would
+                    # upload — skip the redundant full-tile upload and
+                    # let the refresh only fix slice state/thumbnail
+                    self._dbuf.suppress_next_full_upload()
+                self._refresh(final=True, force=True)
+            return
+        self._start_fetch(level, min_coord, max_coord)
+
+    def _ensure_renderable_corners_3d(self, level: int) -> None:
+        """Retile 3D corner pixels whose crop no GL driver could load.
+
+        Whatever path produced them (level switches mid-interaction,
+        stale slices, external corner writes), corners spanning far more
+        than the 3D tile budget yield a texture the driver refuses —
+        vispy then samples the zero texture and the canvas goes black.
+        Rewrite such corners into a view-centered tile through the same
+        tiling used by locked/auto level selection. Belt and braces: the
+        corner-producing paths are individually capped, but a black
+        canvas is bad enough to deserve a final guard.
+        """
+        if self._viewer.dims.ndisplay != 3:
+            return
+        layer = self._layer
+        corners_fn = getattr(layer, '_corners_for_locked_level', None)
+        tile_bytes = getattr(layer, '_tile_max_bytes_3d', None)
+        if corners_fn is None or tile_bytes is None:
+            return
+        displayed = list(layer._slice_input.displayed)
+        if len(displayed) not in (2, 3):
+            return
+        span = (
+            layer.corner_pixels[1, displayed]
+            - layer.corner_pixels[0, displayed]
+            + 1
+        )
+        # Per-axis limit first, whatever the total byte count. A layer
+        # with fewer than three dimensions is displayed in 3D as a
+        # single-plane volume, so a wide 2D level ends up as a
+        # (1, H, W) texture: napari refuses to downsample multiscale
+        # data and raises out of the set_data callback, leaving the
+        # volume node on its placeholder texture. Every later draw then
+        # uploads that empty texture and floods the log with GL errors.
+        if self._clamp_corners_to_axis_limit(level, displayed, span):
+            return
+        if len(displayed) != 3:
+            return
+        # napari uploads non-uint8 data as float32
+        tex_itemsize = 1 if self._data.dtype == np.uint8 else 4
+        crop_bytes = int(np.prod(span, dtype=np.int64)) * tex_itemsize
+        # allowance: levels within the interval budget legitimately
+        # render whole (the tiling's own shortcut), and quantized tiles
+        # exceed the tile budget a little — only corners clearly beyond
+        # both are rewritten
+        allowance = max(4 * int(tile_bytes), int(self._interval_max_bytes))
+        if crop_bytes <= allowance:
+            return
+        bbox = self._camera_bbox_level0(displayed)
+        view_dir = getattr(layer, '_view_direction_data', lambda _d: None)(
+            displayed,
+        )
+        with contextlib.suppress(Exception):
+            corners = corners_fn(level, displayed, bbox, view_dir)
+            if not np.array_equal(corners, layer.corner_pixels):
+                LOGGER.warning(
+                    'progressive loading: 3D corner pixels span %.0f MB '
+                    'of texture (tile budget %.0f MB); retiling to keep '
+                    'the texture loadable',
+                    crop_bytes / 1e6,
+                    tile_bytes / 1e6,
+                )
+                layer.corner_pixels = corners
+
+    def _on_ndisplay_change(self, event=None) -> None:
+        """Keep the crop loadable across a 2D/3D switch.
+
+        Runs on the event itself rather than the debounced check: the
+        re-slice for the new display mode happens immediately, and an
+        oversized volume upload raises out of napari's ``set_data``
+        callback (multiscale data is never downsampled), which leaves
+        the volume node on an empty placeholder texture.
+        """
+        if self._closed or self._viewer.dims.ndisplay != 3:
+            return
+        self._ensure_persistent_overview()
+        layer = self._layer
+        displayed = list(layer._slice_input.displayed)
+        if len(displayed) not in (2, 3):
+            return
+        with contextlib.suppress(Exception):
+            span = (
+                layer.corner_pixels[1, displayed]
+                - layer.corner_pixels[0, displayed]
+                + 1
+            )
+            self._clamp_corners_to_axis_limit(
+                int(layer.data_level), displayed, span
+            )
+
+    def _clamp_corners_to_axis_limit(
+        self, level: int, displayed: list[int], span: np.ndarray
+    ) -> bool:
+        """Shrink corner pixels exceeding the driver's 3D texture limit.
+
+        Returns True when the corners were rewritten (or could not be
+        checked), meaning the caller should not apply its own byte-budget
+        retiling on top.
+
+        The tile-byte budget alone does not catch this: a 2976 x 7200
+        uint8 level is only 21 MB, comfortably inside the budget, yet
+        no driver will load it as a 3D texture.
+        """
+        try:
+            from napari._vispy.utils.gl import get_max_texture_sizes
+
+            _, gl_max_3d = get_max_texture_sizes()
+        except Exception:  # noqa: BLE001
+            return False
+        if gl_max_3d is None or not np.any(span > gl_max_3d):
+            return False
+        layer = self._layer
+        level_shape = np.take(np.asarray(layer.level_shapes[level]), displayed)
+        extent = np.minimum(np.minimum(span, gl_max_3d), level_shape)
+        lo = layer.corner_pixels[0, displayed]
+        center = lo + span / 2.0
+        new_lo = np.clip(
+            (center - extent / 2).astype(int),
+            0,
+            np.maximum(level_shape - extent, 0),
+        )
+        corners = layer.corner_pixels.copy()
+        corners[0, displayed] = new_lo
+        corners[1, displayed] = new_lo + extent - 1
+        if not np.array_equal(corners, layer.corner_pixels):
+            LOGGER.warning(
+                'progressive loading: %s crop exceeds the 3D texture '
+                'limit of %d; rendering a %s region instead',
+                tuple(int(s) for s in span),
+                int(gl_max_3d),
+                tuple(int(e) for e in extent),
+            )
+            layer.corner_pixels = corners
+        return True
+
+    def _backdrop_level(
+        self,
+        level: int,
+        min_coord,
+        max_coord,
+        data=None,
+    ) -> int | None:
+        """Pick the best level to initialize newly exposed regions from.
+
+        Prefers the level closest in resolution to ``level`` whose resident
+        data fully covers the requested region — usually the level that was
+        just displayed, so a resolution switch keeps the previous data on
+        screen until the new chunks arrive. Falls back to the coarsest
+        level with any loaded data.
+
+        ``data`` overrides the pyramid to read: worker threads pass the
+        snapshot they took before starting, so a concurrent :meth:`close`
+        cannot pull the sources out from under them.
+        """
+        data = self._data if data is None else data
+        n_levels = len(data)
+        factors = data._scale_factors
+        ndim = data.ndim
+        candidates = sorted(
+            (c for c in range(n_levels) if c != level),
+            key=lambda c: (abs(c - level), c),
+        )
+        fallback = None
+        for cand in candidates:
+            src = data[cand]
+            if not src.loaded_chunks:
+                continue
+            cand_min = [
+                int(
+                    np.floor(
+                        min_coord[d] * factors[level][d] / factors[cand][d],
+                    ),
+                )
+                for d in range(ndim)
+            ]
+            cand_max = [
+                int(
+                    np.ceil(
+                        max_coord[d] * factors[level][d] / factors[cand][d],
+                    ),
+                )
+                for d in range(ndim)
+            ]
+            cand_min = np.clip(cand_min, 0, src.shape)
+            cand_max = np.clip(cand_max, 0, src.shape)
+            if src.covers(cand_min, cand_max):
+                return cand
+            if cand == n_levels - 1:
+                fallback = cand
+        return fallback
+
+    def _on_set_data(self, event=None) -> None:
+        """Fast path keeping the canvas filled across level switches.
+
+        napari re-slices immediately when it changes the data level, often
+        before any fetch pass has prepared that level's interval — the
+        slice then materializes zeros. Detect that here and schedule a
+        backdrop (outside the event emission stack) so at most one blank
+        frame is shown.
+        """
+        if self._closed or not self._layer.visible:
+            return
+        dbuf = self._dbuf
+        if dbuf is not None and hasattr(dbuf, 'capture_transform'):
+            # napari's vispy layer (connected before this handler) just
+            # staged the new tile AND applied its matrix; capture the
+            # matrix as pending and restore the front-matching one so
+            # the still-rendered old tile never draws misplaced. Runs
+            # inside the emission — nothing can paint in between.
+            dbuf.capture_transform()
+        if self._backdrop_pending:
+            return
+        level = int(self._layer.data_level)
+        min_coord, max_coord = self._level_interval(level)
+        if np.any(max_coord <= min_coord):
+            return
+        if self._data[level].covers(min_coord, max_coord):
+            return
+        if self._sync_backdrop_2d(level, min_coord, max_coord):
+            return
+        self._backdrop_pending = True
+        QTimer.singleShot(0, self._prepare_backdrop)
+
+    def _sync_backdrop_2d(self, level, min_coord, max_coord) -> bool:
+        """Backdrop a just-sliced empty 2D level before it can paint.
+
+        A level switch slices the new level's VirtualData before any
+        pass has prepared its interval, so the node receives zeros; the
+        deferred ``_prepare_backdrop`` refresh races the paint event and
+        sometimes loses — a visible black flash between scales. Here,
+        still inside the ``set_data`` emission (so before any paint),
+        the interval is filled from a coarser level (a memory copy —
+        cheap for a 2D view region) and the texture is patched directly,
+        skipping the slicing pipeline, which must not re-enter. Returns
+        False (caller falls back to the deferred path) when the GPU
+        patch cannot be validated, e.g. in 3D where this path is not
+        used.
+        """
+        if self._viewer.dims.ndisplay != 2:
+            return False
+        vdata = self._data[level]
+        if vdata.ndim < 2:
+            return False
+        # Only the on-screen region is prepared here — the slice (and
+        # texture) extend a render margin beyond the viewport, and an
+        # upsampling gather plus pixel copy of the full margin-sized
+        # tile costs tens of ms on the main thread. The margin starts
+        # as (invisible) zeros and is repaired off-thread below.
+        view_min, view_max = self._viewport_box_2d(level, min_coord, max_coord)
+        try:
+            self._data.set_interval(level, min_coord, max_coord)
+            self._backdrop_fill_layered(level, view_min, view_max)
+        except Exception:  # noqa: BLE001 # pragma: no cover - degenerate
+            return False
+        patched = self._patch_texture_region(
+            vdata,
+            [int(c) for c in view_min],
+            [int(c) for c in view_max],
+        )
+        if not patched:
+            # validation failed (e.g. cold start: the node's texture
+            # re-spec is still deferred to its first draw, so shapes
+            # don't match) — push the backdrop crop through set_data,
+            # which handles the re-spec itself
+            patched = self._set_node_data_from_hyperslice(vdata)
+        if patched:
+            # writes staged into the back texture; swap it in now so
+            # the very next paint shows the backdrop, not the zeros
+            self._update_node()
+            # the texture now equals the hyperslice; if the fetch pass
+            # starts on this same interval, its forced backdrop refresh
+            # may skip the redundant full-tile upload
+            self._synced_backdrop_key = (
+                level,
+                tuple(int(c) for c in min_coord),
+                tuple(int(c) for c in max_coord),
+            )
+            # backfill the off-screen margin on a worker thread
+            self._repair_backdrop()
+        return patched
+
+    def _backdrop_fill_layered(self, level, lo, hi, data=None) -> bool:
+        """Fill unloaded regions of ``[lo, hi)`` from every level with
+        useful resident data, coarsest first so finer sources overwrite
+        their overlap.
+
+        Unlike :meth:`_backdrop_level` (which requires one fully
+        covering source), this reuses *partially* covering levels —
+        including levels finer than the target, so zooming back out
+        reuses already-fetched detail instead of restarting from the
+        coarsest level.
+
+        ``data`` overrides the pyramid to read; see
+        :meth:`_backdrop_level`.
+        """
+        data = self._data if data is None else data
+        if len(data) == 0:
+            # close() drops the pyramid to release the resident level's
+            # memory, and a repair worker runs a plain function that
+            # quit() cannot interrupt — so teardown can land here.
+            return False
+        n_levels = len(data)
+        factors = data._scale_factors
+        ndim = data.ndim
+        # single-cover shortcut: when the closest-resolution source
+        # fully covers the region, one gather suffices — layering
+        # coarse->fine would run one gather per level with data, all
+        # but the last overwritten
+        full = self._backdrop_level(level, lo, hi, data=data)
+        if full is not None and full != level:
+            src = data[full]
+            cand_lo = [
+                int(np.floor(lo[d] * factors[level][d] / factors[full][d]))
+                for d in range(ndim)
+            ]
+            cand_hi = [
+                int(np.ceil(hi[d] * factors[level][d] / factors[full][d]))
+                for d in range(ndim)
+            ]
+            if src.covers(
+                np.clip(cand_lo, 0, src.shape),
+                np.clip(cand_hi, 0, src.shape),
+            ):
+                with contextlib.suppress(Exception):
+                    return bool(
+                        data.fill_unloaded_from(
+                            level,
+                            full,
+                            region=(list(lo), list(hi)),
+                        ),
+                    )
+        wrote = False
+        # high index = coarse; iterate coarse -> fine, skipping target
+        for cand in range(n_levels - 1, -1, -1):
+            if cand == level:
+                continue
+            src = data[cand]
+            if not src.loaded_chunks:
+                continue
+            with src.lock:
+                if src._min_coord is None:
+                    continue
+                src_min = [int(c) for c in src._min_coord]
+                src_max = [int(c) for c in src._max_coord]
+            # source interval expressed in target-level coordinates
+            ratio = [factors[cand][d] / factors[level][d] for d in range(ndim)]
+            region_lo = [
+                max(int(lo[d]), int(np.ceil(src_min[d] * ratio[d])))
+                for d in range(ndim)
+            ]
+            region_hi = [
+                min(int(hi[d]), int(np.floor(src_max[d] * ratio[d])))
+                for d in range(ndim)
+            ]
+            if any(b <= a for a, b in zip(region_lo, region_hi, strict=True)):
+                continue
+            with contextlib.suppress(Exception):
+                wrote = (
+                    data.fill_unloaded_from(
+                        level,
+                        cand,
+                        region=(region_lo, region_hi),
+                    )
+                    or wrote
+                )
+        return wrote
+
+    def _viewport_box_2d(self, level, min_coord, max_coord):
+        """The visible (no-margin) region of ``level``, clamped to the
+        given interval. Non-displayed dims keep the interval's bounds
+        (the current-step slab). Falls back to the full interval when no
+        viewport bbox has been recorded yet."""
+        lo = [int(c) for c in min_coord]
+        hi = [int(c) for c in max_coord]
+        bbox = getattr(self._layer, '_last_data_bbox', None)
+        displayed = tuple(self._layer._slice_input.displayed)
+        if bbox is None or bbox[0] != displayed or len(displayed) != 2:
+            return lo, hi
+        factors = np.take(
+            np.asarray(self._data._scale_factors[level], dtype=float),
+            list(displayed),
+        )
+        corners = np.asarray(bbox[1], dtype=float) / factors
+        for i, d in enumerate(displayed):
+            view_lo = int(max(np.floor(corners[0, i]), lo[d]))
+            view_hi = int(min(np.ceil(corners[1, i]) + 1, hi[d]))
+            if view_hi <= view_lo:
+                return [int(c) for c in min_coord], [int(c) for c in max_coord]
+            lo[d], hi[d] = view_lo, view_hi
+        return lo, hi
+
+    def _set_node_data_from_hyperslice(self, vdata: VirtualData) -> bool:
+        """Replace the node's data with the current corner-pixels crop
+        (at the current step of every non-displayed dim)."""
+        node = self._get_display_node(2)
+        if node is None:
+            return False
+        plane = self._displayed_plane(int(self._layer.data_level))
+        if plane is None:
+            return False
+        displayed, steps = plane
+        if len(displayed) != 2:
+            return False
+        corners = self._layer.corner_pixels
+        translate = vdata.translate
+        displayed_set = set(displayed)
+        src = tuple(
+            steps[d] - int(translate[d])
+            if d in steps
+            else slice(
+                int(corners[0, d]) - int(translate[d]),
+                int(corners[1, d]) + 1 - int(translate[d]),
+            )
+            if d in displayed_set
+            else slice(0, int(vdata.shape[d]))
+            for d in range(vdata.ndim)
+        )
+        try:
+            from napari._vispy.utils.gl import fix_data_dtype
+
+            with vdata.lock:
+                crop = np.ascontiguousarray(vdata.hyperslice[src])
+            if crop.ndim not in (2, 3) or 0 in crop.shape:
+                return False
+            gl_max = self._gl_max_texture_size_2d
+            if gl_max is not None and any(s > gl_max for s in crop.shape[:2]):
+                # a texture this large cannot be allocated (GLError);
+                # the normal pipeline downsamples oversize slices
+                return False
+            node.set_data(fix_data_dtype(crop))
+        except Exception:  # noqa: BLE001 # pragma: no cover - GL mismatch
+            return False
+        return True
+
+    def _prepare_backdrop(self) -> None:
+        self._backdrop_pending = False
+        if self._closed or not self._layer.visible:
+            return
+        level = int(self._layer.data_level)
+        min_coord, max_coord = self._level_interval(level)
+        if np.any(max_coord <= min_coord):
+            return
+        if self._data[level].covers(min_coord, max_coord):
+            return
+        # Set the interval cheap (carry-over + zeros): the full-tile
+        # upsample gather scales with the tile cap (200ms+ on the main
+        # thread at 33 MB), and a fetch pass with this same shape
+        # usually follows anyway. 2D fills the visible region
+        # synchronously (bounded work; usually a no-op right after
+        # _sync_backdrop_2d); the off-screen margin fills on the repair
+        # worker. In 3D carried-over content plus the double buffer
+        # keep the canvas filled until repaired content presents.
+        self._data.set_interval(level, min_coord, max_coord)
+        if self._viewer.dims.ndisplay == 2:
+            with contextlib.suppress(Exception):
+                self._backdrop_fill_layered(
+                    level,
+                    [int(c) for c in min_coord],
+                    [int(c) for c in max_coord],
+                )
+        dbuf = self._dbuf
+        if dbuf is not None and hasattr(dbuf, 'hold_presents'):
+            # the refresh below stages zeros + carry-over; keep the
+            # front on screen until the repair worker lands content
+            dbuf.hold_presents(
+                timeout=None if self._has_clipmap_overview() else 1.5
+            )
+        self._repair_backdrop()
+        self._refresh(force=True)
+
+    def _start_fetch(self, level: int, min_coord, max_coord) -> None:
+        if not self._chunk_warned:
+            self._chunk_warned = True
+            _warn_if_chunks_suboptimal(self._data)
+        self._cancel_active()
+        vdata = self._data[level]
+
+        # Set the interval cheap (carry-over + zeros): the backdrop
+        # upsample gather is too much main-thread time at pass start
+        # (the whole 16 MB tile in 3D; interval-sized regions in 2D).
+        # 2D fills the visible region synchronously (bounded work, and
+        # usually already done by _sync_backdrop_2d — refilling skips
+        # nothing visible since fills are idempotent over unloaded
+        # chunks); everything else fills on the repair worker. In 3D
+        # the double buffer keeps rendering the previous tile until the
+        # filled content presents.
+        self._data.set_interval(level, min_coord, max_coord)
+        if self._viewer.dims.ndisplay == 2:
+            # the FULL interval, synchronously. Restricting this to the
+            # recorded viewport box is tempting (4x less work with the
+            # render margin) but wrong: that box comes from the last
+            # rendered slice and lags the camera exactly during fast
+            # pans/zooms, leaving freshly exposed screen area unfilled
+            # (black) until a repair lands. Coverage beats the saved
+            # milliseconds.
+            with contextlib.suppress(Exception):
+                self._backdrop_fill_layered(
+                    level,
+                    [int(c) for c in min_coord],
+                    [int(c) for c in max_coord],
+                )
+        self._repair_backdrop()
+        self._active = (level, tuple(min_coord), tuple(max_coord))
+
+        queue = self._stage_queue(level)
+
+        if not queue:
+            # Everything visible is already resident (e.g. carried over
+            # from the previous interval); make sure the canvas shows it.
+            # Release any present veto BEFORE the refresh: the resident
+            # content is real, and in 2D the re-slice presents inline —
+            # a lingering step-change hold would veto it with nothing
+            # left to retry.
+            dbuf = self._dbuf
+            if dbuf is not None and hasattr(dbuf, 'release_presents'):
+                dbuf.release_presents()
+                # In 3D the refresh triggers an async re-slice that
+                # stages data into the back buffer via set_data_staged.
+                # Without a fetch worker there is no _on_fetch_finished
+                # to present the staged content; the GLIR drain callback
+                # swaps the back buffer in once its uploads complete.
+                from napari.experimental import _glir_metering
+
+                _glir_metering.add_drain_callback(self._on_uploads_drained)
+            self._refresh(final=True)
+            # present anything already staged (sync 2D re-slices land
+            # inside the refresh; async 3D content presents on drain)
+            self._update_node()
+            return
+
+        stages = [(level, queue)]
+        if self._coarse_first:
+            stages = self._ladder_stages(level, min_coord, max_coord) + stages
+
+        LOGGER.debug(
+            'starting fetch pass: level=%d interval=%s stages=%s',
+            level,
+            vdata.interval,
+            [(lvl, len(q)) for lvl, q in stages],
+        )
+
+        self._generation += 1
+        generation = self._generation
+        self._chunks_done = 0
+        self._chunks_total = sum(len(q) for _, q in stages)
+        self._pass_all_patched = True
+        self._needs_final_reconcile = False
+        if self._dbuf is not None:
+            # a new pass invalidates any pending "texture already
+            # matches" assertion from a previous reconcile
+            self._dbuf._suppress_full = False
+        self._pbar = self._make_progress(
+            self._chunks_total,
+            f'{self._layer.name}: loading level {level}',
+        )
+
+        # Attach the texture double buffer BEFORE the backdrop refresh
+        # below, so the pass's first full-tile upload (and any tile
+        # reallocation) is staged off the rendered path instead of
+        # re-specifying the bound texture in place.
+        if self._double_buffer:
+            node = self._get_display_node()
+            if (
+                node is not None
+                and getattr(node, '_texture', None) is not None
+            ):
+                with contextlib.suppress(Exception):
+                    self._ensure_dbuf(node)
+
+        # Show carried-over and backdrop content before the first chunk
+        # arrives so the canvas is never empty while fetching. This is
+        # a full-tile texture upload: keep frames cheap while the GLIR
+        # meter drains it (quality restores once the backlog is gone).
+        # When the synchronous backdrop already patched this exact
+        # interval, the GPU texture equals the hyperslice (patches and
+        # full refreshes both preserve that) — skip the redundant
+        # full-tile upload; the refresh still fixes slice state.
+        if self._dbuf is not None and self._synced_backdrop_key == (
+            level,
+            tuple(min_coord),
+            tuple(max_coord),
+        ):
+            self._dbuf.suppress_next_full_upload()
+        self._synced_backdrop_key = None
+        dbuf = self._dbuf
+        if dbuf is not None and hasattr(dbuf, 'hold_presents'):
+            # this pass-start rewrite is zeros + carry-over until the
+            # repair worker lands its backdrop; the front (previous
+            # tile, correctly placed via the transform hold) renders
+            # meanwhile
+            dbuf.hold_presents(
+                timeout=None if self._has_clipmap_overview() else 1.5
+            )
+        self._degrade_render_quality()
+        self._refresh(force=True)
+
+        self._stages = stages
+        self._start_stage(generation, 0)
+
+    def _stage_queue(
+        self,
+        level: int,
+        region=None,
+    ) -> list[tuple[slice, ...]]:
+        """Missing chunks of ``level``'s interval, in priority order.
+
+        ``region`` restricts the queue to a sub-region of the interval
+        (ladder stages fetch only the view's footprint at their level,
+        not whatever else the level keeps resident).
+        """
+        vdata = self._data[level]
+        interval = region if region is not None else vdata.interval
+        if interval is None:
+            return []
+        keys = chunk_slices(vdata, interval=interval)
+        if self._viewer.dims.ndisplay == 3:
+            queue = self._prioritize_3d(level, keys, interval)
+        else:
+            queue = chunk_priority_2D(keys, interval[0], interval[1])
+        return [
+            key for key in queue if _chunk_id(key) not in vdata.loaded_chunks
+        ]
+
+    def _ladder_stages(
+        self,
+        target: int,
+        min_coord,
+        max_coord,
+    ) -> list[tuple[int, list]]:
+        """Fetch stages for the levels between the resident coarsest and
+        the target, coarsest first.
+
+        Resolving a fresh view coarse-to-fine keeps the display
+        sharpening while a slow target level streams: each rung's
+        chunks arrive quickly (counts shrink geometrically with
+        coarseness) and are upsampled into the target's unloaded
+        regions (:meth:`_on_intermediate_chunks`), replacing the
+        coarsest-level backdrop step by step.
+        """
+        stages: list[tuple[int, list]] = []
+        factors = self._data._scale_factors
+        ndim = self._data.ndim
+        # a resident backdrop keeps every freshly created ladder
+        # interval showing real content from the start, so the layered
+        # backdrop fills can never source zeros from it
+        resident_loaded = bool(self._data[self._resident_level].loaded_chunks)
+        for lvl in range(self._resident_level - 1, target, -1):
+            vdata = self._data[lvl]
+            ratio = [factors[target][d] / factors[lvl][d] for d in range(ndim)]
+            region_min = np.array(
+                [int(np.floor(min_coord[d] * ratio[d])) for d in range(ndim)],
+                dtype=np.int64,
+            )
+            region_max = np.array(
+                [int(np.ceil(max_coord[d] * ratio[d])) for d in range(ndim)],
+                dtype=np.int64,
+            )
+            region_min = np.clip(region_min, 0, vdata.shape)
+            region_max = np.clip(region_max, 0, vdata.shape)
+            if np.any(region_max <= region_min):
+                continue
+            region_min, region_max = self._clamp_interval(
+                vdata,
+                region_min,
+                region_max,
+            )
+            if not vdata.covers(region_min, region_max):
+                # never clobber a level's already-fetched data with a
+                # smaller interval (scrolling back would re-show coarse
+                # content): grow to the union when the budget allows
+                new_min, new_max = region_min, region_max
+                existing = vdata.interval
+                if existing is not None:
+                    union_min = np.minimum(new_min, existing[0])
+                    union_max = np.maximum(new_max, existing[1])
+                    c_min, c_max = self._clamp_interval(
+                        vdata,
+                        union_min,
+                        union_max,
+                    )
+                    if np.all(c_min <= region_min) and np.all(
+                        region_max <= c_max,
+                    ):
+                        new_min, new_max = c_min, c_max
+                self._data.set_interval(
+                    lvl,
+                    new_min,
+                    new_max,
+                    backdrop_level=self._resident_level
+                    if resident_loaded
+                    else None,
+                )
+            queue = self._stage_queue(lvl, region=(region_min, region_max))
+            if queue:
+                stages.append((lvl, queue))
+        return stages
+
+    def _start_stage(self, generation: int, index: int) -> None:
+        """Submit the renderer plan through the configured loading engine."""
+        raise NotImplementedError
+
+    def _prioritize_3d(self, level, keys, interval):
+        camera = self._viewer.scene.camera
+        factors = np.asarray(self._data._scale_factors[level])
+        displayed = list(self._layer._slice_input.displayed)[-3:]
+        if len(displayed) < 3:
+            # mid ndisplay transition: displayed dims not 3D yet
+            return chunk_priority_2D(keys, interval[0], interval[1])
+        world_point = np.asarray(self._viewer.dims.point, dtype=float)
+        world_point[displayed] = np.asarray(camera.center, dtype=float)[-3:]
+        camera_center = np.asarray(
+            self._layer.world_to_data(world_point), dtype=float
+        )[displayed] / np.take(factors, displayed)
+        full_direction = np.zeros(self._layer.ndim, dtype=float)
+        full_direction[displayed] = np.asarray(
+            camera.view_direction, dtype=float
+        )[-3:]
+        view_direction = np.asarray(
+            self._layer._world_to_data_ray(full_direction), dtype=float
+        )[displayed] / np.take(factors, displayed)
+        # chunk_priority_3D sanitizes degenerate camera state internally
+        return chunk_priority_3D(
+            keys,
+            interval[0],
+            interval[1],
+            camera_center=camera_center,
+            view_direction=view_direction,
+        )
+
+    def _make_progress(self, total: int, description: str):
+        """Best-effort progress bar shown in the napari activity dock.
+
+        Disabled in 3D: the chunk fill-in is visible feedback there, and
+        Qt progress updates call processEvents(), which costs main-thread
+        time precisely when streaming is busiest.
+        """
+        if total < PROGRESS_MIN_CHUNKS:
+            return None
+        if self._viewer.dims.ndisplay == 3:
+            return None
+        try:
+            return progress(total=total, desc=description)
+        except Exception:  # noqa: BLE001 # pragma: no cover - cosmetic
+            return None
+
+    @staticmethod
+    def _close_progress(pbar) -> None:
+        if pbar is not None:
+            with contextlib.suppress(Exception):
+                pbar.close()
+
+    def _advance_progress(self, count: int = 1) -> None:
+        """Accumulate progress for the timer-driven flush.
+
+        ``QtLabeledProgressBar.setValue`` runs ``processEvents()``;
+        calling it from a chunk handler re-enters the event loop *inside*
+        that handler, nesting queued chunk deliveries and repaints there
+        (the dominant 2D streaming stall on slow GL stacks). Chunk
+        handlers only increment counters; the Qt update runs from a
+        timer at the top of the event loop.
+        """
+        self._pbar_pending += count
+        if self._closed or self._pbar_scheduled:
+            return
+        now = time.monotonic()
+        if now - self._pbar_last_flush < 0.2:
+            # ~5 flushes/s: the next batch after the window flushes,
+            # and the pass-end close covers the tail
+            return
+        self._pbar_last_flush = now
+        self._pbar_scheduled = True
+        try:
+            # zero-delay one-shot: fires on the next event-loop pass
+            # (outside any chunk handler) and self-disposes, so nothing
+            # outlives the loader
+            QTimer.singleShot(0, self._flush_progress)
+        except Exception:  # noqa: BLE001 # pragma: no cover - no Qt
+            self._pbar_scheduled = False
+
+    def _flush_progress(self) -> None:
+        """Deferred callback: push accumulated counts to the Qt bars."""
+        self._pbar_scheduled = False
+        if self._closed or self._pbar_flushing:
+            return
+        self._pbar_flushing = True
+        try:
+            count = self._pbar_pending
+            if count:
+                self._pbar_pending = 0
+                if self._pbar is not None:
+                    with contextlib.suppress(Exception):
+                        self._pbar.update(count)
+        finally:
+            self._pbar_flushing = False
+
+    def _cancel_active(self) -> None:
+        self._generation += 1
+        self._stages = []
+        self._held_batches.clear()  # all stale now
+        if self._worker is not None:
+            self._worker.quit()
+            self._worker = None
+        self._active = None
+        self._close_progress(self._pbar)
+        self._pbar = None
+        self._pbar_pending = 0
+
+    def _on_chunks(self, generation: int, vdata: VirtualData, batch) -> None:
+        """Handle a batch of fetched chunks (already applied off-thread)."""
+        if generation != self._generation or self._closed:
+            return
+        if self._holding:
+            # interaction in progress: no GPU patches, no refreshes, no
+            # progress churn; _end_hold replays these once it settles
+            self._held_batches.append((generation, vdata, batch))
+            return
+        block = None
+        if isinstance(batch, tuple):
+            batch, block = batch
+        self._chunks_done += len(batch)
+        if self._pbar is not None:
+            self._advance_progress(len(batch))
+        target = (
+            self._active[0]
+            if self._active is not None
+            else int(self._layer.data_level)
+        )
+        if vdata.scale_level != target:
+            # a coarse-first ladder stage: not rendered directly — fold
+            # it into the target level's backdrop instead
+            self._on_intermediate_chunks(vdata, batch)
+            return
+        final = self._chunks_done >= self._chunks_total
+        if final:
+            self._close_progress(self._pbar)
+            self._pbar = None
+        # While the pass is streaming, patched chunks keep the GPU texture
+        # identical to what a pipeline refresh would produce: each batch
+        # is one coalesced partial upload, and the only full re-slice +
+        # re-upload runs once per pass — at its start (backdrop) and,
+        # deferred to idle, after its end. Mid-pass full uploads were the
+        # main remaining UI stalls on slow GL drivers.
+        patched = self._texture_patching and self._patch_texture_batch(
+            vdata,
+            batch,
+            block=block,
+        )
+        if not patched:
+            self._pass_all_patched = False
+            self._refresh(final=final)
+            return
+        now = time.monotonic()
+        if final:
+            self._update_node()
+            if self._pass_all_patched:
+                # The texture already shows every chunk. Defer the full
+                # consistency refresh (thumbnail, slice state) to the
+                # next interaction, where it folds into the pass-start
+                # refresh instead of stalling the moment loading ends.
+                self._needs_final_reconcile = True
+            else:
+                self._refresh(final=True)
+        elif now - self._last_node_update >= max(
+            self._refresh_interval_s,
+            0.05,
+        ):
+            self._last_node_update = now
+            self._update_node()
+
+    def _on_intermediate_chunks(self, vdata: VirtualData, batch) -> None:
+        """Fold a ladder stage's fresh chunks into the rendered level.
+
+        Intermediate levels are never rendered directly: their payoff is
+        upsampling into the target level's not-yet-loaded chunks,
+        replacing the coarser backdrop there so the view sharpens level
+        by level while the target fetch streams. The fold runs on the
+        repair worker: the gather never blocks the GUI thread (drag
+        events during streaming stay responsive), and the repair's
+        layered coarsest-first fill means a partially loaded rung can
+        never write content coarser than what is already shown. Folds
+        coalesce naturally — repairs run one at a time — and the stage
+        end triggers a final one for anything skipped.
+        """
+        if batch:
+            self._repair_backdrop()
+
+    def _on_fetch_finished(self, generation: int) -> None:
+        if generation != self._generation or self._closed:
+            return
+        self._worker = None
+        dbuf = self._dbuf
+        if dbuf is not None and hasattr(dbuf, 'release_presents'):
+            # belt for the present veto: the pass is over, so whatever
+            # is staged (chunks, backdrop) is the best content there is
+            dbuf.release_presents()
+            node = self._get_display_node()
+            if node is not None and dbuf.matches(node):
+                with contextlib.suppress(Exception):
+                    dbuf.present()
+        self._maybe_restore_quality()
+
+    def _get_display_node(self, ndisplay: int | None = None):
+        try:
+            visual = self._viewer.window._qt_viewer.layer_to_visual[
+                self._layer
+            ]
+            if ndisplay is None:
+                ndisplay = self._viewer.dims.ndisplay
+            return visual._layer_node.get_node(ndisplay)
+        except (KeyError, AttributeError, RuntimeError):  # pragma: no cover
+            return None
+
+    def _get_volume_node(self):
+        return self._get_display_node(3)
+
+    def _has_clipmap_overview(self) -> bool:
+        """Whether a persistent coarse texture can seed the detail page."""
+        if self._closed or self._viewer.dims.ndisplay != 3:
+            return False
+        node = self._get_volume_node()
+        return bool(node is not None and node.clipmap_enabled)
+
+    def _displayed_plane(self, level: int):
+        """The displayed dims and the fixed level-coordinate steps of
+        every other dim for the current slice.
+
+        Returns ``(displayed, steps)`` where ``steps`` maps each
+        non-displayed dim to its integer position at ``level`` (the
+        same rounding the slicing pipeline applies), or ``None`` when
+        the rendered slice is not a plain single plane that patches can
+        represent: transposed display order, thick-slice projections,
+        or an unusable slice point.
+        """
+        layer = self._layer
+        displayed = list(layer._slice_input.displayed)
+        if displayed != sorted(displayed):
+            return None
+        ndim = self._data.ndim
+        try:
+            data_slice = layer._data_slice
+            factors = np.asarray(
+                layer.downsample_factors[level],
+                dtype=float,
+            )
+        except Exception:  # noqa: BLE001 # pragma: no cover - no slice yet
+            return None
+        steps: dict[int, int] = {}
+        n_slice = len(data_slice.point)
+        for d in range(ndim):
+            if d in displayed:
+                continue
+            if d >= n_slice:
+                # Dimension not tracked by the slicer (e.g. RGB
+                # channel): fully present in both hyperslice and
+                # texture — skip, don't step.
+                continue
+            point = data_slice.point[d]
+            if not np.isfinite(point):
+                return None
+            for margin in (
+                data_slice.margin_left[d],
+                data_slice.margin_right[d],
+            ):
+                if np.isfinite(margin) and margin:
+                    # thick-slice projection: the rendered plane is a
+                    # reduction over a slab, not a copyable plane
+                    return None
+            steps[d] = int(np.round(float(point) / factors[d]))
+        return displayed, steps
+
+    def _patch_texture_batch(
+        self,
+        vdata: VirtualData,
+        batch,
+        block=None,
+    ) -> bool:
+        """Upload a batch of chunks as ONE coalesced texture update.
+
+        Uploads the union bounding box of the batch from the hyperslice
+        in a single partial transfer — front-to-back ordering makes
+        batches spatially coherent, and many small GL calls cost more
+        than one slightly larger one. Voxels inside the box that are not
+        loaded yet simply re-upload their current (backdrop) content.
+        """
+        if not batch:
+            return True
+        ndisplay = self._viewer.dims.ndisplay
+        if ndisplay not in (2, 3) or vdata.ndim < ndisplay:
+            return False
+        if block is not None:
+            low, high, data = block
+            return self._patch_texture_region(vdata, low, high, block=data)
+        ndim = vdata.ndim
+        low = [min(int(key[d].start) for key in batch) for d in range(ndim)]
+        high = [max(int(key[d].stop) for key in batch) for d in range(ndim)]
+        return self._patch_texture_region(vdata, low, high)
+
+    def _patch_texture_region(
+        self,
+        vdata: VirtualData,
+        low,
+        high,
+        block=None,
+    ) -> bool:
+        """Write an absolute-coordinate region into the GPU texture.
+
+        A partial texture upload (glTexSubImage2D/3D) is orders of
+        magnitude cheaper than the re-slice plus whole-texture upload of
+        a pipeline refresh. Works for data of any dimensionality: the
+        texture holds the displayed dims' corner-pixels crop at the
+        current step of every other dim. Only used when the texture
+        demonstrably matches the current interval; any mismatch falls
+        back to a normal refresh.
+        """
+        ndisplay = self._viewer.dims.ndisplay
+        ndim = vdata.ndim
+        if (
+            ndisplay not in (2, 3)
+            or ndim < ndisplay
+            or len(low) != ndim
+            or vdata.interval is None
+        ):
+            return False
+        plane = self._displayed_plane(int(self._layer.data_level))
+        if plane is None:
+            return False
+        displayed, steps = plane
+        if len(displayed) != ndisplay:
+            return False
+        # regions that miss the displayed plane have nothing to upload —
+        # the hyperslice already holds them for other steps
+        for d, step in steps.items():
+            if not int(low[d]) <= step < int(high[d]):
+                return True
+        node = self._get_display_node(ndisplay)
+        if node is None:
+            return False
+        try:
+            texture = node._texture
+            dbuf = self._ensure_dbuf(node) if self._double_buffer else None
+            # during a pending reshape the bound texture still has the
+            # old tile's shape while staged patches target the new one,
+            # so validate against the pair's staging shape
+            tex_shape = (
+                dbuf.shape
+                if dbuf is not None
+                else tuple(texture.shape[:ndisplay])
+            )
+        except (AttributeError, TypeError, RuntimeError):  # pragma: no cover
+            return False
+        # The texture holds the corner-pixels crop of the level (the
+        # rendered tile), which sits inside the chunk-aligned interval.
+        corners = self._layer.corner_pixels
+        box_min = {d: int(corners[0, d]) for d in displayed}
+        box_max = {d: int(corners[1, d]) + 1 for d in displayed}
+        if tex_shape != tuple(box_max[d] - box_min[d] for d in displayed):
+            # texture not (yet) synced to the current tile
+            return False
+        region_low = [int(v) for v in low]
+        lo = {d: max(int(low[d]), box_min[d]) for d in displayed}
+        hi = {d: min(int(high[d]), box_max[d]) for d in displayed}
+        if any(hi[d] <= lo[d] for d in displayed):
+            return False
+        offset = tuple(lo[d] - box_min[d] for d in displayed)
+        displayed_set = set(displayed)
+        try:
+            if block is not None:
+                # precomputed contiguous copy from the fetch worker:
+                # index the displayed sub-box (and the plane of every
+                # other dim) out of it
+                inner = tuple(
+                    steps[d] - region_low[d]
+                    if d in steps
+                    else slice(lo[d] - region_low[d], hi[d] - region_low[d])
+                    if d in displayed_set
+                    else slice(None)
+                    for d in range(ndim)
+                )
+                sub = block[inner]
+                expected = tuple(hi[d] - lo[d] for d in displayed)
+                if sub.shape[: len(expected)] != expected:
+                    return False
+                sub = np.ascontiguousarray(sub)
+            else:
+                # region in absolute coords -> hyperslice coords
+                translate = vdata.translate
+                source = tuple(
+                    steps[d] - int(translate[d])
+                    if d in steps
+                    else slice(
+                        lo[d] - int(translate[d]),
+                        hi[d] - int(translate[d]),
+                    )
+                    if d in displayed_set
+                    else slice(None)
+                    for d in range(ndim)
+                )
+                with vdata.lock:
+                    sub = np.ascontiguousarray(vdata.hyperslice[source])
+            # napari uploads GL-incompatible dtypes (e.g. int16) as a
+            # converted type; patches must match the texture's dtype
+            tex_dtype = getattr(texture, '_data_dtype', None)
+            if tex_dtype is not None and sub.dtype != tex_dtype:
+                sub = sub.astype(tex_dtype)
+            if dbuf is not None:
+                # stream into the back texture; draws keep sampling the
+                # untouched front texture until the next present()
+                dbuf.stage(offset, sub)
+            else:
+                texture.set_data(sub, offset=offset)
+        except Exception:  # noqa: BLE001 # pragma: no cover - GL mismatch
+            return False
+        self._texture_patches += 1
+        return True
+
+    def _ensure_dbuf(self, node):
+        """(Re)build the double-buffered texture pair for ``node``."""
+        dbuf_cls = (
+            DoubleBufferedVolumeTexture
+            if self._viewer.dims.ndisplay == 3
+            else DoubleBufferedImageTexture
+        )
+        dbuf = self._dbuf
+        if dbuf is not None and type(dbuf) is dbuf_cls and dbuf.matches(node):
+            return dbuf
+        texture = getattr(node, '_texture', None)
+        if texture is None or getattr(texture, '_data_dtype', None) is None:
+            # the node still holds vispy's unresolved placeholder (e.g.
+            # the 10x10 RGBA checkerboard, internalformat unsettled):
+            # building a sibling from it raises a channel mismatch.
+            # Not an unsupported configuration — just too early; retry
+            # on a later patch, after the first real upload resolves it.
+            return None
+        pool = []
+        if dbuf is not None:
+            # carry the retired-texture pool across rebuilds (same GL
+            # context): pooled textures stay reusable and rebuilds do
+            # not pay delete + reallocate GPU syncs. Only between same
+            # texture classes — a 2D/3D switch closes the pool instead.
+            if type(dbuf) is dbuf_cls:
+                pool, dbuf._pool = dbuf._pool, []
+            with contextlib.suppress(Exception):
+                dbuf.close()
+            self._dbuf = None
+        try:
+            dbuf = dbuf_cls(node, pool=pool)
+            dbuf.attach_set_data()
+        except Exception:
+            LOGGER.warning(
+                'texture double buffering unavailable; falling back to '
+                'in-place texture patches',
+                exc_info=True,
+            )
+            self._double_buffer = False
+            for _key, tex in pool:
+                with contextlib.suppress(Exception):
+                    tex.delete()
+            return None
+        self._dbuf = dbuf
+        return dbuf
+
+    def _update_node(self) -> None:
+        node = self._get_display_node()
+        if node is not None:
+            if self._dbuf is not None and self._dbuf.matches(node):
+                try:
+                    self._dbuf.present()
+                except Exception:  # pragma: no cover - GL
+                    LOGGER.warning(
+                        'texture present failed; dropping double buffer',
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        self._dbuf.close()
+                    self._dbuf = None
+            with contextlib.suppress(RuntimeError):
+                node.update()
+        self._maybe_restore_quality()
+
+    def _refresh(self, final: bool = False, force: bool = False) -> None:
+        # During interaction, defer throttled refreshes entirely (the
+        # reload -> async re-slice cascade is main-thread work that
+        # would land in drag frames); forced refreshes — backdrops at
+        # pass boundaries, where the canvas would otherwise be wrong —
+        # still go through.
+        if self._holding and not force:
+            self._held_refresh = True
+            return
+        # Adaptive throttle: refresh as often as every chunk (so loading is
+        # visibly progressive) while never spending more than ~half the
+        # time re-slicing — large 3D volumes re-upload the whole texture
+        # per refresh, so their interval backs off automatically.
+        now = time.monotonic()
+        min_interval = max(
+            self._refresh_interval_s,
+            2.0 * self._last_refresh_duration,
+        )
+        if not (final or force) and now - self._last_refresh < min_interval:
+            return
+        self._last_refresh = now
+        start = time.monotonic()
+        self._layer.refresh(extent=False, highlight=False, thumbnail=final)
+        self._last_refresh_duration = time.monotonic() - start
+
+    def _repair_backdrop(self) -> None:
+        """Backfill unloaded regions of the active level from the coarsest.
+
+        The upsampling gather can take seconds for large tiles, so it runs
+        on a background thread (VirtualData is lock-guarded) limited to
+        the currently rendered region; the layer refreshes on completion.
+        """
+        if self._closed:
+            return
+        level = int(self._layer.data_level)
+        if level == self._resident_level:
+            return
+        min_coord, max_coord = self._level_interval(level)
+        if np.any(max_coord <= min_coord):
+            return
+        if self._repair_worker is not None:
+            # one repair at a time — but never DROP a request: the
+            # running repair covers a stale region during fast moves,
+            # and every other trigger may land while it is busy, which
+            # would leave the fresh region unfilled (black) until some
+            # unrelated later event. Chain a follow-up run instead.
+            self._repair_again = True
+            return
+
+        # Snapshot the pyramid for the worker. close() swaps self._data
+        # out to release the resident level, and cannot interrupt this
+        # worker (a plain function, so quit() only sets a flag nothing
+        # polls), so the worker must not read state teardown invalidates.
+        data = self._data
+        clipmap_prefill = self._has_clipmap_overview()
+
+        @thread_worker
+        def repair():
+            if self._closed:
+                return False, None
+            wrote = self._backdrop_fill_layered(
+                level,
+                min_coord,
+                max_coord,
+                data=data,
+            )
+            packed = None
+            if wrote and clipmap_prefill:
+                key = tuple(
+                    slice(int(low), int(high))
+                    for low, high in zip(min_coord, max_coord, strict=True)
+                )
+                packed = data[level].copy_chunk_union((key,))
+            return wrote, packed
+
+        worker = repair()
+
+        def on_done(result):
+            if self._repair_worker is worker:
+                self._repair_worker = None
+            if self._closed:
+                return
+            wrote, packed = result
+            dbuf = self._dbuf
+            clipmap = self._has_clipmap_overview()
+            patched = False
+            if clipmap and packed is not None:
+                region, block = packed
+                patched = self._patch_texture_region(
+                    data[level],
+                    region.start,
+                    region.stop,
+                    block=block,
+                )
+            # A clipmap hold is indefinite until the complete detail page
+            # contains either real fine data or spatially correct coarse
+            # data. If staging that prefill fails, pass completion remains
+            # the safe fallback that releases the old page.
+            if (
+                dbuf is not None
+                and hasattr(dbuf, 'release_presents')
+                and (not clipmap or patched or not wrote)
+            ):
+                dbuf.release_presents()
+            if patched:
+                self._update_node()
+            elif wrote:
+                self._refresh(force=True)
+            elif dbuf is not None:
+                # nothing to fill (fully carried over): present whatever
+                # is staged now that the veto is lifted
+                node = self._get_display_node()
+                if node is not None and dbuf.matches(node):
+                    with contextlib.suppress(Exception):
+                        dbuf.present()
+            if self._repair_again:
+                self._repair_again = False
+                self._repair_backdrop()
+
+        worker.returned.connect(on_done)
+        worker.errored.connect(
+            lambda _e: on_done((False, None))
+        )  # pragma: no cover
+        self._repair_worker = worker
+        worker.start()
+
+    def _ensure_persistent_overview(self) -> None:
+        """Optional renderer hook for persistent coarse coverage."""
+
+
+# ---------- public entry point ----------
+
+
+def _progressive_loaders(viewer) -> list[ProgressiveLoader]:
+    """Every loader currently attached to a layer of *viewer*."""
+    return [
+        loader
+        for layer in viewer.layers
+        if isinstance(
+            loader := layer.metadata.get('progressive_loader'),
+            ProgressiveLoader,
+        )
+    ]
+
+
+def _estimate_contrast_limits(array) -> tuple[float, float] | None:
+    """Estimate contrast limits from a central sample of an array."""
+    try:
+        key = []
+        for size in array.shape:
+            center = int(size) // 2
+            half = min(int(size), 256) // 2
+            key.append(slice(max(center - half, 0), center + half + 1))
+        sample = np.asarray(array[tuple(key)])
+    except Exception:  # pragma: no cover - estimation is best-effort
+        LOGGER.exception('contrast limit estimation failed')
+        return None
+    if sample.size == 0:
+        return None
+    low = float(np.min(sample))
+    high = float(np.max(sample))
+    if low == high:
+        high = low + 1
+    return low, high
+
+
+def _resolve_viewer_and_tile_cap(viewer, tile_max_bytes_3d):
+    """Create a viewer if needed and apply the tile-cap env override."""
+    if viewer is None:
+        from napari import Viewer
+
+        viewer = Viewer()
+    env_tile = os.environ.get('NAPARI_PROGRESSIVE_TILE_MAX_BYTES_3D')
+    if env_tile:
+        tile_max_bytes_3d = int(float(env_tile))
+    return viewer, tile_max_bytes_3d
+
+
+def _normalize_scale_for_float32(data, layer_kwargs, kind: str) -> None:
+    """Downscale deep pyramids so world extents stay float32-renderable.
+
+    vispy renders with float32: world extents beyond the precision limit
+    lose pixel accuracy and 3D rendering goes blank. If the caller did not
+    pass an explicit ``scale``, pick a power-of-two factor that keeps the
+    largest axis under :data:`FLOAT32_EXTENT_LIMIT`.
+
+    The factor shrinks the whole world about the origin, not just the
+    voxel grid: any ``translate`` and ``affine`` offset the caller passed
+    is in that same space and is scaled to match, so the layer keeps its
+    placement relative to the rest of the scene. ``rotate``/``shear`` and
+    the affine's linear part are scale-free and pass through untouched.
+    """
+    if layer_kwargs.get('scale') is not None:
+        return
+    max_extent = float(max(data.shape))
+    limit = float(FLOAT32_EXTENT_LIMIT)
+    if max_extent > limit:
+        factor = 2.0 ** -int(np.ceil(np.log2(max_extent / limit)))
+        # an RGB(A) layer has one fewer world axis than its data array
+        ndim = data.ndim - 1 if layer_kwargs.get('rgb') else data.ndim
+        layer_kwargs['scale'] = (factor,) * ndim
+        translate = layer_kwargs.get('translate')
+        if translate is not None:
+            layer_kwargs['translate'] = tuple(
+                factor * np.asarray(translate, dtype=float)
+            )
+        affine = layer_kwargs.get('affine')
+        if affine is not None:
+            from napari.utils.transforms import Affine
+
+            # copy rather than mutate: the caller may still own the
+            # transform (and napari coerces a matrix back to an Affine)
+            matrix = np.array(
+                affine.affine_matrix if isinstance(affine, Affine) else affine,
+                dtype=float,
+            )
+            matrix[:-1, -1] *= factor
+            layer_kwargs['affine'] = matrix
+        LOGGER.warning(
+            '%s extent %.3g exceeds float32 rendering precision; scaling '
+            'the layer by %g to keep it renderable. Pass scale= explicitly '
+            'to override.',
+            kind,
+            max_extent,
+            factor,
+        )
+
+
+def _attach_progressive_loader(
+    layer,
+    data,
+    viewer,
+    *,
+    interval_max_bytes,
+    tile_max_bytes_3d,
+    auto_level_3d,
+    max_pixel_size_3d,
+    max_bytes_per_second,
+    interaction_hold,
+    interactive_step_rate,
+    coarse_first,
+    debug_overlay=None,
+    loader_class=ProgressiveLoader,
+) -> ProgressiveLoader:
+    """Wire a constructed multiscale layer to a :class:`ProgressiveLoader`.
+
+    Shared tail of :func:`add_progressive_loading_image` and
+    :func:`add_progressive_loading_labels`: set the 3D tile extent before
+    the layer controls are built (so the resolution selector knows fine
+    levels render as sub-volume tiles and does not disable them), append
+    the layer, enable async slicing and GLIR upload metering, construct
+    the loader, and register window-close teardown.
+    """
+    tile_bytes = min(interval_max_bytes, tile_max_bytes_3d)
+    layer._max_tile_extent_3d = _tile_extent_3d_for(
+        _texture_dtype_3d(data.dtype), tile_bytes
+    )
+    layer._tile_max_bytes_3d = tile_bytes
+    viewer.layers.append(layer)
+    # Slice off the main thread: refreshes materialize the visible tile
+    # (np.asarray over up to hundreds of MB), which would otherwise block
+    # the UI. Layer.refresh only routes through the async slicer when the
+    # experimental setting is on; VirtualData access is lock-guarded, so
+    # concurrent slicing is safe.
+    from napari.settings import get_settings
+
+    settings = get_settings()
+    # inherit the snapshot from a progressive layer already on this
+    # viewer: reading the live state now would capture what that layer
+    # switched it *to*, and the last loader to close would restore async
+    # slicing instead of turning it off (see _restore_slicing)
+    slicing_restore = next(
+        (
+            other._slicing_restore
+            for other in _progressive_loaders(viewer)
+            if other._slicing_restore is not None
+        ),
+        (settings.experimental.async_, viewer._layer_slicer._force_sync),
+    )
+    settings.experimental.async_ = True
+    viewer._layer_slicer._force_sync = False
+    # Meter GLIR 3D texture uploads: without this, vispy drains every
+    # queued glTexSubImage3D inside the next draw — including interaction
+    # frames — which stalls the GUI for seconds on slow GL drivers
+    # (macOS GL-over-Metal).
+    from napari.experimental import _glir_metering
+
+    _glir_metering.install()
+    loader = loader_class(
+        viewer,
+        layer,
+        data,
+        auto_level_3d=auto_level_3d,
+        max_pixel_size_3d=max_pixel_size_3d,
+        interval_max_bytes=interval_max_bytes,
+        tile_max_bytes_3d=tile_max_bytes_3d,
+        max_bytes_per_second=max_bytes_per_second,
+        interaction_hold=interaction_hold,
+        interactive_step_rate=interactive_step_rate,
+        coarse_first=coarse_first,
+    )
+    loader._slicing_restore = slicing_restore
+    layer.metadata['progressive_loader'] = loader
+    if debug_overlay is None:
+        debug_overlay = bool(os.environ.get('NAPARI_PROGRESSIVE_DEBUG'))
+    if debug_overlay:
+        loader.enable_debug_overlay()
+    with contextlib.suppress(AttributeError):
+        # stop all background work when the window goes away
+        viewer.window._qt_window.destroyed.connect(loader.close)
+    return loader
+
+
+_CHUNK_WARN_BYTES = 50 * 1024 * 1024  # 50 MB
+_CHUNK_AXIS_COVERAGE = 0.5  # chunk covers >50% of array axis
+# An axis shorter than one tile cannot be split usefully, so a chunk
+# spanning it is not a problem (e.g. the channel axis of an RGB image).
+_CHUNK_MIN_SPLIT_AXIS = 64
+
+
+def _warn_if_chunks_suboptimal(data: MultiScaleVirtualData) -> None:
+    """Emit a napari notification when chunk shapes are too large."""
+    level0 = data.arrays[0]
+    cshape = chunk_shape_for(level0)
+    shape = level0.shape
+    itemsize = np.dtype(level0.dtype).itemsize
+
+    chunk_bytes = int(np.prod(cshape)) * itemsize
+    full_axes = [
+        i
+        for i, (c, s) in enumerate(zip(cshape, shape, strict=False))
+        if s > _CHUNK_MIN_SPLIT_AXIS and c / s > _CHUNK_AXIS_COVERAGE
+    ]
+
+    issues = []
+    if chunk_bytes > _CHUNK_WARN_BYTES:
+        mb = chunk_bytes / (1024 * 1024)
+        issues.append(f'each chunk is {mb:.0f} MB')
+    if full_axes:
+        axes_str = ', '.join(str(a) for a in full_axes)
+        issues.append(f'chunks span >50% of axis {axes_str}')
+
+    if issues:
+        msg = (
+            f'Progressive loading: chunk shape {cshape} may cause '
+            f'slow or flickery streaming ({"; ".join(issues)}). '
+            f'Consider rechunking to smaller tiles '
+            f'(e.g. 64³ or 128³) for best results.'
+        )
+        import warnings
+
+        warnings.warn(msg, stacklevel=2)
+
+
+def add_progressive_loading_image(img, viewer=None, **kwargs):
+    """Add an image through the LodStone progressive-loading integration."""
+    from napari.experimental._lodstone_loading import (
+        add_lodstone_loading_image,
+    )
+
+    return add_lodstone_loading_image(img, viewer=viewer, **kwargs)
+
+
+def add_progressive_loading_labels(labels, viewer=None, **kwargs):
+    """Add labels through the LodStone progressive-loading integration."""
+    from napari.experimental._lodstone_loading import (
+        add_lodstone_loading_labels,
+    )
+
+    return add_lodstone_loading_labels(labels, viewer=viewer, **kwargs)
