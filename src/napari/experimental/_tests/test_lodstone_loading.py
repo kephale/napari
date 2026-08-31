@@ -114,6 +114,25 @@ def test_target_applies_full_nd_chunk_before_render_callback() -> None:
     assert delivered == [(7, vdata, [region.slices()])]
 
 
+def test_target_reports_renderer_submissions() -> None:
+    vdata = _VirtualData()
+    delivered = []
+    loader = SimpleNamespace(
+        _data=[vdata],
+        _resident_level=None,
+        _on_resident_chunks=None,
+        _on_chunks=lambda generation, level, batch: delivered.append(batch),
+    )
+    target = _NapariTarget(loader)
+    block = np.ones((1, 4, 4), dtype=np.uint16)
+
+    target.apply(((0, (block.shape,), ([0, 0, 0], [1, 4, 4], block)),))
+
+    metrics = target.performance_metrics()
+    assert metrics.submitted_bytes == block.nbytes
+    assert metrics.presentations == 1
+
+
 def test_level_transforms_include_downsampling_and_layer_transform() -> None:
     layer_matrix = np.eye(3)
     layer_matrix[0, 0] = 3

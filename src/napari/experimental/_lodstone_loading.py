@@ -18,6 +18,7 @@ import numpy as np
 from lodstone import (
     Layout,
     LevelDiagnosticArray,
+    PerformanceRecorder,
     Plan,
     PlanComparison as _PlanComparison,
     Planner,
@@ -26,6 +27,7 @@ from lodstone import (
     Runtime,
     Stream,
     StreamDiagnostics,
+    TargetDiagnostics,
     TileKey,
     View,
     available_tile_keys,
@@ -264,7 +266,36 @@ class _NapariTarget:
         self.loader = loader
         self.generation = 0
         self._prepare_lock = Lock()
+        self._performance_lock = Lock()
+        self._submitted_bytes = 0
+        self._presentations = 0
         self.prepared_regions: dict[int, Region] = {}
+
+    def performance_metrics(self) -> TargetDiagnostics:
+        """Report texture submissions observable at napari's upload boundary."""
+        with self._performance_lock:
+            return TargetDiagnostics(
+                submitted_bytes=self._submitted_bytes,
+                presentations=self._presentations,
+            )
+
+    def _record_submission(self, level: int, batch, block) -> None:
+        if block is not None:
+            submitted = block[2].nbytes
+        else:
+            data = self.loader._data[level]
+            dtype = getattr(data, 'dtype', None)
+            if dtype is None:
+                dtype = data.values.dtype
+            itemsize = np.dtype(dtype).itemsize
+            submitted = sum(
+                int(np.prod([part.stop - part.start for part in key]))
+                * itemsize
+                for key in batch
+            )
+        with self._performance_lock:
+            self._submitted_bytes += submitted
+            self._presentations += 1
 
     def layout(self, view, pyramid) -> Layout:
         return Layout(
@@ -346,10 +377,12 @@ class _NapariTarget:
             resident = getattr(self.loader, '_resident_level', None)
             on_resident = getattr(self.loader, '_on_resident_chunks', None)
             if level == resident and on_resident is not None:
+                self._record_submission(level, batch, block)
                 on_resident(
                     self.loader._data[level],
                     (batch, block) if block is not None else batch,
                 )
+            self._record_submission(level, batch, block)
             self.loader._on_chunks(
                 self.generation,
                 self.loader._data[level],
@@ -434,6 +467,11 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             raise
         self._disconnect_lodstone_status = (
             self._lodstone_stream.on_status_changed(self._on_lodstone_status)
+        )
+        self._performance_recorder = PerformanceRecorder(
+            self._lodstone_stream,
+            host='napari',
+            backend='vispy',
         )
         self._lodstone_enabled = True
         self._check()
@@ -708,6 +746,11 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         """Recent exact-plan native-read traces, oldest first."""
         return tuple(self._execution_diagnostics)
 
+    @property
+    def performance_records(self) -> tuple[dict[str, Any], ...]:
+        """Comparable Lodstone stream and renderer-boundary measurements."""
+        return self._performance_recorder.records()
+
     def _on_lodstone_status(self, status) -> None:
         stream = self._lodstone_stream
         if status.state in {'complete', 'failed'} and stream is not None:
@@ -810,6 +853,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         if stream is not None:
             stream.close()
             self._record_execution_diagnostics(stream.diagnostics, 'closed')
+        self._performance_recorder.close()
         runtime = self._lodstone_runtime
         self._lodstone_runtime = None
         if runtime is not None:
