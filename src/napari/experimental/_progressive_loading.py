@@ -210,6 +210,40 @@ def distance_from_camera_center_line(points, camera) -> np.ndarray:
     return distances
 
 
+def _orientation_signs(camera) -> np.ndarray:
+    """Return +1 per ZYX axis at napari's default orientation, else -1."""
+    orientation = getattr(camera, 'orientation', None)
+    if orientation is None:
+        return np.ones(3, dtype=float)
+    defaults = ('towards', 'down', 'right')
+    return np.array(
+        [
+            1.0 if getattr(axis, 'value', axis) == default else -1.0
+            for axis, default in zip(orientation, defaults, strict=True)
+        ]
+    )
+
+
+def _drawn_camera_axes(
+    camera,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the view, up and right directions the canvas actually draws.
+
+    ``view_direction`` and ``up_direction`` come from the Euler angles alone,
+    but a flipped orientation also changes the drawn camera. Angles are negated
+    per flipped axis, in XYZ order, and the result is mirrored per axis.
+    """
+    signs = _orientation_signs(camera)
+    source = camera
+    if np.any(signs < 0):
+        from napari.components import Camera
+
+        source = Camera(angles=tuple(np.asarray(camera.angles) * signs[::-1]))
+    view = np.asarray(source.view_direction, dtype=float)
+    up = np.asarray(source.up_direction, dtype=float)
+    return signs * view, signs * up, signs * np.cross(view, up)
+
+
 def _front_depth_segment(
     center: np.ndarray,
     direction: np.ndarray,
@@ -1229,18 +1263,15 @@ class ProgressiveLoader:
             np.asarray(self._layer.scale, dtype=float),
             list(displayed_axes),
         )
-        # Canvas size is (width, height), while the camera basis is
-        # (up, right). Keep those spans paired correctly on non-square
-        # canvases.
+        # Canvas size is (height, width), matching the (up, right) camera
+        # basis. Keep those spans paired correctly on non-square canvases.
         screen_half = canvas_size[:2] / (2 * zoom)
         screen_radius = float(np.max(screen_half))
         half_extent = screen_radius / np.maximum(layer_scale, 1e-12)
         if self._viewer.dims.ndisplay == 3:
             try:
                 directions = []
-                view_world = np.asarray(camera.view_direction, dtype=float)
-                up_world = np.asarray(camera.up_direction, dtype=float)
-                right_world = np.cross(up_world, view_world)
+                view_world, up_world, right_world = _drawn_camera_axes(camera)
                 for world_direction in (up_world, right_world, view_world):
                     full_direction = np.zeros(self._layer.ndim, dtype=float)
                     full_direction[list(displayed_axes)] = world_direction[
@@ -1252,9 +1283,9 @@ class ProgressiveLoader:
                     )[list(displayed_axes)]
                     directions.append(data_direction)
                 up_data, right_data, view_data = directions
-                lateral_half_extent = screen_half[1] * np.abs(
+                lateral_half_extent = screen_half[0] * np.abs(
                     up_data
-                ) + screen_half[0] * np.abs(right_data)
+                ) + screen_half[1] * np.abs(right_data)
                 depth_length = 0.7 * screen_radius
                 front = _front_depth_segment(
                     center,

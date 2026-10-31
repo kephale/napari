@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 from types import SimpleNamespace
 
 import dask.array as da
@@ -234,15 +235,25 @@ def _drawn_world_to_clip(viewer, ndisplay: int) -> np.ndarray:
 
 
 @pytest.mark.parametrize('ndisplay', [2, 3])
+@pytest.mark.parametrize(
+    'orientation',
+    list(
+        itertools.product(
+            ('towards', 'away'), ('down', 'up'), ('right', 'left')
+        )
+    ),
+)
 def test_camera_view_matches_the_drawn_camera(
     qtbot,
     make_napari_viewer,
     ndisplay,
+    orientation,
 ) -> None:
     viewer = make_napari_viewer(show=True)
     layer = viewer.add_image(np.zeros((8, 16, 32), dtype=np.uint8))
     viewer.dims.ndisplay = ndisplay
     qtbot.wait(50)
+    viewer.camera.orientation = orientation
     viewer.camera.center = (2, 5, 9)
     viewer.camera.zoom = 3
     if ndisplay == 3:

@@ -428,6 +428,7 @@ def test_camera_bbox_covers_rotated_screen_plane(
     bbox = loader._camera_bbox_level0(displayed)
     assert bbox is not None
 
+    # napari reports canvas size as (height, width).
     screen_half = np.asarray(viewer.canvas.size) / (2 * camera.zoom)
     data_directions = []
     view = np.asarray(camera.view_direction, dtype=float)
@@ -441,11 +442,38 @@ def test_camera_bbox_covers_rotated_screen_plane(
     center = bbox.mean(axis=0)
     for up_sign, right_sign in itertools.product((-1, 1), repeat=2):
         corner = center + (
-            up_sign * screen_half[1] * data_directions[0]
-            + right_sign * screen_half[0] * data_directions[1]
+            up_sign * screen_half[0] * data_directions[0]
+            + right_sign * screen_half[1] * data_directions[1]
         )
         assert np.all(corner >= bbox[0] - 1e-9)
         assert np.all(corner <= bbox[1] + 1e-9)
+    loader.close()
+
+
+def test_camera_bbox_is_wider_than_tall_on_a_wide_canvas(
+    make_napari_viewer,
+    multiscale_3d_arrays,
+):
+    from types import SimpleNamespace
+
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    camera = viewer.scene.camera
+    camera.angles = (0, 0, 90)
+    real_viewer = loader._viewer
+    loader._viewer = SimpleNamespace(
+        scene=real_viewer.scene,
+        dims=real_viewer.dims,
+        canvas=SimpleNamespace(size=(200, 1000)),
+    )
+    displayed = list(layer._slice_input.displayed)
+    bbox = loader._camera_bbox_level0(displayed)
+    extent = bbox[1] - bbox[0]
+
+    assert extent[2] > 2 * extent[1]
+    loader._viewer = real_viewer
     loader.close()
 
 
@@ -470,7 +498,8 @@ def test_camera_bbox_covers_non_square_anisotropic_canvas(
     loader._viewer = SimpleNamespace(
         scene=real_viewer.scene,
         dims=real_viewer.dims,
-        canvas=SimpleNamespace(size=(1200, 400)),
+        # napari reports canvas size as (height, width).
+        canvas=SimpleNamespace(size=(400, 1200)),
     )
     displayed = list(layer._slice_input.displayed)
     bbox = loader._camera_bbox_level0(displayed)

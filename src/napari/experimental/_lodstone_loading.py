@@ -42,8 +42,10 @@ from napari.experimental._progressive_loading import (
     DEFAULT_TILE_MAX_BYTES_3D,
     ProgressiveLoader,
     _attach_progressive_loader,
+    _drawn_camera_axes,
     _estimate_contrast_limits,
     _normalize_scale_for_float32,
+    _orientation_signs,
     _pack_upload_block,
     _resolve_viewer_and_tile_cap,
     chunk_priority_2D,
@@ -183,21 +185,28 @@ def _camera_view(
     matrix = np.eye(4, dtype=float)
     matrix[:3, :] = 0.0
     if ndisplay == 2:
+        _, row_sign, column_sign = _orientation_signs(camera)
         x_scale, y_scale = 2.0 * zoom / np.asarray(viewport, dtype=float)
-        # Screen X follows the last displayed axis; screen Y points against
-        # the first, because napari draws rows downward.
+        x_scale *= column_sign
+        # Screen Y points against the first displayed axis by default, because
+        # napari draws rows downward.
+        y_scale *= row_sign
         matrix[0, 1] = x_scale
         matrix[1, 0] = -y_scale
         matrix[0, 3] = -x_scale * center[1]
         matrix[1, 3] = y_scale * center[0]
         eye = None
     else:
-        view_direction = np.asarray(camera.view_direction, dtype=float)
-        up_direction = np.asarray(camera.up_direction, dtype=float)
-        view_direction /= max(np.linalg.norm(view_direction), 1e-12)
-        up_direction /= max(np.linalg.norm(up_direction), 1e-12)
-        right_direction = np.cross(view_direction, up_direction)
-        right_direction /= max(np.linalg.norm(right_direction), 1e-12)
+        view_direction, up_direction, right_direction = _drawn_camera_axes(
+            camera
+        )
+        view_direction = view_direction / max(
+            np.linalg.norm(view_direction), 1e-12
+        )
+        up_direction = up_direction / max(np.linalg.norm(up_direction), 1e-12)
+        right_direction = right_direction / max(
+            np.linalg.norm(right_direction), 1e-12
+        )
         rows = (right_direction, up_direction, view_direction)
         projection_center = center
         if depth_center is not None:
