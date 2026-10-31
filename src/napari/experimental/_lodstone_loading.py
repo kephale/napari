@@ -170,7 +170,8 @@ def _camera_view(
     ndim = len(shape)
     displayed = tuple(int(axis) for axis in layer._slice_input.displayed)
     ndisplay = len(displayed)
-    viewport = tuple(max(int(value), 1) for value in viewer.canvas.size)
+    # napari reports canvas size as (height, width); Lodstone uses (width, height).
+    viewport = tuple(max(int(value), 1) for value in viewer.canvas.size[::-1])
     scene = getattr(viewer, 'scene', None)
     camera = scene.camera if scene is not None else viewer.camera
     center = np.asarray(camera.center, dtype=float)[-ndisplay:]
@@ -182,20 +183,22 @@ def _camera_view(
     matrix = np.eye(4, dtype=float)
     matrix[:3, :] = 0.0
     if ndisplay == 2:
-        scales = 2.0 * zoom / np.asarray(viewport, dtype=float)
-        matrix[0, 0] = scales[0]
-        matrix[1, 1] = scales[1]
-        matrix[0, 3] = -scales[0] * center[0]
-        matrix[1, 3] = -scales[1] * center[1]
+        x_scale, y_scale = 2.0 * zoom / np.asarray(viewport, dtype=float)
+        # Screen X follows the last displayed axis; screen Y points against
+        # the first, because napari draws rows downward.
+        matrix[0, 1] = x_scale
+        matrix[1, 0] = -y_scale
+        matrix[0, 3] = -x_scale * center[1]
+        matrix[1, 3] = y_scale * center[0]
         eye = None
     else:
         view_direction = np.asarray(camera.view_direction, dtype=float)
         up_direction = np.asarray(camera.up_direction, dtype=float)
         view_direction /= max(np.linalg.norm(view_direction), 1e-12)
         up_direction /= max(np.linalg.norm(up_direction), 1e-12)
-        right_direction = np.cross(up_direction, view_direction)
+        right_direction = np.cross(view_direction, up_direction)
         right_direction /= max(np.linalg.norm(right_direction), 1e-12)
-        rows = (up_direction, right_direction, view_direction)
+        rows = (right_direction, up_direction, view_direction)
         projection_center = center
         if depth_center is not None:
             projection_center = np.asarray(depth_center, dtype=float)

@@ -165,14 +165,16 @@ def test_camera_view_captures_2d_viewport_center_and_zoom() -> None:
 
     view = _camera_view(viewer, layer, (100, 100), depth_span=1)
 
-    assert view.viewport == (200, 400)
+    # napari's canvas size is (height, width); a Lodstone viewport is the reverse.
+    assert view.viewport == (400, 200)
     np.testing.assert_allclose(
         view.world_to_clip @ np.array([10, 20, 0, 1]),
         (0, 0, 0, 1),
     )
     # Four pixels per world unit on both canvas axes.
-    assert view.world_to_clip[0, 0] * view.viewport[0] / 2 == 4
-    assert view.world_to_clip[1, 1] * view.viewport[1] / 2 == 4
+    assert view.world_to_clip[0, 1] * view.viewport[0] / 2 == 4
+    # Rows run down the screen, so clip Y falls as the row index grows.
+    assert view.world_to_clip[1, 0] * view.viewport[1] / 2 == -4
 
 
 def test_camera_view_captures_3d_orientation_and_hidden_index() -> None:
@@ -212,6 +214,50 @@ def test_camera_view_captures_3d_orientation_and_hidden_index() -> None:
     assert (view.world_to_clip @ np.array([7, 16, 24, 1]))[2] > 0
 
 
+def _drawn_world_to_clip(viewer, ndisplay: int) -> np.ndarray:
+    """Return the matrix the VisPy scene draws with, in displayed-axis order."""
+    canvas = viewer.window._qt_viewer.canvas
+    height, width = canvas.size
+    points = np.zeros((ndisplay + 1, 4))
+    points[:, 3] = 1.0
+    for axis in range(ndisplay):
+        points[axis + 1, ndisplay - axis - 1] = 1.0
+    mapped = np.asarray(canvas.view.scene.transform.map(points), dtype=float)
+    framebuffer = np.eye(4)
+    framebuffer[:, 3] = mapped[0]
+    for axis in range(ndisplay):
+        framebuffer[:, axis] = mapped[axis + 1] - mapped[0]
+    to_clip = np.eye(4)
+    to_clip[0] = (2.0 / width, 0.0, 0.0, -1.0)
+    to_clip[1] = (0.0, -2.0 / height, 0.0, 1.0)
+    return to_clip @ framebuffer
+
+
+@pytest.mark.parametrize('ndisplay', [2, 3])
+def test_camera_view_matches_the_drawn_camera(
+    qtbot,
+    make_napari_viewer,
+    ndisplay,
+) -> None:
+    viewer = make_napari_viewer(show=True)
+    layer = viewer.add_image(np.zeros((8, 16, 32), dtype=np.uint8))
+    viewer.dims.ndisplay = ndisplay
+    qtbot.wait(50)
+    viewer.camera.center = (2, 5, 9)
+    viewer.camera.zoom = 3
+    if ndisplay == 3:
+        viewer.camera.set_view_direction((0.6, 0.2, -0.3), (0.1, -1, 0.2))
+    qtbot.wait(50)
+
+    view = _camera_view(viewer, layer, layer.data.shape, depth_span=100)
+
+    np.testing.assert_allclose(
+        view.world_to_clip[:2],
+        _drawn_world_to_clip(viewer, ndisplay)[:2],
+        atol=1e-6,
+    )
+
+
 def test_real_fetch_pass_records_napari_and_lodstone_plans(
     qtbot,
     make_napari_viewer,
@@ -229,7 +275,7 @@ def test_real_fetch_pass_records_napari_and_lodstone_plans(
         qtbot.waitUntil(lambda: bool(loader._plan_comparisons), timeout=10000)
         comparison = loader.plan_comparisons[-1]
 
-        assert comparison.view.viewport == viewer.canvas.size
+        assert comparison.view.viewport == viewer.canvas.size[::-1]
         assert comparison.view.displayed_axes == tuple(
             layer._slice_input.displayed
         )
