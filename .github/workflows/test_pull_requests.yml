@@ -103,10 +103,18 @@ jobs:
         include:
           # when changing these, try to keep full coverage of supported
           # python versions so we test at least once everywhere
+          # install Lodstone so the progressive-loading tests run instead of
+          # skipping (adds tox_extras to the base ubuntu-latest entry)
+          - python: "3.14"
+            platform: ubuntu-latest
+            backend: pyqt6
+            coverage: cov
+            tox_extras: "progressive"
           - python: "3.14"
             platform: windows-latest
             backend: pyqt6
             coverage: cov
+            tox_extras: "progressive"
           # test with no numba and on macOS intel
           - python: "3.14"
             platform: macos-15-intel
@@ -118,6 +126,7 @@ jobs:
             backend: pyqt6
             coverage: no_cov
             timeout-minutes: 60
+            tox_extras: "progressive"
           # minimum specified requirements
           - python: "3.11"
             platform: ubuntu-22.04
@@ -146,6 +155,7 @@ jobs:
             platform: ubuntu-latest
             backend: pyside6
             coverage: cov
+            tox_extras: "progressive"
           # linux aarch64 test
           - python: "3.14"
             platform: ubuntu-24.04-arm
