@@ -755,6 +755,7 @@ class ScalarFieldBase(Layer, ABC):
         # (e.g. Z=42, Y=304, X=657) shows more of the volume.
         tile_bytes = self._tile_max_bytes_3d
         gl_max = gl_max_3d if gl_max_3d is not None else extent_cap
+        max_elements: int | None = None
         if tile_bytes is not None:
             # Vispy keeps uint8 volume textures compact but normalizes
             # other source dtypes into float32 textures.
@@ -785,7 +786,7 @@ class ScalarFieldBase(Layer, ABC):
                 ]
             )
             center = bbox.mean(axis=0)
-            if tile_bytes is not None:
+            if max_elements is not None:
                 # Spend the texture budget around the rotated viewport's
                 # actual per-axis footprint.  A fixed anisotropic tile based
                 # only on the dataset shape can be too shallow along a
