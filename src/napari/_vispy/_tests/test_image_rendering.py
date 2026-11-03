@@ -51,6 +51,38 @@ def test_image_rendering(make_napari_viewer):
     assert vispy_layer.node.interpolation == 'custom'
 
 
+def test_volume_clipmap_renders_overview_outside_detail(
+    qapp,
+    make_napari_viewer,
+):
+    """A blank high-resolution crop must not hide coarse context."""
+    viewer = make_napari_viewer(show=True)
+    viewer.dims.ndisplay = 3
+    layer = viewer.add_image(
+        np.zeros((16, 16, 16), dtype=np.uint8),
+        contrast_limits=(0, 1),
+        rendering='mip',
+    )
+    visual = viewer.window._qt_viewer.layer_to_visual[layer]
+    node = visual.node
+    node.enable_clipmap(
+        np.ones((16, 16, 16), dtype=np.uint8),
+        full_shape=(64, 64, 64),
+    )
+    node.set_clipmap_detail_bounds((24, 24, 24), (40, 40, 40))
+    # Vispy rebuilds this lookup lazily when interpolation changes. The
+    # rebuild must retain the movable detail box instead of resetting it to
+    # the full volume and hiding the overview.
+    node._build_interpolation()
+    visual._on_matrix_change()
+    viewer.reset_view()
+    qapp.processEvents()
+
+    screenshot = viewer.screenshot(canvas_only=True, flash=False)
+
+    assert np.count_nonzero(screenshot[..., :3]) > 100
+
+
 @skip_on_win_ci
 def test_visibility_consistency(qapp, make_napari_viewer):
     """Make sure toggling visibility maintains image contrast.

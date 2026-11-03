@@ -146,6 +146,22 @@ class VispyScalarFieldBaseLayer(VispyBaseLayer[ScalarFieldBase]):
             node.set_data(data)
             node.visible = not self.layer._slice.empty and self.layer.visible
 
+        if (
+            ndisplay == 3
+            and isinstance(node, VolumeNode)
+            and node.clipmap_enabled
+        ):
+            displayed = list(self.layer._slice_input.displayed)
+            corners = self.layer.corner_pixels
+            scale = self.layer.downsample_factors[self.layer.data_level][
+                displayed
+            ]
+            node.set_clipmap_detail_bounds(
+                corners[0, displayed].tolist(),
+                (corners[1, displayed] + 1).tolist(),
+                scale=scale,
+            )
+
         # Call to update order of translation values with new dims:
         self._on_matrix_change()
         node.update()

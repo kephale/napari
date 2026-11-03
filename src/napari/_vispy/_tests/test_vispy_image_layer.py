@@ -63,6 +63,46 @@ def test_3d_slice_of_3d_image_with_order(order):
     np.testing.assert_array_equal((8, 8, 8), scene_size)
 
 
+def test_volume_clipmap_keeps_full_geometry_and_detail_texture():
+    image = Image(np.zeros((8, 8, 8), dtype=np.uint16))
+    visual = VispyImageLayer(image, font_info=FontInfo())
+    image._slice_dims(Dims(ndim=3, ndisplay=3))
+    node = visual.node
+
+    node.enable_clipmap(
+        np.zeros((4, 5, 6), dtype=np.uint16),
+        full_shape=(16, 20, 24),
+    )
+    node.set_clipmap_detail_bounds((4, 5, 6), (12, 13, 14))
+
+    assert node.clipmap_enabled
+    assert node._vol_shape == (16, 20, 24)
+    assert tuple(node._texture.shape[:3]) == (8, 8, 8)
+    assert tuple(node._overview_texture.shape[:3]) == (4, 5, 6)
+    assert node._clipmap_lookup is not None
+
+
+def test_volume_clipmap_scales_level_coordinates_to_level_zero():
+    image = Image(np.zeros((8, 8, 8), dtype=np.uint16))
+    visual = VispyImageLayer(image, font_info=FontInfo())
+    image._slice_dims(Dims(ndim=3, ndisplay=3))
+    node = visual.node
+    node.enable_clipmap(
+        np.zeros((4, 4, 4), dtype=np.uint16),
+        full_shape=(64, 80, 96),
+    )
+
+    node.set_clipmap_detail_bounds(
+        (4, 5, 6),
+        (12, 13, 14),
+        scale=(2, 4, 8),
+    )
+
+    low, high = node._clipmap_detail_bounds
+    np.testing.assert_allclose(low, (0.5, 0.25, 0.125))
+    np.testing.assert_allclose(high, (14 / 12, 0.65, 0.375))
+
+
 @pytest.mark.parametrize('order', list(permutations((0, 1, 2, 3))))
 def test_3d_slice_of_4d_image_with_order(order):
     """See https://github.com/napari/napari/issues/4926
