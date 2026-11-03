@@ -229,19 +229,15 @@ def _drawn_camera_axes(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return the view, up and right directions the canvas actually draws.
 
-    ``view_direction`` and ``up_direction`` come from the Euler angles alone,
-    but a flipped orientation also changes the drawn camera. Angles are negated
-    per flipped axis, in XYZ order, and the result is mirrored per axis.
+    napari's ``Camera.view_direction`` and ``up_direction`` already account
+    for the axis orientation (napari#9389). An odd number of flipped axes
+    mirrors the world relative to the screen, which reverses the right
+    direction relative to ``view x up``.
     """
-    signs = _orientation_signs(camera)
-    source = camera
-    if np.any(signs < 0):
-        from napari.components import Camera
-
-        source = Camera(angles=tuple(np.asarray(camera.angles) * signs[::-1]))
-    view = np.asarray(source.view_direction, dtype=float)
-    up = np.asarray(source.up_direction, dtype=float)
-    return signs * view, signs * up, signs * np.cross(view, up)
+    view = np.asarray(camera.view_direction, dtype=float)
+    up = np.asarray(camera.up_direction, dtype=float)
+    handedness = float(np.prod(_orientation_signs(camera)))
+    return view, up, handedness * np.cross(view, up)
 
 
 def _front_depth_segment(
