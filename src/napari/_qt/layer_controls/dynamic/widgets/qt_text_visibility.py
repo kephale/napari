@@ -8,7 +8,7 @@ from napari._qt.layer_controls.dynamic.widgets.qt_widget_controls_base import (
     QtWidgetControlsBase,
     QtWrappedLabel,
 )
-from napari._qt.utils import checked_to_bool, qt_signals_blocked
+from napari._qt.utils import qt_signals_blocked
 from napari.utils.events import disconnect_events
 from napari.utils.events.event_utils import connect_setattr
 
@@ -52,10 +52,9 @@ class QtTextVisibilityControl(QtWidgetControlsBase):
         text_disp_cb.setChecked(self._layers[0].text.visible)
         for layer in self._layers:
             connect_setattr(
-                text_disp_cb.stateChanged,
+                text_disp_cb.toggled,
                 layer.text,
                 'visible',
-                convert_fun=checked_to_bool,
             )
         self.text_disp_checkbox = text_disp_cb
         self.text_disp_label = QtWrappedLabel('display text:')
@@ -65,7 +64,9 @@ class QtTextVisibilityControl(QtWidgetControlsBase):
         with qt_signals_blocked(self.text_disp_checkbox):
             self.text_disp_checkbox.setChecked(self._layers[0].text.visible)
 
-    def get_widget_controls(self) -> list[tuple[QtWrappedLabel, QWidget]]:
+    def get_widget_controls(
+        self,
+    ) -> list[tuple[QtWrappedLabel, QWidget] | tuple[QWidget]]:
         return [(self.text_disp_label, self.text_disp_checkbox)]
 
     def disconnect_widget_controls(self) -> None:

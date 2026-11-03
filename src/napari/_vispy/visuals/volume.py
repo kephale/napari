@@ -346,7 +346,7 @@ class Volume(TextureMixin, BaseVolume):
     _shaders = shaders
     _rendering_methods = rendering_methods
 
-    def __init__(self, *args, **kwargs) -> None:  # type: ignore [no-untyped-def]
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.unfreeze()
         self._clipmap_enabled = False

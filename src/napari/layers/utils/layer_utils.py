@@ -9,6 +9,7 @@ from importlib import import_module
 from typing import (
     TYPE_CHECKING,
     Any,
+    Literal,
     NamedTuple,
     TypeVar,
 )
@@ -116,7 +117,8 @@ def register_layer_action(
         The description of the action, this will typically be translated and
         will be what will be used in tooltips.
     repeatable : bool
-        A flag indicating whether the action autorepeats when key is held
+        Deprecated and ignored. Key auto-repeat is delivered to every binding
+        by default; hold-semantics bindings suppress it automatically.
     shortcuts : str | List[str]
         Shortcut to bind by default to the action we are registering.
 
@@ -194,19 +196,20 @@ def register_layer_attr_action(
             ) from e
 
         @functools.wraps(func)
-        def _wrapper(*args, **kwargs):
+        def _wrapper(*args, **kwargs) -> Callable[[], None]:
             obj = args[0] if args else kwargs[first_variable_name]
             prev_mode = getattr(obj, attribute_name)
             func(*args, **kwargs)
 
-            def _callback():
+            def _callback() -> None:
                 setattr(obj, attribute_name, prev_mode)
 
             return _callback
 
-        repeatable = False  # attribute actions are always non-repeatable
+        # _wrapper returns a release callback, so held-key auto-repeat is
+        # suppressed automatically while the hold is pending
         register_layer_action(
-            keymapprovider, description, repeatable, shortcuts
+            keymapprovider, description, shortcuts=shortcuts
         )(_wrapper)
         return func
 
@@ -348,7 +351,7 @@ def segment_normal(a, b, p=(0, 0, 1)) -> np.ndarray:
     """
     d = b - a
 
-    norm: Any  # float or array or float, mypy has some difficulties.
+    norm: Any  # float or array or float, pyrefly has some difficulties.
 
     if d.ndim == 1:
         normal = np.array([d[1], -d[0]]) if len(d) == 2 else np.cross(d, p)
@@ -384,7 +387,7 @@ def convert_to_uint8(data: np.ndarray) -> np.ndarray:
 
     Float images are multiplied by 255 and then cast to uint8.
     """
-    out_dtype = np.dtype(np.uint8)
+    out_dtype: np.dtype = np.dtype(np.uint8)
     out_max = np.iinfo(out_dtype).max
     if data.dtype == out_dtype:
         return data
@@ -560,7 +563,7 @@ def coerce_current_properties(
 
 def compute_multiscale_level(
     requested_shape, shape_threshold, downsample_factors
-):
+) -> int:
     """Computed desired level of the multiscale given requested field of view.
 
     The level of the multiscale should be the lowest resolution such that
@@ -610,7 +613,7 @@ def compute_multiscale_level(
 
 def compute_multiscale_level_and_corners(
     corner_pixels, shape_threshold, downsample_factors
-):
+) -> tuple[int, np.ndarray[tuple[Literal[2], int], np.dtype[np.int_]]]:
     """Computed desired level and corners of a multiscale view.
 
     The level of the multiscale should be the lowest resolution such that
@@ -674,7 +677,7 @@ def _chunk_boundaries(axis_chunks: Any, axis_size: int) -> np.ndarray | None:
     # zarr/tensorstore: a single regular chunk size for the axis, e.g. 4. The
     # edge chunk may be smaller than this size.
     try:
-        chunk_size = operator.index(axis_chunks)
+        chunk_size = operator.index(axis_chunks)  # pyrefly: ignore [bad-argument-type]
     except TypeError:
         return None
     if chunk_size <= 0:
@@ -1256,6 +1259,19 @@ def _unique_element(array: Array) -> Any | None:
     if len(array) == 0:
         return None
     el = array[0]
+    if len(array) == 1:
+        return el
+    if isinstance(el, (list, tuple, np.ndarray)):
+        # Container-valued elements (e.g. list-valued features, or a 2D
+        # array of per-point RGBA colors) can't be safely compared via
+        # numpy broadcasting: `array[1:] != el` raises on ragged/differently
+        # shaped elements, and `np.equal(array[1:], array[:1])` raises
+        # "ambiguous truth value" once any element has more than one entry.
+        # Compare them individually with np.array_equal instead, which
+        # returns False rather than raising on a shape mismatch.
+        if all(np.array_equal(x, el) for x in array[1:]):
+            return el
+        return None
     if np.any(array[1:] != el):
         return None
     return el

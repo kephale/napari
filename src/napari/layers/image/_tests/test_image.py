@@ -575,7 +575,7 @@ def test_value():
         ((2, 2, 2), [1, 0, 0], [0, 1, 2], False, 'translucent', 0),
         # not quite as expected for additive
         ((2, 2, 2), [1, 0, 0], [0, 1, 2], False, 'additive', 2),
-        ((2, 2, 2), [1, 0, 0], [0, 1, 2], False, 'iso', None),
+        ((2, 2, 2), [1, 0, 0], [0, 1, 2], False, 'iso', 1),
         ((2, 2, 2), [1, 0, 0], [0, 1, 2], False, 'attenuated_mip', 0),
         ((0, 2, 2, 2), [0, 1, 0, 0], [1, 2, 3], False, 'mip', 1),
     ],
@@ -957,6 +957,57 @@ def test_thick_slice():
     layer.projection_mode = 'max'
     np.testing.assert_array_equal(
         layer._slice.image.raw, np.max(data[2:4], axis=0)
+    )
+
+
+@pytest.mark.parametrize('scale', [2, -1, -2])
+@pytest.mark.parametrize('translate', [0, 10])
+@pytest.mark.parametrize('transform', ['scale', 'affine'])
+@pytest.mark.parametrize(
+    ('point', 'left', 'right', 'positive_bounds', 'negative_bounds'),
+    [
+        (1.5, 0.125, 0.125, (1, 2), (1, 2)),
+        (2, 1, 0, (1, 3), (2, 4)),
+        (2, 0, 1, (2, 4), (1, 3)),
+        (0, 1, 1, (0, 2), (0, 2)),
+        (4, 1, 1, (3, 5), (3, 5)),
+    ],
+)
+def test_thick_slice_transformed_margins(
+    scale,
+    translate,
+    transform,
+    point,
+    left,
+    right,
+    positive_bounds,
+    negative_bounds,
+):
+    data = np.arange(125).reshape(5, 5, 5)
+    if transform == 'scale':
+        layer = Image(
+            data,
+            scale=(scale, 1, 1),
+            translate=(translate, 0, 0),
+            projection_mode='mean',
+        )
+    else:
+        affine = np.diag([scale, 1, 1, 1])
+        affine[0, -1] = translate
+        layer = Image(data, affine=affine, projection_mode='mean')
+
+    layer._slice_dims(
+        Dims(
+            ndim=3,
+            range=tuple((low, high, 1) for low, high in layer.extent.world.T),
+            point=(translate + scale * point, 0, 0),
+            margin_left=(abs(scale) * left, 0, 0),
+            margin_right=(abs(scale) * right, 0, 0),
+        )
+    )
+    bounds = positive_bounds if scale > 0 else negative_bounds
+    np.testing.assert_array_equal(
+        layer._slice.image.raw, data[slice(*bounds)].mean(axis=0)
     )
 
 

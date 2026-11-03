@@ -63,7 +63,7 @@ from napari.utils.notifications import show_info
 from napari._vispy import VispyCanvas, create_vispy_layer  # isort:skip
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Generator, Sequence
     from types import FrameType
 
     from napari_console import QtConsole
@@ -201,7 +201,10 @@ class QtViewer(QSplitter):
             font_family=self._overlay_font,
             key_map_handler=self._key_map_handler,
             size=self.viewer.canvas.size,
-            autoswap=get_settings().experimental.autoswap_buffers,  # see #5734
+            autoswap=get_settings().advanced.autoswap_buffers,  # see #5734
+            config={
+                'samples': 4 if get_settings().advanced.multisampling else 0
+            },
         )
 
         self._welcome_widget = QtWelcomeWidget(
@@ -217,7 +220,7 @@ class QtViewer(QSplitter):
         self.setOrientation(Qt.Orientation.Vertical)
         self.addWidget(main_widget)
 
-        self.viewer._layer_slicer.events.ready.connect(self._on_slice_ready)  # type: ignore[arg-type]
+        self.viewer._layer_slicer.events.ready.connect(self._on_slice_ready)  # pyrefly: ignore [bad-argument-type]
 
         self._on_active_change()
         self.viewer.layers.events.inserted.connect(self._update_camera_depth)
@@ -267,11 +270,11 @@ class QtViewer(QSplitter):
         # set up welcome screen
         self._set_welcome_visible(False)
 
-    def showEvent(self, event: QShowEvent | None) -> None:
+    def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
         self._update_welcome_screen()
 
-    def hideEvent(self, event: QHideEvent | None) -> None:
+    def hideEvent(self, event: QHideEvent) -> None:
         super().hideEvent(event)
 
     @property
@@ -341,7 +344,6 @@ class QtViewer(QSplitter):
             layerListLayout.addWidget(self.viewerButtons)
             layerListLayout.setContentsMargins(8, 4, 8, 6)
             layerList.setLayout(layerListLayout)
-            prev_policy = layerList.sizePolicy()
             self._dockLayerList = QtViewerDockWidget(
                 self,
                 layerList,
@@ -351,9 +353,6 @@ class QtViewer(QSplitter):
                 object_name='layer list',
                 close_btn=False,
             )
-            # restore policy to avoid empty space below buttons
-            # See https://github.com/napari/napari/pull/9447
-            layerList.setSizePolicy(prev_policy)
         return self._dockLayerList
 
     @property
@@ -427,7 +426,7 @@ class QtViewer(QSplitter):
         for action, shortcuts in get_settings().shortcuts.shortcuts.items():
             action_manager.unbind_shortcut(action)
             for shortcut in shortcuts:
-                action_manager.bind_shortcut(action, str(shortcut))
+                action_manager.bind_shortcut(action, shortcut)
 
     def _create_performance_dock_widget(self) -> QtViewerDockWidget | None:
         """Create the dock widget that shows performance metrics."""
@@ -609,7 +608,7 @@ class QtViewer(QSplitter):
     def console(self, console: QtConsole | None) -> None:
         self._console = console
         if console is not None:
-            self.dockConsole.setWidget(console)  # type: ignore[no-untyped-call]
+            self.dockConsole.setWidget(console)
             console.setParent(self.dockConsole)
 
     @ensure_main_thread
@@ -627,7 +626,7 @@ class QtViewer(QSplitter):
             if layer := weak_layer():
                 # Update the layer slice state to temporarily support behavior
                 # that depends on it.
-                layer._slicing_state._update_slice_response(response)  # type: ignore[attr-defined]
+                layer._slicing_state._update_slice_response(response)  # pyrefly: ignore [missing-attribute]
                 # Update the layer's loaded state before everything else,
                 # because they may rely on its updated value.
                 layer._slicing_state._update_loaded_slice_id(
@@ -641,7 +640,7 @@ class QtViewer(QSplitter):
                     data_displayed=False,
                     thumbnail=True,
                     highlight=True,
-                    extent=True,
+                    extent=False,  # already updated via Layer.refresh()
                 )
 
     def _on_active_change(self) -> None:
@@ -833,7 +832,7 @@ class QtViewer(QSplitter):
             str(
                 Path(hist[0]) / selected_layer_name
             ),  # directory in PyQt, dir in PySide
-            filter=ext_str,
+            filter=ext_str or '',
             options=(
                 QFileDialog.Option.DontUseNativeDialog
                 if in_ipython()
@@ -996,7 +995,7 @@ class QtViewer(QSplitter):
     @contextlib.contextmanager
     def resize_canvas(
         self, size: tuple[int, int] | None, scale: float
-    ) -> Iterator[None]:
+    ) -> Generator[None]:
         """Temporarily, safely, resize the canvas
 
         Parameters
@@ -1016,6 +1015,8 @@ class QtViewer(QSplitter):
         else:
             size_arr = np.asarray(prev_size)
         size_arr = (size_arr * scale).astype(np.int64)
+
+        camera.zoom = old_zoom * scale
         canvas.size = tuple(size_arr)
         try:
             yield
