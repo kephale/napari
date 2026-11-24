@@ -1607,6 +1607,20 @@ class ProgressiveLoader:
             self._held_refresh = False
             self._refresh()
 
+    def _sync_view_direction(self) -> None:
+        """Give the layer the camera's current view direction.
+
+        The canvas records it on the layer only when it draws. A check that
+        runs after a rotation but before the next frame would otherwise
+        place tiles and choose the level for the previous direction; when
+        coverage then fails at every fine level the view settles coarse,
+        and nothing re-checks once the camera is still.
+        """
+        if self._viewer.dims.ndisplay == 3:
+            self._layer._camera_view_direction = np.asarray(
+                self._viewer.scene.camera.view_direction, dtype=float
+            )
+
     def _check(self, event=None) -> None:
         """Start a fetch pass if the current view is not fully loaded."""
         if self._closed:
@@ -1616,6 +1630,7 @@ class ProgressiveLoader:
         if not layer.visible:
             self._cancel_active()
             return
+        self._sync_view_direction()
         self._ensure_persistent_overview()
         self._apply_auto_level()
         level = int(layer.data_level)

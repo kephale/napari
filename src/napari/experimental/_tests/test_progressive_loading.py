@@ -1130,6 +1130,31 @@ def test_covers_without_waiting_does_not_block_on_busy_level():
         thread.join()
 
 
+def test_check_uses_the_current_view_direction(
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+):
+    """Level and tile choices must follow the camera, not the direction
+    the canvas last drew with: a check between a rotation and the next
+    frame otherwise plans for the old direction."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    _wait_for_idle_loader(qtbot, loader)
+    try:
+        layer._camera_view_direction = np.array([1.0, 0.0, 0.0])
+        viewer.scene.camera.angles = (0.0, 90.0, 0.0)
+        loader._check()
+        np.testing.assert_allclose(
+            layer._camera_view_direction,
+            viewer.scene.camera.view_direction,
+        )
+    finally:
+        loader.close()
+
+
 def test_huge_world_auto_normalized(qtbot, make_napari_viewer):
     """Pyramids whose extent exceeds float32 rendering precision get a
     normalizing layer scale (3D rendering goes blank past 2**22).
