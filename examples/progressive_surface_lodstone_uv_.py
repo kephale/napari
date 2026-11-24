@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "napari[pyqt6]",
-#     "lodstone[mesh]>=0.1.0a3",
+#     "lodstone[mesh]>=0.1.0a4",
 # ]
 #
 # [tool.uv.sources]
