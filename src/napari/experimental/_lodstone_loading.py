@@ -414,9 +414,22 @@ class _NapariTarget:
 
 
 class LodstoneProgressiveLoader(ProgressiveLoader):
-    """ProgressiveLoader whose fetch passes execute through Lodstone."""
+    """ProgressiveLoader whose fetch passes execute through Lodstone.
 
-    def __init__(self, viewer, layer, data, **kwargs) -> None:
+    ``trace_plans`` also runs Lodstone's strict frustum planner on every
+    pass and records it against the submitted plan in
+    :attr:`plan_comparisons`. That plan is diagnostic only and is planned
+    on the Qt thread, which stalls the UI for seconds on large pyramids,
+    so it is off unless requested (or debug logging is enabled).
+    """
+
+    trace_plans: bool = False
+
+    def __init__(
+        self, viewer, layer, data, *, trace_plans: bool | None = None, **kwargs
+    ) -> None:
+        if trace_plans is not None:
+            self.trace_plans = trace_plans
         self._lodstone_enabled = False
         self._lodstone_stream: Stream | None = None
         self._lodstone_runtime: Runtime | None = None
@@ -571,18 +584,8 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             fetch_levels=None,
         )
         plan_source = 'napari-fallback'
-        shared = self._shared_planners[len(view.displayed_axes)].plan(
-            self._lodstone_source.pyramid,
-            view,
-            self._lodstone_target.layout(view, self._lodstone_source.pyramid),
-            available=available,
-        )
-        comparison = PlanComparison(
-            view,
-            PlanTrace.from_plan(plan),
-            PlanTrace.from_plan(shared),
-        )
-        self._plan_comparisons.append(comparison)
+        if self.trace_plans or LOGGER.isEnabledFor(logging.DEBUG):
+            self._trace_shared_plan(view, plan, available)
         active = self._active
         if active is not None:
             _active_level, active_min, active_max = active
@@ -619,17 +622,6 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         )
         plan = merge_plans(plan, overview)
         self._chunks_total = len(plan.wanted)
-        LOGGER.debug(
-            'planner trace: matches=%s geometry_matches=%s '
-            'napari=(level=%d tiles=%d) '
-            'lodstone=(level=%d tiles=%d)',
-            comparison.matches,
-            comparison.geometry_matches,
-            comparison.napari.target_level,
-            len(comparison.napari.tiles),
-            comparison.lodstone.target_level,
-            len(comparison.lodstone.tiles),
-        )
         # Use Lodstone's renderer-constrained region plan only after checking
         # that it describes the same target geometry. Keep the reconstructed
         # napari plan as a compatibility fallback while the strict frustum
@@ -649,6 +641,32 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             diagnostics.desired_tiles,
             diagnostics.wanted_tiles,
             diagnostics.unique_native_chunks,
+        )
+
+    def _trace_shared_plan(self, view, plan, available) -> None:
+        """Record Lodstone's strict frustum plan beside the submitted one."""
+        shared = self._shared_planners[len(view.displayed_axes)].plan(
+            self._lodstone_source.pyramid,
+            view,
+            self._lodstone_target.layout(view, self._lodstone_source.pyramid),
+            available=available,
+        )
+        comparison = PlanComparison(
+            view,
+            PlanTrace.from_plan(plan),
+            PlanTrace.from_plan(shared),
+        )
+        self._plan_comparisons.append(comparison)
+        LOGGER.debug(
+            'planner trace: matches=%s geometry_matches=%s '
+            'napari=(level=%d tiles=%d) '
+            'lodstone=(level=%d tiles=%d)',
+            comparison.matches,
+            comparison.geometry_matches,
+            comparison.napari.target_level,
+            len(comparison.napari.tiles),
+            comparison.lodstone.target_level,
+            len(comparison.lodstone.tiles),
         )
 
     def _desired_stages(self, target: int) -> list[tuple[int, list]]:

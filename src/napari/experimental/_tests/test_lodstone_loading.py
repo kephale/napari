@@ -13,6 +13,7 @@ from lodstone import Plan, Region, TileKey, Update
 from napari.experimental._lodstone_loading import (
     LEVEL_LABEL_OFFSET,
     MISSING_LEVEL_LABEL,
+    LodstoneProgressiveLoader,
     PlanTrace,
     _acquire_viewer_runtime,
     _camera_view,
@@ -24,6 +25,33 @@ from napari.experimental._lodstone_loading import (
     add_lodstone_loading_image,
     add_lodstone_loading_labels,
 )
+
+
+@pytest.fixture(autouse=True)
+def _trace_plans(monkeypatch):
+    """These tests compare each submitted plan with Lodstone's own."""
+    monkeypatch.setattr(LodstoneProgressiveLoader, 'trace_plans', True)
+
+
+def test_shared_plan_is_not_traced_by_default(
+    qtbot, make_napari_viewer, monkeypatch
+) -> None:
+    """The diagnostic frustum plan runs on the Qt thread and can stall the
+    UI for seconds, so ordinary loading must not compute it."""
+    monkeypatch.setattr(LodstoneProgressiveLoader, 'trace_plans', False)
+    base = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    arrays = [
+        da.from_array(base, chunks=(16, 16)),
+        da.from_array(base[::2, ::2], chunks=(16, 16)),
+    ]
+    viewer = make_napari_viewer()
+    layer = add_lodstone_loading_image(arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    try:
+        qtbot.waitUntil(lambda: loader._submitted_plan is not None)
+        assert loader.plan_comparisons == ()
+    finally:
+        loader.close()
 
 
 def test_viewer_layers_share_lodstone_runtime() -> None:
