@@ -68,6 +68,10 @@ from napari.experimental._virtual_data import (
     VirtualData,
     chunk_shape_for,
 )
+from napari.layers._scalar_field._slice import (
+    _materialize_and_project,
+    _ThumbnailPlaneCache,
+)
 from napari.utils import progress
 
 # Qt imports are deferred so the module can be imported in headless
@@ -127,6 +131,15 @@ FLOAT32_EXTENT_LIMIT = 2**21
 
 
 # ---------- chunk geometry ----------
+
+
+class _UncachedThumbnailPlane(_ThumbnailPlaneCache):
+    """Thumbnail plane reader that never caches, for data filled in place."""
+
+    def __call__(self, level, index, mode, axis) -> np.ndarray:
+        return _materialize_and_project(
+            self._data[level], self._project, index, mode, axis
+        )
 
 
 def chunk_slices(data, interval: tuple | None = None) -> list[list[slice]]:
@@ -769,11 +782,13 @@ class ProgressiveLoader:
                     emitter.connect(self._debounced_check)
                     self._canvas_events.append(emitter)
 
-        # 2D multiscale slicing caches a one-time materialization of the
-        # thumbnail (coarsest) level, which would freeze this layer's
-        # pre-load (all-zero) content. Disable it: materializing a resident
-        # VirtualData is a plain memory copy.
-        layer._level_materializer = None
+        # Multiscale slicing caches the projected plane of the thumbnail
+        # (coarsest) level, which would freeze this layer's pre-load
+        # (all-zero) content. Read it fresh instead: materializing a
+        # resident VirtualData is a plain memory copy.
+        layer._slicing_state._thumbnail_plane_cache = _UncachedThumbnailPlane(
+            layer.data, layer._slicing_state._slice_request_class._project_slice
+        )
 
         # GL texture size limits: clamp intervals so no axis exceeds
         # what the driver can allocate in glTexImage2D / glTexImage3D.
