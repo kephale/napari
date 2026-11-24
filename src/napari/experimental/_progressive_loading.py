@@ -710,6 +710,11 @@ class ProgressiveLoader:
         # a repair was requested while one was running: chain a
         # follow-up over the (possibly moved) region when it finishes
         self._repair_again = False
+        # Pending repair work: a full-interval repair, and/or the union of
+        # target-level regions dirtied by intermediate (ladder) chunks
+        # since the last repair, as (low, high) level coordinates.
+        self._repair_full_pending = False
+        self._repair_dirty: tuple[np.ndarray, np.ndarray] | None = None
         self._debug_overlay = None
         self._chunk_warned = False
         self._resident_level = len(data) - 1
@@ -813,6 +818,7 @@ class ProgressiveLoader:
         layer._tile_max_bytes_3d = min(interval_max_bytes, tile_max_bytes_3d)
         layer._interval_max_bytes_3d = interval_max_bytes
         layer._full_level_fetchable_3d = self._full_level_fetchable_3d
+        layer._view_bbox_3d = self._camera_bbox_level0
 
         layer._render_margin_2d = 2.0
         self._tile_margin_3d = 1.25
@@ -904,6 +910,10 @@ class ProgressiveLoader:
         with contextlib.suppress(Exception):
             self._debounce_timer.stop()
         self._restore_slicing()
+        if self._layer is not None:
+            # the hooks call back into this loader's pyramid and viewer
+            self._layer._full_level_fetchable_3d = None
+            self._layer._view_bbox_3d = None
         self._data = []
         self._viewer = None  # type: ignore[assignment]
         self._layer = None  # type: ignore[assignment]
@@ -2492,8 +2502,29 @@ class ProgressiveLoader:
         coalesce naturally — repairs run one at a time — and the stage
         end triggers a final one for anything skipped.
         """
-        if batch:
-            self._repair_backdrop()
+        if not batch:
+            return
+        target = int(self._layer.data_level)
+        ratio = np.asarray(
+            self._data._scale_factors[vdata.scale_level], dtype=float
+        ) / np.asarray(self._data._scale_factors[target], dtype=float)
+        low = np.min([[k.start for k in key] for key in batch], axis=0)
+        high = np.max([[k.stop for k in key] for key in batch], axis=0)
+        # A fresh coarse chunk changes only its own footprint in the
+        # target level. Repairing just that footprint keeps each fold
+        # proportional to the new data instead of re-filling and
+        # re-uploading the whole tile per chunk.
+        target_vdata = self._data[target]
+        shape = np.asarray(target_vdata.shape, dtype=np.int64)
+        chunks = np.asarray(target_vdata.chunk_shape, dtype=np.int64)
+        low = (np.floor(low * ratio).astype(np.int64) // chunks) * chunks
+        high = -(-np.ceil(high * ratio).astype(np.int64) // chunks) * chunks
+        low, high = np.clip(low, 0, shape), np.clip(high, 0, shape)
+        if self._repair_dirty is not None:
+            low = np.minimum(low, self._repair_dirty[0])
+            high = np.maximum(high, self._repair_dirty[1])
+        self._repair_dirty = (low, high)
+        self._repair_backdrop(dirty_only=True)
 
     def _on_fetch_finished(self, generation: int) -> None:
         if generation != self._generation or self._closed:
@@ -2813,17 +2844,25 @@ class ProgressiveLoader:
         self._layer.refresh(extent=False, highlight=False, thumbnail=final)
         self._last_refresh_duration = time.monotonic() - start
 
-    def _repair_backdrop(self) -> None:
+    def _repair_backdrop(self, dirty_only: bool = False) -> None:
         """Backfill unloaded regions of the active level from the coarsest.
 
         The upsampling gather can take seconds for large tiles, so it runs
         on a background thread (VirtualData is lock-guarded) limited to
         the currently rendered region; the layer refreshes on completion.
+
+        ``dirty_only`` repairs just the region intermediate chunks dirtied
+        since the last repair (see :meth:`_on_intermediate_chunks`). Any
+        full request pending at the same time takes precedence.
         """
         if self._closed:
             return
+        if not dirty_only:
+            self._repair_full_pending = True
         level = int(self._layer.data_level)
         if level == self._resident_level:
+            self._repair_full_pending = False
+            self._repair_dirty = None
             return
         min_coord, max_coord = self._level_interval(level)
         if np.any(max_coord <= min_coord):
@@ -2835,6 +2874,18 @@ class ProgressiveLoader:
             # would leave the fresh region unfilled (black) until some
             # unrelated later event. Chain a follow-up run instead.
             self._repair_again = True
+            return
+
+        partial = not self._repair_full_pending
+        if partial:
+            dirty = self._repair_dirty
+            if dirty is None:
+                return
+            min_coord = np.maximum(min_coord, dirty[0])
+            max_coord = np.minimum(max_coord, dirty[1])
+        self._repair_full_pending = False
+        self._repair_dirty = None
+        if np.any(max_coord <= min_coord):
             return
 
         # Snapshot the pyramid for the worker. close() swaps self._data
@@ -2855,7 +2906,7 @@ class ProgressiveLoader:
                 data=data,
             )
             packed = None
-            if wrote and clipmap_prefill:
+            if wrote and (clipmap_prefill or partial):
                 key = tuple(
                     slice(int(low), int(high))
                     for low, high in zip(min_coord, max_coord, strict=True)
@@ -2874,7 +2925,7 @@ class ProgressiveLoader:
             dbuf = self._dbuf
             clipmap = self._has_clipmap_overview()
             patched = False
-            if clipmap and packed is not None:
+            if (clipmap or partial) and packed is not None:
                 region, block = packed
                 patched = self._patch_texture_region(
                     data[level],
@@ -2887,7 +2938,8 @@ class ProgressiveLoader:
             # data. If staging that prefill fails, pass completion remains
             # the safe fallback that releases the old page.
             if (
-                dbuf is not None
+                not partial
+                and dbuf is not None
                 and hasattr(dbuf, 'release_presents')
                 and (not clipmap or patched or not wrote)
             ):
@@ -2905,7 +2957,7 @@ class ProgressiveLoader:
                         dbuf.present()
             if self._repair_again:
                 self._repair_again = False
-                self._repair_backdrop()
+                self._repair_backdrop(dirty_only=not self._repair_full_pending)
 
         worker.returned.connect(on_done)
         worker.errored.connect(

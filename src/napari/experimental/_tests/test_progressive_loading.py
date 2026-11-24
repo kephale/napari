@@ -1027,6 +1027,74 @@ def test_zoom_in_tiles_levels_too_many_chunks_to_fetch_whole(
         loader.close()
 
 
+def test_draw_path_places_tiles_with_the_loader_view_bbox(
+    qtbot,
+    make_napari_viewer,
+):
+    """The draw path must place a locked 3D tile around the same bbox the
+    loader plans with. The canvas viewbox is centered on the camera, but
+    an oblique ray reaches the camera-facing tile far from that center:
+    a tile placed around the viewbox is never on screen."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    arrays = [
+        da.zeros((size,) * 3, chunks=(32, 32, 32), dtype=np.uint8)
+        for size in (512, 256)
+    ]
+    layer = viewer.add_image(arrays, multiscale=True)
+    layer._max_tile_extent_3d = 64
+    layer._tile_max_bytes_3d = 64**3
+    layer._interval_max_bytes_3d = 64**3
+    layer._locked_data_level = 0
+    displayed = list(layer._slice_input.displayed)
+    centered = np.array([[224.0, 224.0, 224.0], [288.0, 288.0, 288.0]])
+    corner = np.array([[0.0, 440.0, 20.0], [30.0, 480.0, 60.0]])
+    layer._view_bbox_3d = lambda axes: corner
+
+    layer._update_level_and_corners(centered, (1, 1), displayed)
+    # depth follows the view direction; the bug was the screen-plane axes
+    lateral = displayed[1:]
+    low = layer.corner_pixels[0, lateral]
+    high = layer.corner_pixels[1, lateral] + 1
+    assert np.all(low <= corner[0, 1:])
+    assert np.all(high >= corner[1, 1:])
+
+
+def test_intermediate_chunks_dirty_only_their_footprint(
+    qtbot,
+    make_napari_viewer,
+    multiscale_3d_arrays,
+):
+    """A coarse ladder chunk repairs just its footprint in the target
+    level, not the whole tile: re-filling and re-uploading the full tile
+    per chunk streamed gigabytes of texture during a single load."""
+    from napari.experimental._virtual_data import MultiScaleVirtualData
+
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    data = MultiScaleVirtualData(multiscale_3d_arrays)
+    layer = viewer.add_image(data._data, multiscale=True)
+    loader = LodstoneProgressiveLoader(viewer, layer, data)
+    layer.metadata['progressive_loader'] = loader
+    _wait_for_idle_loader(qtbot, loader)
+    try:
+        layer._data_level = 0
+        # a repair is running: requests only accumulate
+        loader._repair_worker = object()
+        loader._repair_full_pending = False
+        # level 1 chunk [16:32, 0:16, 0:16] -> level 0 [32:64, 0:32, 0:32]
+        key = (slice(16, 32), slice(0, 16), slice(0, 16))
+        loader._on_intermediate_chunks(data[1], [key])
+        low, high = loader._repair_dirty
+        np.testing.assert_array_equal(low, [32, 0, 0])
+        np.testing.assert_array_equal(high, [64, 32, 32])
+        assert loader._repair_again
+        assert not loader._repair_full_pending
+    finally:
+        loader._repair_worker = None
+        loader.close()
+
+
 def test_huge_world_auto_normalized(qtbot, make_napari_viewer):
     """Pyramids whose extent exceeds float32 rendering precision get a
     normalizing layer scale (3D rendering goes blank past 2**22).

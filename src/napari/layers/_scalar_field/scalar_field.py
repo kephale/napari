@@ -344,6 +344,16 @@ class ScalarFieldBase(Layer, ABC):
         # many chunks to load promptly is tiled around the view instead.
         # Set by the progressive loader; ``None`` allows every level.
         self._full_level_fetchable_3d: Callable[[int], bool] | None = None
+        # The 3D view bbox (level-0 data coordinates of the displayed axes)
+        # that sub-volume tiles are placed around. The canvas viewbox is a
+        # screen-plane box through the camera center, which an oblique ray
+        # leaves long before it reaches a camera-facing tile, so the
+        # progressive loader supplies its ray-following bbox here. It must
+        # be the same bbox the loader plans and selects levels with, or the
+        # two place tiles differently and the loaded chunks are off screen.
+        self._view_bbox_3d: Callable[[list[int]], np.ndarray | None] | None = (
+            None
+        )
 
         # Camera view direction in world coordinates, set by _update_draw
         # from the vispy canvas.  Used by _view_direction_data to compute
@@ -556,6 +566,11 @@ class ScalarFieldBase(Layer, ABC):
                 data_bbox_int, shape_threshold, displayed_axes
             )
             return
+
+        if self._slice_input.ndisplay == 3 and self._view_bbox_3d is not None:
+            view_bbox = self._view_bbox_3d(list(displayed_axes))
+            if view_bbox is not None:
+                data_bbox_int = view_bbox
 
         # remember the viewport bbox (level-0 data coords) so that other
         # corner computations (e.g. the locked_data_level setter, which
