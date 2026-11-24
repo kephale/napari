@@ -915,10 +915,9 @@ class ProgressiveLoader:
         leaving it on once the last progressive layer is gone changes
         behavior for unrelated layers. It also keeps slice responses
         coming from the slicing thread while the viewer is being torn
-        down, and ``QtViewer._on_slice_ready`` is ``@ensure_main_thread``:
-        superqt wraps such a call in a ``CallCallable`` held by a global
-        list until the main thread runs it. One posted during teardown is
-        never run, so the list keeps the whole ``QtViewer`` alive.
+        down: ``QtViewer`` receives them through a queued Qt signal, so a
+        response posted just before close would otherwise be delivered to
+        layers that are already gone.
         """
         restore, self._slicing_restore = self._slicing_restore, None
         if restore is None or self._viewer is None:
@@ -937,26 +936,17 @@ class ProgressiveLoader:
         with contextlib.suppress(AttributeError):
             self._viewer._layer_slicer._force_sync = force_sync
         # A slice that finished on the worker thread just before the switch
-        # above may have queued QtViewer._on_slice_ready through superqt's
-        # ensure_main_thread wrapper.  The queued CallCallable owns the
-        # QtViewer until its MetaCall runs, which leaks the whole viewer when
-        # close() is immediately followed by viewer teardown.  Wait for all
-        # slice workers, then deliver those already-posted callbacks while the
-        # viewer is still alive.
+        # above may already have queued its response for QtViewer through
+        # the cross-thread ``_slice_ready`` signal.  Wait for all slice
+        # workers, then deliver those posted calls while the viewer and its
+        # layers are still alive.
         with contextlib.suppress(AttributeError, TimeoutError):
             self._viewer._layer_slicer.wait_until_idle(timeout=5)
         if QCoreApplication is not None and QEvent is not None:
-            with contextlib.suppress(
-                ImportError, AttributeError, RuntimeError
-            ):
-                from superqt.utils._ensure_thread import CallCallable
-
-                qt_viewer = self._viewer.window._qt_viewer
-                for call in tuple(CallCallable.instances):
-                    if qt_viewer in call._args:
-                        QCoreApplication.sendPostedEvents(
-                            call, QEvent.Type.MetaCall
-                        )
+            with contextlib.suppress(AttributeError, RuntimeError):
+                QCoreApplication.sendPostedEvents(
+                    self._viewer.window._qt_viewer, QEvent.Type.MetaCall
+                )
 
     # -- view tracking --
 

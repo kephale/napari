@@ -1060,10 +1060,9 @@ def test_close_restores_synchronous_slicing(
     """Async slicing is a viewer-wide switch, so closing the last
     progressive layer has to put it back.
 
-    Left on, a slice response emitted from the slicing thread while the
-    viewer is torn down strands a superqt ``CallCallable`` — held by a
-    global list — that owns ``QtViewer._on_slice_ready``, leaking the
-    whole QtViewer.
+    Left on, unrelated layers keep slicing asynchronously, and slice
+    responses keep arriving from the slicing thread while the viewer is
+    torn down.
     """
     from napari.settings import get_settings
 
@@ -1087,10 +1086,16 @@ def test_close_drains_pending_slice_callback(
     make_napari_viewer,
     multiscale_arrays,
 ):
-    """Closing the last loader releases queued main-thread callbacks."""
-    from types import SimpleNamespace
+    """Closing the last loader delivers slice responses already queued."""
 
-    from superqt.utils._ensure_thread import CallCallable
+    class Recorder:
+        """Stands in for a layer weakref; records delivery on the GUI thread."""
+
+        def __init__(self) -> None:
+            self.threads: list[threading.Thread] = []
+
+        def __call__(self):
+            self.threads.append(threading.current_thread())
 
     viewer = make_napari_viewer()
     layer = add_progressive_loading_image(multiscale_arrays, viewer=viewer)
@@ -1098,19 +1103,19 @@ def test_close_drains_pending_slice_callback(
     _wait_for_idle_loader(qtbot, loader)
     qt_viewer = viewer.window._qt_viewer
 
-    # Calling the decorated slot off the GUI thread posts a CallCallable
-    # whose args retain qt_viewer until its MetaCall is delivered.
+    # Emitting off the GUI thread queues QtViewer._on_slice_ready, as the
+    # slicing thread does when a response arrives.
+    recorder = Recorder()
     thread = threading.Thread(
-        target=qt_viewer._on_slice_ready,
-        args=(SimpleNamespace(value={}),),
+        target=qt_viewer._slice_ready.emit, args=({recorder: None},)
     )
     thread.start()
     thread.join()
-    assert any(qt_viewer in call._args for call in CallCallable.instances)
+    assert recorder.threads == []
 
     loader.close()
 
-    assert all(qt_viewer not in call._args for call in CallCallable.instances)
+    assert recorder.threads == [threading.main_thread()]
 
 
 def test_async_slicing_kept_while_another_progressive_layer_lives(
