@@ -425,6 +425,25 @@ def _chunk_id(chunk_key: tuple[slice, ...]) -> tuple[tuple[int, int], ...]:
     return chunk_key_id(chunk_key)
 
 
+#: Retry delay for main-thread checks that found a level's lock busy.
+_LOCK_RETRY_MS = 30
+
+
+def _covers_without_waiting(vdata: VirtualData, low, high) -> bool | None:
+    """``vdata.covers`` without blocking on a worker; None while it is busy.
+
+    Workers hold a level's lock for a whole backdrop gather or chunk
+    write (hundreds of ms for a full 3D tile); a GUI-thread check that
+    waits on it stalls rendering and interaction for as long.
+    """
+    if not vdata.lock.acquire(blocking=False):
+        return None
+    try:
+        return vdata.covers(low, high)
+    finally:
+        vdata.lock.release()
+
+
 def _pack_upload_block(vdata: VirtualData, keys) -> tuple | None:
     """Contiguous copy of the union region of ``keys`` (worker thread).
 
@@ -1835,9 +1854,19 @@ class ProgressiveLoader:
         min_coord, max_coord = self._level_interval(level)
         if np.any(max_coord <= min_coord):
             return
-        if self._data[level].covers(min_coord, max_coord):
+        if self._viewer.dims.ndisplay == 3:
+            # never wait here on a worker writing this level: decide in
+            # _prepare_backdrop, which retries until the lock is free
+            covered = _covers_without_waiting(
+                self._data[level], min_coord, max_coord
+            )
+        else:
+            covered = self._data[level].covers(min_coord, max_coord)
+        if covered:
             return
-        if self._sync_backdrop_2d(level, min_coord, max_coord):
+        if covered is not None and self._sync_backdrop_2d(
+            level, min_coord, max_coord
+        ):
             return
         self._backdrop_pending = True
         QTimer.singleShot(0, self._prepare_backdrop)
@@ -2061,7 +2090,19 @@ class ProgressiveLoader:
         min_coord, max_coord = self._level_interval(level)
         if np.any(max_coord <= min_coord):
             return
-        if self._data[level].covers(min_coord, max_coord):
+        if self._viewer.dims.ndisplay == 3:
+            covered = _covers_without_waiting(
+                self._data[level], min_coord, max_coord
+            )
+            if covered is None:
+                # a worker is writing this level; check again shortly
+                # rather than stall the GUI thread until it finishes
+                self._backdrop_pending = True
+                QTimer.singleShot(_LOCK_RETRY_MS, self._prepare_backdrop)
+                return
+        else:
+            covered = self._data[level].covers(min_coord, max_coord)
+        if covered:
             return
         # Set the interval cheap (carry-over + zeros): the full-tile
         # upsample gather scales with the tile cap (200ms+ on the main

@@ -1095,6 +1095,41 @@ def test_intermediate_chunks_dirty_only_their_footprint(
         loader.close()
 
 
+def test_covers_without_waiting_does_not_block_on_busy_level():
+    """GUI-thread checks must not wait while a worker holds a level's
+    lock for a whole backdrop gather."""
+    import threading
+
+    from napari.experimental._progressive_loading import (
+        _covers_without_waiting,
+    )
+    from napari.experimental._virtual_data import MultiScaleVirtualData
+
+    data = MultiScaleVirtualData([np.zeros((64, 64, 64), np.uint8)])
+    vdata = data[0]
+    vdata.set_interval((0, 0, 0), (32, 32, 32))
+    for high in ((32, 32, 32), (64, 64, 64), (65, 64, 64)):
+        assert _covers_without_waiting(vdata, (0, 0, 0), high) == vdata.covers(
+            (0, 0, 0), high
+        )
+
+    held, release = threading.Event(), threading.Event()
+
+    def worker():
+        with vdata.lock:
+            held.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    try:
+        assert held.wait(5)
+        assert _covers_without_waiting(vdata, (0, 0, 0), (32, 32, 32)) is None
+    finally:
+        release.set()
+        thread.join()
+
+
 def test_huge_world_auto_normalized(qtbot, make_napari_viewer):
     """Pyramids whose extent exceeds float32 rendering precision get a
     normalizing layer scale (3D rendering goes blank past 2**22).
