@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
@@ -316,6 +318,18 @@ class _QtDispatcher(QObject):
             LOGGER.debug('dropping callback after Qt dispatcher teardown')
 
 
+@dataclass(frozen=True)
+class _PlanInputs:
+    """Qt-thread state a pass is planned from, captured at pass start."""
+
+    target: int
+    view: View
+    desired_stages: list
+    available: frozenset
+    layout: Layout
+    active: tuple | None
+
+
 class _WorkerProxy:
     def __init__(self, stream: Stream) -> None:
         self._stream = stream
@@ -516,6 +530,9 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             maxlen=32
         )
         self._lodstone_dispatcher = _QtDispatcher()
+        self._plan_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='napari-lodstone-plan'
+        )
         self._submitted_plan: Plan | None = None
         self._lodstone_target = _NapariTarget(self)
         runtime = _acquire_viewer_runtime(viewer)
@@ -622,38 +639,63 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             self._refresh()
 
     def _start_stage(self, generation: int, index: int) -> None:
+        """Plan the pass off the Qt thread, then submit it from the Qt thread.
+
+        Planning walks every tile of every ladder level in Python (hundreds
+        of milliseconds for a 3D view), which stalled the viewer each time
+        the camera settled. Inputs that read Qt, camera and layer state are
+        captured here; the plans are pure functions of them and are built on
+        a planning thread. Submission returns to this thread so the target's
+        generation still changes in step with the stream's.
+        """
         if not self._lodstone_enabled or self._lodstone_stream is None:
             return
-
         target = self._stages[-1][0]
-        desired_stages = self._desired_stages(target)
         view = self._pass_view()
-        available = self._available_keys(view)
+        inputs = _PlanInputs(
+            target=target,
+            view=view,
+            desired_stages=self._desired_stages(target),
+            available=self._available_keys(view),
+            layout=self._lodstone_target.layout(
+                view, self._lodstone_source.pyramid
+            ),
+            active=self._active,
+        )
+        # the pass is in flight from now on, even while it is being planned
+        self._worker = _WorkerProxy(self._lodstone_stream)
+        future = self._plan_executor.submit(self._build_plan, inputs)
+        future.add_done_callback(
+            lambda done: self._lodstone_dispatcher.dispatch(
+                lambda: self._submit_planned(generation, inputs, done)
+            )
+        )
+
+    def _build_plan(self, inputs: _PlanInputs) -> tuple[Plan, str]:
+        """Build the pass plan from captured inputs (planning thread)."""
+        pyramid = self._lodstone_source.pyramid
+        view, target = inputs.view, inputs.target
+        planners = self._bounded_planners[len(view.displayed_axes)]
         plan = plan_from_slices(
-            self._lodstone_source.pyramid,
+            pyramid,
             view,
-            desired_stages,
+            inputs.desired_stages,
             target_level=target,
-            available=available,
+            available=inputs.available,
             fetch_levels=None,
         )
         plan_source = 'napari-fallback'
         if self.trace_plans or LOGGER.isEnabledFor(logging.DEBUG):
-            self._trace_shared_plan(view, plan, available)
-        active = self._active
-        if active is not None:
-            _active_level, active_min, active_max = active
-            bounded = self._bounded_planners[
-                len(view.displayed_axes)
-            ].plan_region(
-                self._lodstone_source.pyramid,
+            self._trace_shared_plan(view, plan, inputs.available)
+        if inputs.active is not None:
+            _active_level, active_min, active_max = inputs.active
+            bounded = planners.plan_region(
+                pyramid,
                 view,
-                self._lodstone_target.layout(
-                    view, self._lodstone_source.pyramid
-                ),
+                inputs.layout,
                 target_level=target,
                 target_region=Region(active_min, active_max),
-                available=available,
+                available=inputs.available,
                 fetch_intermediate=True,
             )
             bounded_comparison = PlanComparison(
@@ -662,29 +704,42 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
                 PlanTrace.from_plan(bounded),
             )
             self._bounded_plan_comparisons.append(bounded_comparison)
+            # Use Lodstone's renderer-constrained region plan only after
+            # checking that it describes the same target geometry. Keep the
+            # reconstructed napari plan as a compatibility fallback while
+            # the strict frustum planner remains useful as a diagnostic.
             if bounded_comparison.geometry_matches:
                 plan = bounded
                 plan_source = 'lodstone-region'
-        overview = self._bounded_planners[
-            len(view.displayed_axes)
-        ].plan_overview(
-            self._lodstone_source.pyramid,
+        overview = planners.plan_overview(
+            pyramid,
             view,
             level_index=self._resident_level,
             memory_limit=self._resident_max_bytes,
-            available=available,
+            available=inputs.available,
         )
-        plan = merge_plans(plan, overview)
+        return merge_plans(plan, overview), plan_source
+
+    def _submit_planned(self, generation: int, inputs: _PlanInputs, done):
+        """Submit a finished plan if its pass is still current (Qt thread)."""
+        stream = self._lodstone_stream
+        if (
+            self._closed
+            or not self._lodstone_enabled
+            or stream is None
+            or generation != self._generation
+        ):
+            return
+        try:
+            plan, plan_source = done.result()
+        except Exception:
+            LOGGER.exception('Lodstone planning failed; planning inline')
+            plan, plan_source = self._build_plan(inputs)
         self._chunks_total = len(plan.wanted)
-        # Use Lodstone's renderer-constrained region plan only after checking
-        # that it describes the same target geometry. Keep the reconstructed
-        # napari plan as a compatibility fallback while the strict frustum
-        # planner remains useful as an independent diagnostic.
         self._submitted_plan = plan
         self._lodstone_target.generation = generation
-        self._worker = _WorkerProxy(self._lodstone_stream)
-        self._lodstone_stream.submit(view, plan)
-        diagnostics = self._lodstone_stream.diagnostics
+        stream.submit(inputs.view, plan)
+        diagnostics = stream.diagnostics
         LOGGER.info(
             'Lodstone submitted progressive plan: source=%s generation=%d '
             'target_level=%d desired_tiles=%d wanted_tiles=%d '
@@ -927,6 +982,8 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         stream = self._lodstone_stream
         self._lodstone_stream = None
         self._lodstone_enabled = False
+        # a plan still being built is dropped on delivery (loader closed)
+        self._plan_executor.shutdown(wait=False, cancel_futures=True)
         disconnect_status = self._disconnect_lodstone_status
         self._disconnect_lodstone_status = lambda: None
         disconnect_status()

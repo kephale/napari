@@ -344,7 +344,14 @@ def test_real_fetch_pass_records_napari_and_lodstone_plans(
     layer = add_lodstone_loading_image(arrays, viewer=viewer)
     loader = layer.metadata['progressive_loader']
     try:
-        qtbot.waitUntil(lambda: bool(loader._plan_comparisons), timeout=10000)
+        # plans are built off the Qt thread: wait for the submission
+        qtbot.waitUntil(
+            lambda: (
+                loader._submitted_plan is not None
+                and bool(loader.bounded_plan_comparisons)
+            ),
+            timeout=10000,
+        )
         comparison = loader.plan_comparisons[-1]
 
         assert comparison.view.viewport == viewer.canvas.size[::-1]
@@ -406,7 +413,14 @@ def test_real_3d_fetch_pass_records_napari_and_lodstone_plans(
     layer = add_lodstone_loading_image(arrays, viewer=viewer)
     loader = layer.metadata['progressive_loader']
     try:
-        qtbot.waitUntil(lambda: bool(loader.plan_comparisons), timeout=10000)
+        # plans are built off the Qt thread: wait for the submission
+        qtbot.waitUntil(
+            lambda: (
+                loader._submitted_plan is not None
+                and bool(loader.bounded_plan_comparisons)
+            ),
+            timeout=10000,
+        )
         comparison = loader.plan_comparisons[-1]
 
         assert comparison.view.displayed_axes == tuple(
