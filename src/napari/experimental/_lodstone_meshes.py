@@ -14,6 +14,7 @@ camera is mapped back into the source frame for planning.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -35,6 +36,10 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MESH_MEMORY_LIMIT = 128 << 20
+# Shortest interval between level/culling updates while the camera moves.
+# Every update can publish and upload new geometry; one per camera event
+# made continuous zooms re-upload tens of times a second.
+DEFAULT_UPDATE_INTERVAL_S = 0.15
 
 # Source XYZ (homogeneous) to napari ZYX (homogeneous).
 _XYZ_TO_ZYX = np.array(
@@ -144,18 +149,38 @@ class NapariSurfaceTarget:
         self.faces = 0
         self.publications = 0
 
-    def replace(
+    def prepare(
         self, level: int, chunks: Sequence[tuple[MeshKey, MeshData]]
-    ) -> None:
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Merge and weld a phase's fragments (off the dispatch thread).
+
+        Lodstone versions that support two-step targets call this from a
+        worker, so only :meth:`replace_prepared` runs on the Qt thread.
+        """
         vertices, faces = _combine(chunks, self.source_to_data)
         if not len(faces):
-            vertices, faces = self.placeholder
+            return self.placeholder
+        return vertices, faces
+
+    def replace_prepared(
+        self,
+        level: int,
+        chunks: Sequence[tuple[MeshKey, MeshData]],
+        prepared: tuple[np.ndarray, np.ndarray],
+    ) -> None:
+        vertices, faces = prepared
         # Record the publication first: ``layer.data`` emits synchronously and
         # listeners read the target to describe what is shown.
         self.level = level
         self.vertices, self.faces = len(vertices), len(faces)
         self.publications += 1
         self.layer.data = (vertices, faces)
+
+    def replace(
+        self, level: int, chunks: Sequence[tuple[MeshKey, MeshData]]
+    ) -> None:
+        """Single-step replacement, for Lodstone without two-step targets."""
+        self.replace_prepared(level, chunks, self.prepare(level, chunks))
 
 
 class LodstoneSurfaceLoader:
@@ -186,9 +211,16 @@ class LodstoneSurfaceLoader:
             _placeholder(low, high, self.source_to_data),
         )
         self._dispatcher = None
+        self._throttle = None
         if dispatch is None:
             self._dispatcher = _QtDispatcher()
             dispatch = self._dispatcher.dispatch
+            from qtpy.QtCore import QTimer
+
+            self._throttle = QTimer()
+            self._throttle.setSingleShot(True)
+            self._throttle.timeout.connect(self.refresh)
+        self._last_refresh = -float('inf')
         self._owns_runtime = runtime is None
         self._runtime = (
             _acquire_viewer_runtime(viewer) if runtime is None else runtime
@@ -204,11 +236,11 @@ class LodstoneSurfaceLoader:
         self._closed = False
         self._last_matrix: np.ndarray | None = None
         self._connections = [
-            (viewer.scene.camera.events.center, self.refresh),
-            (viewer.scene.camera.events.zoom, self.refresh),
-            (viewer.scene.camera.events.angles, self.refresh),
-            (viewer.dims.events.ndisplay, self.refresh),
-            (viewer.canvas.events.size, self.refresh),
+            (viewer.scene.camera.events.center, self._on_view_change),
+            (viewer.scene.camera.events.zoom, self._on_view_change),
+            (viewer.scene.camera.events.angles, self._on_view_change),
+            (viewer.dims.events.ndisplay, self._on_view_change),
+            (viewer.canvas.events.size, self._on_view_change),
             (viewer.layers.events.removed, self._on_layer_removed),
         ]
         for emitter, callback in self._connections:
@@ -237,10 +269,30 @@ class LodstoneSurfaceLoader:
         matrix = world_view.world_to_clip @ data_to_world @ self.source_to_data
         return View((0, 1, 2), (None,) * 3, world_view.viewport, matrix)
 
+    def _on_view_change(self, event=None) -> None:
+        """Update for a camera change, at most once per update interval.
+
+        The first change of a gesture updates at once; later ones coalesce
+        into one trailing update per interval, and the last always lands.
+        """
+        if self._closed:
+            return
+        throttle = self._throttle
+        if throttle is None:
+            self.refresh()
+            return
+        if throttle.isActive():
+            return
+        wait = (
+            self._last_refresh + DEFAULT_UPDATE_INTERVAL_S - time.monotonic()
+        )
+        throttle.start(max(0, round(wait * 1000)))
+
     def refresh(self, event=None) -> None:
         """Ask Lodstone for the level and chunks the current camera needs."""
         if self._closed:
             return
+        self._last_refresh = time.monotonic()
         view = self.view()
         if view is None:
             # 2D slices of a surface keep the last 3D phase, or start coarse.
@@ -295,6 +347,8 @@ class LodstoneSurfaceLoader:
         self._closed = True
         for emitter, callback in self._connections:
             emitter.disconnect(callback)
+        if self._throttle is not None:
+            self._throttle.stop()
         self.stream.close()
         if self._owns_runtime:
             _release_viewer_runtime(self._viewer, self._runtime)

@@ -247,3 +247,33 @@ def test_zarr_vectors_levels_stream_into_napari(viewer, tmp_path):
         loader.close()
     finally:
         source.close()
+
+
+def test_camera_gestures_update_the_stream_at_a_bounded_rate(
+    qtbot, viewer, monkeypatch
+):
+    """Each update can publish and upload new geometry, so a continuous
+    zoom must not update once per camera event; the final camera must
+    still be the one loaded."""
+    viewer.dims.ndisplay = 3
+    layer = add_lodstone_surface(SheetSource(), viewer)
+    loader = _loader(layer)
+    try:
+        qtbot.waitUntil(lambda: loader.target.level is not None)
+        views = []
+        update = loader.stream.update
+        monkeypatch.setattr(
+            loader.stream,
+            'update',
+            lambda view, **kwargs: (views.append(view), update(view, **kwargs)),
+        )
+        qtbot.wait(300)
+        for step in range(40):
+            viewer.scene.camera.zoom *= 1.05
+        qtbot.wait(400)
+        assert 1 <= len(views) <= 3
+        np.testing.assert_array_equal(
+            views[-1].world_to_clip, loader.view().world_to_clip
+        )
+    finally:
+        loader.close()
