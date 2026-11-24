@@ -92,6 +92,47 @@ def test_combine_reverses_xyz_and_offsets_faces():
     np.testing.assert_array_equal(faces, [[0, 1, 2], [3, 4, 5]])
 
 
+def test_combine_welds_vertices_shared_across_chunks():
+    # Two triangles of one quad, split into chunks that each copy the
+    # shared edge. Unwelded, smooth shading creases along that edge.
+    left = MeshData(
+        np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32),
+        np.array([[0, 1, 2]]),
+    )
+    right = MeshData(
+        np.array([[1, 0, 0], [1, 1, 0], [0, 1, 0]], np.float32),
+        np.array([[0, 1, 2]]),
+    )
+    vertices, faces = _combine(
+        [(('m', (0,)), left), (('m', (1,)), right)], _XYZ_TO_ZYX
+    )
+    assert len(vertices) == 4
+    corners = vertices[faces][..., ::-1]  # back to XYZ
+    np.testing.assert_array_equal(
+        corners,
+        [
+            [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+            [[1, 0, 0], [1, 1, 0], [0, 1, 0]],
+        ],
+    )
+
+
+def test_title_listeners_see_the_published_level(viewer):
+    viewer.dims.ndisplay = 3
+    source = SheetSource()
+    layer = add_lodstone_surface(source, viewer, dispatch=_inline)
+    loader = _loader(layer)
+    seen = []
+    layer.events.data.connect(
+        lambda _: seen.append((loader.target.faces, len(layer.data[1])))
+    )
+    loader.stream.wait()
+    viewer.camera.zoom *= 64
+    loader.stream.wait()
+    assert seen
+    assert all(target == shown for target, shown in seen)
+
+
 def test_2d_display_starts_with_the_coarsest_level(viewer):
     source = SheetSource()
     layer = add_lodstone_surface(source, viewer, dispatch=_inline)

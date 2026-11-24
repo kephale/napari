@@ -82,10 +82,31 @@ def _combine(
         offset += len(data.vertices)
     if not faces:
         return np.empty((0, 3), np.float32), np.empty((0, 3), np.int64)
-    combined = np.concatenate(vertices)
+    combined, combined_faces = _weld(
+        np.concatenate(vertices), np.concatenate(faces)
+    )
     # A permutation (or identity) keeps float32 exact: no matrix product.
     order = [int(np.flatnonzero(row[:3])[0]) for row in source_to_data[:3]]
-    return combined[:, order], np.concatenate(faces)
+    return combined[:, order], combined_faces
+
+
+def _weld(
+    vertices: np.ndarray, faces: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Merge vertices that chunks duplicate along their shared boundaries.
+
+    Each chunk carries its own copy of the vertices on its boundary. Left
+    apart, smooth shading averages normals per chunk and every chunk edge
+    shows as a crease. Copies are bitwise equal, so exact matching suffices.
+    """
+    vertices = np.ascontiguousarray(vertices)
+    rows = vertices.view(np.dtype((np.void, vertices.dtype.itemsize * 3)))
+    _, first, inverse = np.unique(
+        rows.ravel(), return_index=True, return_inverse=True
+    )
+    if len(first) == len(vertices):
+        return vertices, faces
+    return vertices[first], inverse.reshape(-1)[faces]
 
 
 def _placeholder(
@@ -129,10 +150,12 @@ class NapariSurfaceTarget:
         vertices, faces = _combine(chunks, self.source_to_data)
         if not len(faces):
             vertices, faces = self.placeholder
-        self.layer.data = (vertices, faces)
+        # Record the publication first: ``layer.data`` emits synchronously and
+        # listeners read the target to describe what is shown.
         self.level = level
         self.vertices, self.faces = len(vertices), len(faces)
         self.publications += 1
+        self.layer.data = (vertices, faces)
 
 
 class LodstoneSurfaceLoader:
