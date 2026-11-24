@@ -66,7 +66,28 @@ LEVEL_LABEL_OFFSET = 2
 _RUNTIME_LOCK = Lock()
 _RUNTIME_ATTRIBUTE = '_lodstone_runtime'
 _RUNTIME_REFS_ATTRIBUTE = '_lodstone_runtime_refs'
-LODSTONE_GPU_BATCH_SIZE = 1
+# Decoded bytes Lodstone may gather into one Qt delivery and upload block.
+LODSTONE_GPU_BATCH_BYTES = 32 << 20
+
+
+def _gpu_batch_size(chunks, dtype, workers: int) -> int:
+    """Tiles per Lodstone read window and Qt delivery.
+
+    Lodstone gathers each window's reads concurrently and delivers it as
+    one batch, so the batch size bounds read parallelism as well as
+    delivery size. A decoded ZebraHub chunk is roughly 32 MiB, and core's
+    default of eight tiles would make 256+ MiB deliveries, so large chunks
+    go one at a time. Small chunks (the 32^3 Mandelbulb's are 32 KiB) would
+    then read strictly one after another, leaving every worker but one
+    idle: allow enough of them to keep the workers busy.
+    """
+    itemsize = np.dtype(dtype).itemsize
+    largest = max(
+        int(np.prod([max(axis) for axis in level], dtype=np.int64))
+        for level in chunks
+    )
+    fit = LODSTONE_GPU_BATCH_BYTES // max(largest * itemsize, 1)
+    return int(max(1, min(2 * workers, fit)))
 
 
 def _acquire_viewer_runtime(viewer) -> Runtime:
@@ -437,9 +458,10 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         kwargs['_start_immediately'] = False
         super().__init__(viewer, layer, data, **kwargs)
 
+        level_chunks = [chunk_sizes_for(array) for array in data.arrays]
         source = ArrayPyramidSource(
             data.arrays,
-            chunks=[chunk_sizes_for(array) for array in data.arrays],
+            chunks=level_chunks,
             transforms=_level_transforms(layer, data),
         )
         self._lodstone_source = source
@@ -469,12 +491,9 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
                 self._lodstone_target,
                 dispatch=self._lodstone_dispatcher.dispatch,
                 workers=self._fetch_workers,
-                # A decoded ZebraHub chunk is roughly 32 MiB.  Core's
-                # throughput-oriented default of eight tiles can therefore
-                # create a 256+ MiB contiguous upload block and one equally
-                # large Qt delivery.  GPU targets need latency-oriented
-                # delivery: one independently presentable brick at a time.
-                batch_size=LODSTONE_GPU_BATCH_SIZE,
+                batch_size=_gpu_batch_size(
+                    level_chunks, data.dtype, self._fetch_workers
+                ),
                 # The movable interval already bounds napari's CPU working
                 # set.  Do not retain a second, multi-gigabyte decoded cache
                 # behind it merely because Stream's viewer-neutral default is

@@ -12,11 +12,13 @@ from lodstone import Plan, Region, TileKey, Update
 
 from napari.experimental._lodstone_loading import (
     LEVEL_LABEL_OFFSET,
+    LODSTONE_GPU_BATCH_BYTES,
     MISSING_LEVEL_LABEL,
     LodstoneProgressiveLoader,
     PlanTrace,
     _acquire_viewer_runtime,
     _camera_view,
+    _gpu_batch_size,
     _level_transforms,
     _NapariTarget,
     _QtDispatcher,
@@ -52,6 +54,20 @@ def test_shared_plan_is_not_traced_by_default(
         assert loader.plan_comparisons == ()
     finally:
         loader.close()
+
+
+def test_gpu_batch_size_parallelizes_small_chunks_only() -> None:
+    """Lodstone gathers one window of reads at a time, so its batch size
+    bounds read parallelism. Small chunks must fill every worker; chunks
+    near the delivery budget still go one at a time."""
+    small = [((32,) * 32, (32,) * 32, (32,) * 32)]  # 32^3 uint8 = 32 KiB
+    assert _gpu_batch_size(small, np.uint8, workers=4) == 8
+    large = [((256,) * 2, (256,) * 2, (128,) * 2)]  # 8 Mi voxels
+    batch = _gpu_batch_size(large, np.uint32, workers=4)  # 32 MiB each
+    assert batch == 1
+    medium = [((128,), (128,), (128,))]  # 2 MiB float32 each
+    batch = _gpu_batch_size(medium, np.float32, workers=8)
+    assert batch * 128**3 * 4 <= LODSTONE_GPU_BATCH_BYTES
 
 
 def test_viewer_layers_share_lodstone_runtime() -> None:
@@ -333,7 +349,8 @@ def test_real_fetch_pass_records_napari_and_lodstone_plans(
         assert diagnostics.wanted_tiles == len(comparison.napari.wanted)
         assert diagnostics.unique_native_chunks > 0
         assert diagnostics.source_reads > 0
-        assert loader._lodstone_stream.batch_size == 1
+        # 16x16 uint16 chunks are tiny: a window reads every worker at once
+        assert loader._lodstone_stream.batch_size == 2 * loader._fetch_workers
         assert loader._lodstone_stream.cpu_cache_limit == max(
             loader._interval_max_bytes,
             loader._resident_max_bytes,
