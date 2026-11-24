@@ -787,7 +787,8 @@ class ProgressiveLoader:
         # (all-zero) content. Read it fresh instead: materializing a
         # resident VirtualData is a plain memory copy.
         layer._slicing_state._thumbnail_plane_cache = _UncachedThumbnailPlane(
-            layer.data, layer._slicing_state._slice_request_class._project_slice
+            layer.data,
+            layer._slicing_state._slice_request_class._project_slice,
         )
 
         # GL texture size limits: clamp intervals so no axis exceeds

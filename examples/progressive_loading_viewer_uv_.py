@@ -8,12 +8,11 @@
 #     "requests",
 #     "s3fs",
 #     "dask[array]",
-#     "lodstone>=0.1.0a0",
+#     "lodstone>=0.1.0a3",
 # ]
 #
 # [tool.uv.sources]
 # napari = { git = "https://github.com/kephale/napari", branch = "lodstone-integration" }
-# lodstone = { git = "https://github.com/kephale/lodstone", branch = "main" }
 # ///
 """
 Progressive loading dataset viewer
