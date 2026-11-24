@@ -9,6 +9,7 @@
 #     "s3fs",
 #     "dask[array]",
 #     "lodstone>=0.1.0a3",
+#     "numba",  # compiles the generated mandelbrot/mandelbulb datasets
 # ]
 #
 # [tool.uv.sources]

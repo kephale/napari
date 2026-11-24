@@ -44,7 +44,7 @@ from napari.utils.naming import magic_name
 from napari.utils.transforms import Affine
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from napari.components import Dims
 
@@ -339,6 +339,11 @@ class ScalarFieldBase(Layer, ABC):
         # within this budget, sub-volume tiling is skipped and the
         # whole level is rendered.  Set by the progressive loader.
         self._interval_max_bytes_3d: int | None = None
+        # Whether a whole level can be fetched in one loading pass, by
+        # level index.  A level that fits the memory budget but spans too
+        # many chunks to load promptly is tiled around the view instead.
+        # Set by the progressive loader; ``None`` allows every level.
+        self._full_level_fetchable_3d: Callable[[int], bool] | None = None
 
         # Camera view direction in world coordinates, set by _update_draw
         # from the vispy canvas.  Used by _view_direction_data to compute
@@ -723,7 +728,10 @@ class ScalarFieldBase(Layer, ABC):
         ):
             tex_itemsize = 1 if self.dtype == np.uint8 else 4
             level_bytes = int(np.prod(shape_at_level)) * tex_itemsize
-            if level_bytes <= interval_budget:
+            fetchable = self._full_level_fetchable_3d
+            if level_bytes <= interval_budget and (
+                fetchable is None or fetchable(level)
+            ):
                 return corners
 
         downsample = np.take(

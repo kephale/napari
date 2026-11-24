@@ -812,6 +812,7 @@ class ProgressiveLoader:
         layer._max_tile_extent_3d = self._tile_extent_3d
         layer._tile_max_bytes_3d = min(interval_max_bytes, tile_max_bytes_3d)
         layer._interval_max_bytes_3d = interval_max_bytes
+        layer._full_level_fetchable_3d = self._full_level_fetchable_3d
 
         layer._render_margin_2d = 2.0
         self._tile_margin_3d = 1.25
@@ -1092,6 +1093,24 @@ class ProgressiveLoader:
             self._user_locked = True
             self._auto_locked = None
         # else: an echo of the level auto mode set; keep auto mode active.
+
+    def _full_level_fetchable_3d(self, level: int) -> bool:
+        """Whether one pass may fetch every displayed chunk of ``level``.
+
+        The level selector rejects passes over ``max_chunks_per_pass``
+        native chunks. A level that fits the memory budget but exceeds
+        that count must be tiled around the view; rendering it whole would
+        make the level unselectable at any zoom, pinning the view to a
+        coarser full level that no camera move can refine.
+        """
+        vdata = self._data[level]
+        displayed = list(self._layer._slice_input.displayed)
+        shape = tuple(int(vdata.shape[axis]) for axis in displayed)
+        chunks = tuple(chunk_sizes_for(vdata)[axis] for axis in displayed)
+        n_chunks = native_chunks_in_region(
+            Region((0,) * len(shape), shape), shape, chunks
+        )
+        return n_chunks <= self._max_chunks_per_pass
 
     def _zoom_target_level_3d(self) -> int:
         """Pick the 3D data level appropriate for the current camera zoom.

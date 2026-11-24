@@ -976,6 +976,57 @@ def test_zoom_target_respects_chunk_budget(
     loader.close()
 
 
+def test_zoom_in_tiles_levels_too_many_chunks_to_fetch_whole(
+    qtbot,
+    make_napari_viewer,
+):
+    """A level that fits the memory budget but spans more chunks than one
+    pass may fetch is tiled around the view instead of rendered whole.
+
+    Rendered whole, its chunk count fails the per-pass budget at every
+    zoom, so auto selection never reaches it and the view stays on a
+    coarser full level that rotating and zooming cannot refine.
+    """
+    from napari.experimental._virtual_data import MultiScaleVirtualData
+
+    arrays = [
+        da.zeros((size,) * 3, chunks=(32, 32, 32), dtype=np.uint8)
+        for size in (256, 128, 64)
+    ]
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    data = MultiScaleVirtualData(arrays)
+    layer = viewer.add_image(data._data, multiscale=True)
+    # Level 0 (16 MiB) fits the memory budget but is 8^3 = 512 chunks;
+    # level 1 is 4^3 = 64. A view tile of level 0 fits in 64 chunks.
+    loader = LodstoneProgressiveLoader(
+        viewer,
+        layer,
+        data,
+        max_chunks_per_pass=64,
+        tile_max_bytes_3d=64**3,
+        auto_level_3d=True,
+    )
+    layer.metadata['progressive_loader'] = loader
+    _wait_for_idle_loader(qtbot, loader)
+    loader._closed = True
+    try:
+        assert not loader._full_level_fetchable_3d(0)
+        assert loader._full_level_fetchable_3d(1)
+
+        viewer.scene.camera.zoom = 50.0
+        assert loader._zoom_target_level_3d() == 0
+        displayed = list(layer._slice_input.displayed)
+        corners = layer._corners_for_locked_level(
+            0, displayed, loader._camera_bbox_level0(displayed)
+        )
+        extent = (corners[1] - corners[0] + 1)[displayed]
+        assert np.all(extent < 256)
+    finally:
+        loader._closed = False
+        loader.close()
+
+
 def test_huge_world_auto_normalized(qtbot, make_napari_viewer):
     """Pyramids whose extent exceeds float32 rendering precision get a
     normalizing layer scale (3D rendering goes blank past 2**22).
