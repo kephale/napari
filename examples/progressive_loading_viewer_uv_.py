@@ -8,7 +8,7 @@
 #     "requests",
 #     "s3fs",
 #     "dask[array]",
-#     "lodstone>=0.1.0a3",
+#     "lodstone>=0.1.0a4",
 #     "numba",  # compiles the generated mandelbrot/mandelbulb datasets
 # ]
 #
@@ -273,6 +273,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--list', action='store_true')
     parser.add_argument('--levels', type=int, help='number of pyramid levels')
     parser.add_argument(
+        '--maxiter',
+        type=int,
+        help='escape-time iterations for generated fractals',
+    )
+    parser.add_argument(
         '--contrast', type=float, nargs=2, metavar=('LO', 'HI')
     )
     parser.add_argument('--colormap')
@@ -305,24 +310,24 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _generated(spec, cache_bytes):
+def _generated(spec, arguments, cache_bytes):
     name = spec['generator']
     if name == 'mandelbrot':
-        return mandelbrot_dataset(max_levels=14, cache_bytes=cache_bytes)[
-            'arrays'
-        ]
-    if name == 'mandelbulb':
-        return mandelbulb_dataset(
-            max_levels=5,
-            tilesize=32,
-            maxiter=64,
+        return mandelbrot_dataset(
+            max_levels=arguments.levels or 14,
+            maxiter=arguments.maxiter or 255,
             cache_bytes=cache_bytes,
         )['arrays']
-    if name == 'mandelbulb-rgb':
-        return mandelbulb_rgb_dataset(
-            max_levels=5,
+    if name in ('mandelbulb', 'mandelbulb-rgb'):
+        dataset = (
+            mandelbulb_dataset
+            if name == 'mandelbulb'
+            else mandelbulb_rgb_dataset
+        )
+        return dataset(
+            max_levels=arguments.levels or 5,
             tilesize=32,
-            maxiter=64,
+            maxiter=arguments.maxiter or 64,
             cache_bytes=cache_bytes,
         )['arrays']
     return local_zarr_dataset(
@@ -332,7 +337,7 @@ def _generated(spec, cache_bytes):
 
 def _open_layer(spec, arguments, cache_bytes):
     if 'generator' in spec:
-        return _generated(spec, cache_bytes), None, None
+        return _generated(spec, arguments, cache_bytes), None, None
 
     arrays, scale, translate = open_ome_zarr(
         spec['path'],
