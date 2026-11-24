@@ -18,6 +18,7 @@ from napari.experimental._lodstone_loading import (
     PlanTrace,
     _acquire_viewer_runtime,
     _camera_view,
+    _compact_key_groups,
     _gpu_batch_size,
     _level_transforms,
     _NapariTarget,
@@ -68,6 +69,22 @@ def test_gpu_batch_size_parallelizes_small_chunks_only() -> None:
     medium = [((128,), (128,), (128,))]  # 2 MiB float32 each
     batch = _gpu_batch_size(medium, np.float32, workers=8)
     assert batch * 128**3 * 4 <= LODSTONE_GPU_BATCH_BYTES
+
+
+def test_compact_key_groups_split_scattered_chunks() -> None:
+    """Each group uploads as its union box: neighbours share one box, but
+    chunks from opposite corners of a tile must not form one tile-sized
+    upload for two chunks' worth of data."""
+
+    def key(z, y, x):
+        return (slice(z, z + 32), slice(y, y + 32), slice(x, x + 32))
+
+    neighbours = [key(0, 0, 0), key(0, 0, 32), key(0, 32, 0), key(0, 32, 32)]
+    assert _compact_key_groups(neighbours) == [neighbours]
+    far = [key(0, 0, 0), key(224, 224, 224)]
+    assert _compact_key_groups(far) == [[far[0]], [far[1]]]
+    mixed = [key(0, 0, 0), key(224, 224, 224), key(0, 0, 32)]
+    assert _compact_key_groups(mixed) == [[mixed[0], mixed[2]], [mixed[1]]]
 
 
 def test_viewer_layers_share_lodstone_runtime() -> None:

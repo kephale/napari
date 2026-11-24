@@ -70,6 +70,36 @@ _RUNTIME_REFS_ATTRIBUTE = '_lodstone_runtime_refs'
 LODSTONE_GPU_BATCH_BYTES = 32 << 20
 
 
+def _compact_key_groups(keys, max_waste: float = 2.0) -> list[list]:
+    """Split chunk keys into groups whose union boxes stay compact.
+
+    A batch is uploaded as the union box of its chunks. Parallel reads
+    deliver chunks from different parts of the tile together, and their
+    union can be a hundred times their own volume: one 16 MiB upload, and
+    again through the double buffer, for 256 KiB of new data. Grow each
+    group only while its union box is at most ``max_waste`` times the
+    volume of its chunks.
+    """
+    groups: list[tuple[list, np.ndarray, np.ndarray, int]] = []
+    for key in keys:
+        low = np.array([k.start for k in key], dtype=np.int64)
+        high = np.array([k.stop for k in key], dtype=np.int64)
+        volume = int(np.prod(high - low))
+        for index, (members, g_low, g_high, g_volume) in enumerate(groups):
+            u_low, u_high = np.minimum(g_low, low), np.maximum(g_high, high)
+            if np.prod(u_high - u_low) <= max_waste * (g_volume + volume):
+                groups[index] = (
+                    [*members, key],
+                    u_low,
+                    u_high,
+                    g_volume + volume,
+                )
+                break
+        else:
+            groups.append(([key], low, high, volume))
+    return [members for members, *_ in groups]
+
+
 def _gpu_batch_size(chunks, dtype, workers: int) -> int:
     """Tiles per Lodstone read window and Qt delivery.
 
@@ -392,12 +422,17 @@ class _NapariTarget:
         return tuple(
             (
                 level,
-                batch,
-                _pack_upload_block(self.loader._data[level], batch)
+                group,
+                _pack_upload_block(self.loader._data[level], group)
                 if level in {target, resident}
                 else None,
             )
             for level, batch in grouped.items()
+            for group in (
+                _compact_key_groups(batch)
+                if level in {target, resident}
+                else (batch,)
+            )
         )
 
     def apply(self, staged) -> None:
