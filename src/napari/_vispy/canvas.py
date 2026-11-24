@@ -25,6 +25,7 @@ from napari._vispy.utils.qt_font import FontInfo, QtFontManager
 from napari._vispy.utils.visual import create_vispy_overlay
 from napari.components._viewer_constants import CanvasPosition
 from napari.components.overlays import CanvasOverlay
+from napari.layers._scalar_field.scalar_field import ScalarFieldBase
 from napari.settings import get_settings
 from napari.utils._proxies import ReadOnlyWrapper
 from napari.utils.events import disconnect_events
@@ -739,7 +740,7 @@ class VispyCanvas:
             # Layers that use the camera direction for multiscale corner
             # computations (see ScalarFieldBase._view_direction_data) read
             # it from here rather than reaching up to the viewer.
-            if hasattr(layer, '_camera_view_direction'):
+            if isinstance(layer, ScalarFieldBase):
                 layer._camera_view_direction = view_dir
             layer._update_draw(
                 scale_factor=1 / self.viewer.scene.camera.zoom,

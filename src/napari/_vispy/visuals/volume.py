@@ -373,7 +373,7 @@ class Volume(TextureMixin, BaseVolume):
         )
         self._overview_texture.set_clim(self._texture.clim)
         self._overview_texture.scale_and_set_data(overview, copy=False)
-        self._clipmap_shape = tuple(int(value) for value in full_shape)
+        self._clipmap_shape = tuple(full_shape)
         self._clipmap_enabled = True
         self.freeze()
         self._install_clipmap_lookup()
