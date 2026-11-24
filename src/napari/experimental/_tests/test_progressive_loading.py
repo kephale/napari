@@ -2,6 +2,7 @@ import itertools
 import os
 import sys
 import threading
+import types
 
 import dask.array as da
 import numpy as np
@@ -81,6 +82,102 @@ def test_front_depth_segment_starts_at_camera_facing_surface(
     center, half = segment
     np.testing.assert_allclose(center, expected_center)
     assert half == 10
+
+
+@pytest.mark.parametrize(
+    ('direction', 'expected_center'),
+    [((1, 0, 0), (70, 50, 50)), ((-1, 0, 0), (30, 50, 50))],
+)
+def test_front_depth_segment_starts_at_first_content(
+    direction,
+    expected_center,
+):
+    # content begins at the orbit center, 50 voxels behind the box face
+    # the segment would otherwise start at
+    segment = _front_depth_segment(
+        np.array((50, 50, 50)),
+        np.array(direction),
+        np.array((100, 100, 100)),
+        length=40,
+        first_content=lambda enter, leave: 0.0,
+    )
+
+    assert segment is not None
+    center, half = segment
+    np.testing.assert_allclose(center, expected_center)
+    assert half == 20
+
+
+@pytest.mark.parametrize('start', [None, -60.0, 60.0, float('nan')])
+def test_front_depth_segment_ignores_content_outside_the_box(start):
+    segment = _front_depth_segment(
+        np.array((50, 50, 50)),
+        np.array((1, 0, 0)),
+        np.array((100, 100, 100)),
+        length=20,
+        first_content=lambda enter, leave: start,
+    )
+
+    assert segment is not None
+    center, half = segment
+    np.testing.assert_allclose(center, (10, 50, 50))
+    assert half == 10
+
+
+def _ray_probe_loader(overview, factor, contrast=(0, 100), loaded=True):
+    class _Levels(list):
+        pass
+
+    levels = _Levels([None, None])
+    levels._scale_factors = [(1, 1, 1), (factor,) * 3]
+    levels[1] = types.SimpleNamespace(
+        ndim=overview.ndim,
+        loaded_chunks={'chunk'} if loaded else set(),
+        lock=threading.RLock(),
+        hyperslice=overview,
+        translate=(0, 0, 0),
+    )
+    loader = ProgressiveLoader.__new__(ProgressiveLoader)
+    loader._layer = types.SimpleNamespace(contrast_limits=contrast, rgb=False)
+    loader._resident_level = 1
+    loader._data = levels
+    return loader
+
+
+def test_first_content_along_ray_finds_sparse_content_in_a_large_box():
+    # a 64-voxel coarse overview of a 1024-voxel box: content is a small
+    # block deep inside, everything in front of it is near-empty background
+    overview = np.full((64, 64, 64), 3, dtype=np.uint8)
+    overview[40:48, 30:34, 30:34] = 80
+    loader = _ray_probe_loader(overview, factor=16)
+    center = np.array([512.0, 512.0, 512.0])
+    direction = np.array([1.0, 0.0, 0.0])
+
+    start = loader._first_content_along_ray(
+        center, direction, -512.0, 512.0, [0, 1, 2]
+    )
+
+    # the block starts at level-0 depth 640, i.e. ray parameter 128; the
+    # result backs off by at most one coarse voxel (16) plus sampling
+    assert start is not None
+    assert 128 - 2 * 16 <= start <= 128
+
+
+def test_first_content_along_ray_keeps_the_face_without_overview_content():
+    overview = np.full((64, 64, 64), 3, dtype=np.uint8)
+    center = np.array([512.0, 512.0, 512.0])
+    direction = np.array([1.0, 0.0, 0.0])
+
+    empty = _ray_probe_loader(overview, factor=16)
+    unloaded = _ray_probe_loader(overview + 90, factor=16, loaded=False)
+
+    for loader in (empty, unloaded):
+        assert (
+            loader._first_content_along_ray(
+                center, direction, -512.0, 512.0, [0, 1, 2]
+            )
+            is None
+        )
 
 
 def test_add_progressive_loading_image(

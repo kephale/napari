@@ -95,6 +95,8 @@ except ImportError:
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import napari
 
 LOGGER = logging.getLogger(__name__)
@@ -258,6 +260,7 @@ def _front_depth_segment(
     direction: np.ndarray,
     shape: np.ndarray,
     length: float,
+    first_content: Callable[[float, float], float | None] | None = None,
 ) -> tuple[np.ndarray, float] | None:
     """Center and half-length of a camera-facing ray segment in a box.
 
@@ -265,6 +268,12 @@ def _front_depth_segment(
     segment starts where the center ray enters the data and extends inward,
     rather than straddling the orbit center. This keeps a bounded 3-D focus
     texture on foreground data that can occlude its coarse context.
+
+    ``first_content(enter, leave)``, when given, returns the ray parameter
+    where content first appears between the box entry and exit, or None.
+    The segment then starts there instead of at the box face, so sparse
+    data inside a large box (a fractal, a cell in a wide field) keeps its
+    focus on the content rather than on empty space in front of it.
     """
     center = np.asarray(center, dtype=float)
     direction = np.asarray(direction, dtype=float)
@@ -294,6 +303,11 @@ def _front_depth_segment(
     leave = float(np.min(np.maximum(lower, upper)))
     if not np.isfinite(enter) or not np.isfinite(leave) or enter >= leave:
         return None
+
+    if first_content is not None:
+        start = first_content(enter, leave)
+        if start is not None and np.isfinite(start) and enter < start < leave:
+            enter = float(start)
 
     stop = min(enter + length, leave)
     half = (stop - enter) / 2.0
@@ -1269,6 +1283,68 @@ class ProgressiveLoader:
                 return level
         return n_levels - 1
 
+    def _first_content_along_ray(
+        self,
+        center: np.ndarray,
+        direction: np.ndarray,
+        enter: float,
+        leave: float,
+        displayed_axes: list[int],
+    ) -> float | None:
+        """Ray parameter where the resident overview first shows content.
+
+        Samples the coarsest level's loaded voxels along the center ray in
+        level-0 coordinates and returns where a value first rises above a
+        tenth of the contrast range, backed off by one coarse voxel so the
+        surface falls inside the focus segment. Returns None, keeping the
+        box face, when the overview has nothing loaded, the data is not a
+        plain 3-D scalar volume, or no content is found.
+        """
+        layer = self._layer
+        if len(displayed_axes) != 3 or getattr(layer, 'rgb', False):
+            return None
+        level = self._resident_level
+        vdata = self._data[level]
+        if vdata.ndim != 3 or not vdata.loaded_chunks:
+            return None
+        contrast = getattr(layer, 'contrast_limits', None)
+        if contrast is None:
+            threshold = 0.0
+        else:
+            low, high = (float(value) for value in contrast)
+            threshold = low + 0.1 * (high - low)
+        factors = np.take(
+            np.asarray(self._data._scale_factors[level], dtype=float),
+            displayed_axes,
+        )
+        coarse_step = float(np.max(factors))
+        count = int(np.clip(2 * (leave - enter) / coarse_step, 2, 4096))
+        steps = np.linspace(enter, leave, count)
+        points = center[None, :] + steps[:, None] * direction[None, :]
+        with vdata.lock:
+            slab = vdata.hyperslice
+            if slab is None or slab.ndim != 3 or 0 in slab.shape:
+                return None
+            translate = np.take(
+                np.asarray(vdata.translate, dtype=float), displayed_axes
+            )
+            index = np.floor(points / factors - translate).astype(np.int64)
+            inside = np.all(
+                (index >= 0) & (index < np.asarray(slab.shape)), axis=1
+            )
+            if not np.any(inside):
+                return None
+            order = np.argsort(displayed_axes)
+            picked = index[inside][:, order]
+            values = np.asarray(
+                slab[picked[:, 0], picked[:, 1], picked[:, 2]], dtype=float
+            )
+        hits = np.flatnonzero(values > threshold)
+        if not len(hits):
+            return None
+        first = float(steps[np.flatnonzero(inside)[hits[0]]])
+        return max(first - coarse_step, enter)
+
     def _camera_bbox_level0(self, displayed_axes) -> np.ndarray | None:
         """Approximate visible bbox around the camera, in level-0 coords.
 
@@ -1337,11 +1413,21 @@ class ProgressiveLoader:
                     up_data
                 ) + screen_half[1] * np.abs(right_data)
                 depth_length = 0.7 * screen_radius
+                ray_center = center
                 front = _front_depth_segment(
                     center,
                     view_data,
                     np.take(np.asarray(self._data.shape), displayed_axes),
                     depth_length,
+                    first_content=lambda enter, leave: (
+                        self._first_content_along_ray(
+                            ray_center,
+                            view_data,
+                            enter,
+                            leave,
+                            list(displayed_axes),
+                        )
+                    ),
                 )
                 if front is None:
                     half_extent = lateral_half_extent + (
