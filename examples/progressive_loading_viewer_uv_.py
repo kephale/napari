@@ -8,7 +8,7 @@
 #     "requests",
 #     "s3fs",
 #     "dask[array]",
-#     "lodstone>=0.1.0a4",
+#     "lodstone>=0.1.0a5",
 #     "numba",  # compiles the generated mandelbrot/mandelbulb datasets
 # ]
 #

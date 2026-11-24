@@ -121,7 +121,7 @@ optional-base = [
     "rapidfuzz>=3",  # fuzzy search in command palette
 ]
 progressive = [
-    "lodstone==0.1.0a4",
+    "lodstone==0.1.0a5",
 ]
 optional-numba = [
     "numba>=0.58.0,<=0.62.1 ; platform_system == 'Darwin' and platform_machine == 'x86_64'",
