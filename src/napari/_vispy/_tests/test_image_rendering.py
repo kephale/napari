@@ -51,6 +51,30 @@ def test_image_rendering(make_napari_viewer):
     assert vispy_layer.node.interpolation == 'custom'
 
 
+@pytest.mark.parametrize(
+    ('dtype', 'expected'),
+    [(np.uint8, 32 / 255), (np.float32, 32.0)],
+)
+def test_iso_threshold_matches_the_texture_values(
+    make_napari_viewer, dtype, expected
+):
+    """The iso shader compares the threshold with raw texture values. A
+    uint8 texture stores value / 255, so a threshold normalized by a
+    narrower contrast range (here 0-64) lies above every voxel and the
+    surface never draws."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    data = np.zeros((16, 16, 16), dtype=dtype)
+    data[4:12, 4:12, 4:12] = 64
+    layer = viewer.add_image(
+        data, rendering='iso', contrast_limits=(0, 64), iso_threshold=32
+    )
+    node = viewer.window._qt_viewer.layer_to_visual[layer].node
+
+    assert node.threshold == pytest.approx(expected)
+    assert node.threshold < node._texture.clim_normalized[1]
+
+
 def test_volume_clipmap_renders_overview_outside_detail(
     qapp,
     make_napari_viewer,

@@ -209,15 +209,38 @@ class VispyImageLayer(VispyScalarFieldBaseLayer):
     def _on_gamma_change(self) -> None:
         self.node.gamma = self.layer.gamma
 
+    def _on_data_change(self) -> None:
+        super()._on_data_change()
+        # a new texture can change dtype, and with it the normalization
+        # the iso threshold must be mapped through
+        self._on_iso_threshold_change()
+
     def _on_iso_threshold_change(self) -> None:
-        if isinstance(self.node, VolumeNode):
-            if self.node._texture.is_normalized:
-                cmin, cmax = self.layer.contrast_limits_range
-                self.node.threshold = (self.layer.iso_threshold - cmin) / (  # pyrefly: ignore [unsupported-operation]
-                    cmax - cmin  # pyrefly: ignore [unsupported-operation]
-                )
-            else:
-                self.node.threshold = self.layer.iso_threshold
+        if not isinstance(self.node, VolumeNode):
+            return
+        texture = self.node._texture
+        if not texture.is_normalized:
+            self.node.threshold = self.layer.iso_threshold
+            return
+        # The iso shader compares the threshold with raw texture values,
+        # before contrast limits apply. Map it the way the texture maps
+        # data: e.g. a uint8 texture stores value / 255, whatever the
+        # contrast range. The mapping is linear, so the texture's own
+        # (clim, normalized clim) pair defines it for any texture type.
+        try:
+            (c0, c1), (n0, n1) = texture.clim, texture.clim_normalized
+            mapped = n0 + (self.layer.iso_threshold - c0) * (n1 - n0) / (
+                c1 - c0
+            )
+        except (RuntimeError, TypeError, ValueError, ZeroDivisionError):
+            mapped = None
+        if mapped is not None and np.isfinite(mapped):
+            self.node.threshold = float(mapped)
+            return
+        cmin, cmax = self.layer.contrast_limits_range
+        self.node.threshold = (self.layer.iso_threshold - cmin) / (  # pyrefly: ignore [unsupported-operation]
+            cmax - cmin  # pyrefly: ignore [unsupported-operation]
+        )
 
     def _on_attenuation_change(self) -> None:
         if isinstance(self.node, VolumeNode):
