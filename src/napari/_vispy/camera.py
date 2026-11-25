@@ -474,6 +474,11 @@ class MouseToggledArcballCamera(add_mouse_pan_zoom_toggles(ArcballCamera)):  # t
         p1 = self._event_value[:2]
         # the same incremental rotation vispy applies, with its angle scaled
         step = Quaternion(*_arcball(p2, wh)) * Quaternion(*_arcball(p1, wh))
+        if step.w < 0:
+            # The arcball's product of two pure quaternions has a negative
+            # scalar part: the same rotation written the long way round
+            # (angle 2*pi - theta). Scale the short way, theta.
+            step = Quaternion(-step.w, -step.x, -step.y, -step.z)
         angle, x, y, z = step.get_axis_angle()
         step = Quaternion.create_from_axis_angle(
             angle * max(scale, 0.0), x, y, z
