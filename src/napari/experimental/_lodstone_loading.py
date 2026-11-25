@@ -102,6 +102,14 @@ def _compact_key_groups(keys, max_waste: float = 2.0) -> list[list]:
     return [members for members, *_ in groups]
 
 
+try:
+    # a huge regular axis is a compact sequence whose max() would iterate
+    # every chunk; Lodstone reads it arithmetically
+    from lodstone.grid import max_chunk_size as _max_chunk_size
+except ImportError:  # pragma: no cover - Lodstone before compact grids
+    _max_chunk_size = max
+
+
 def _gpu_batch_size(chunks, dtype, workers: int) -> int:
     """Tiles per Lodstone read window and Qt delivery.
 
@@ -115,7 +123,7 @@ def _gpu_batch_size(chunks, dtype, workers: int) -> int:
     """
     itemsize = np.dtype(dtype).itemsize
     largest = max(
-        int(np.prod([max(axis) for axis in level], dtype=np.int64))
+        int(np.prod([_max_chunk_size(axis) for axis in level], dtype=np.int64))
         for level in chunks
     )
     fit = LODSTONE_GPU_BATCH_BYTES // max(largest * itemsize, 1)
