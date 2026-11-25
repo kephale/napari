@@ -39,6 +39,7 @@ from lodstone import (
 from lodstone.sources import ArrayPyramidSource
 from qtpy.QtCore import QObject, Qt, Signal, Slot
 
+from napari._vispy.visuals.volume import CLIPMAP_MAX_RINGS
 from napari.experimental._progressive_loading import (
     DEFAULT_INTERVAL_MAX_BYTES,
     DEFAULT_TILE_MAX_BYTES_3D,
@@ -50,6 +51,7 @@ from napari.experimental._progressive_loading import (
     _orientation_signs,
     _pack_upload_block,
     _resolve_viewer_and_tile_cap,
+    _texture_dtype_3d,
     chunk_priority_2D,
     chunk_slices,
 )
@@ -70,6 +72,33 @@ _RUNTIME_ATTRIBUTE = '_lodstone_runtime'
 _RUNTIME_REFS_ATTRIBUTE = '_lodstone_runtime_refs'
 # Decoded bytes Lodstone may gather into one Qt delivery and upload block.
 LODSTONE_GPU_BATCH_BYTES = 32 << 20
+
+
+# clipmap rings: levels between a ring and the next, and the least
+# detail-to-overview level gap that uses them by default
+_RING_LEVEL_STEP = 2
+_AUTO_RING_MIN_GAP = 5
+
+
+def _append_plans(primary: Plan, *suffixes: Plan) -> Plan:
+    """``primary`` followed by tiles of ``suffixes`` it does not hold."""
+
+    def unique(tiles):
+        seen: set[TileKey] = set()
+        result = []
+        for tile in tiles:
+            if tile.key not in seen:
+                seen.add(tile.key)
+                result.append(tile)
+        return tuple(result)
+
+    ordered = (primary, *suffixes)
+    return Plan(
+        unique(tile for plan in ordered for tile in plan.wanted),
+        frozenset(key for plan in ordered for key in plan.retain),
+        primary.target_level,
+        unique(tile for plan in ordered for tile in plan.desired),
+    )
 
 
 def _compact_key_groups(keys, max_waste: float = 2.0) -> list[list]:
@@ -336,6 +365,7 @@ class _PlanInputs:
     available: frozenset
     layout: Layout
     active: tuple | None
+    ring_stages: list = ()  # type: ignore[assignment]
 
 
 class _WorkerProxy:
@@ -441,19 +471,20 @@ class _NapariTarget:
         active = getattr(self.loader, '_active', None)
         target = active[0] if active is not None else None
         resident = getattr(self.loader, '_resident_level', target)
+        uploaded = {target, resident} | {
+            ring[0] for ring in getattr(self.loader, '_rings', ())
+        }
         return tuple(
             (
                 level,
                 group,
                 _pack_upload_block(self.loader._data[level], group)
-                if level in {target, resident}
+                if level in uploaded
                 else None,
             )
             for level, batch in grouped.items()
             for group in (
-                _compact_key_groups(batch)
-                if level in {target, resident}
-                else (batch,)
+                _compact_key_groups(batch) if level in uploaded else (batch,)
             )
         )
 
@@ -463,7 +494,12 @@ class _NapariTarget:
         # off the Qt thread.
         if staged and not isinstance(staged[0], tuple):
             staged = self.stage(staged)
+        on_ring = getattr(self.loader, '_on_ring_chunks', None)
         for level, batch, block in staged:
+            if on_ring is not None:
+                batch = on_ring(level, batch, block)
+                if not batch:
+                    continue
             resident = getattr(self.loader, '_resident_level', None)
             on_resident = getattr(self.loader, '_on_resident_chunks', None)
             if level == resident and on_resident is not None:
@@ -504,10 +540,22 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
     trace_plans: bool = False
 
     def __init__(
-        self, viewer, layer, data, *, trace_plans: bool | None = None, **kwargs
+        self,
+        viewer,
+        layer,
+        data,
+        *,
+        trace_plans: bool | None = None,
+        clipmap_rings: int | None = None,
+        **kwargs,
     ) -> None:
         if trace_plans is not None:
             self.trace_plans = trace_plans
+        self._clipmap_ring_limit = clipmap_rings
+        # (level, low, high) per clipmap ring, finest first, and each ring
+        # level's share of the coarse-first ladder (see _configure_rings)
+        self._rings: tuple[tuple[int, tuple, tuple], ...] = ()
+        self._ring_footprints: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self._lodstone_enabled = False
         self._lodstone_stream: Stream | None = None
         self._lodstone_runtime: Runtime | None = None
@@ -669,6 +717,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
                 view, self._lodstone_source.pyramid
             ),
             active=self._active,
+            ring_stages=self._ring_stages(),
         )
         # the pass is in flight from now on, even while it is being planned
         self._worker = _WorkerProxy(self._lodstone_stream)
@@ -726,7 +775,19 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             memory_limit=self._resident_max_bytes,
             available=inputs.available,
         )
-        return merge_plans(plan, overview), plan_source
+        plan = merge_plans(plan, overview)
+        if inputs.ring_stages:
+            # rings sharpen the surroundings: after the view's own tiles
+            rings = plan_from_slices(
+                pyramid,
+                view,
+                inputs.ring_stages,
+                target_level=target,
+                available=inputs.available,
+                fetch_levels=None,
+            )
+            plan = _append_plans(plan, rings)
+        return plan, plan_source
 
     def _submit_planned(self, generation: int, inputs: _PlanInputs, done):
         """Submit a finished plan if its pass is still current (Qt thread)."""
@@ -743,7 +804,12 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         except Exception:
             LOGGER.exception('Lodstone planning failed; planning inline')
             plan, plan_source = self._build_plan(inputs)
-        self._chunks_total = len(plan.wanted)
+        # ring-only chunks never reach the progress count (_on_ring_chunks)
+        self._chunks_total = len(plan.wanted) - sum(
+            1
+            for tile in plan.wanted
+            if self._ring_only(tile.level, tile.region.slices())
+        )
         self._submitted_plan = plan
         self._lodstone_target.generation = generation
         stream.submit(inputs.view, plan)
@@ -785,6 +851,198 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             comparison.lodstone.target_level,
             len(comparison.lodstone.tiles),
         )
+
+    # -- clipmap rings --
+
+    def _ring_layout(
+        self, target: int, min_coord, max_coord
+    ) -> tuple[tuple[int, tuple, tuple], ...]:
+        """(level, low, high) of each ring around a target region.
+
+        Rings are cubes of the 3D tile budget every _RING_LEVEL_STEP levels
+        coarser than the target, centered on it, finest first, stopping
+        before the resident overview or once a ring holds its whole level.
+        With ``clipmap_rings=None`` they are used only when the overview
+        is _AUTO_RING_MIN_GAP or more levels coarser than the target.
+        """
+        node = self._get_volume_node()
+        if (
+            self._viewer.dims.ndisplay != 3
+            or self._data.ndim != 3
+            or node is None
+            or not getattr(node, 'clipmap_enabled', False)
+            or not hasattr(node, 'set_clipmap_ring')
+        ):
+            return ()
+        gap = self._resident_level - target
+        limit = self._clipmap_ring_limit
+        if limit is None:
+            limit = CLIPMAP_MAX_RINGS if gap >= _AUTO_RING_MIN_GAP else 0
+        limit = max(0, min(int(limit), CLIPMAP_MAX_RINGS))
+        tile_bytes = getattr(self._layer, '_tile_max_bytes_3d', None)
+        if not limit or not tile_bytes:
+            return ()
+        itemsize = _texture_dtype_3d(self._data.dtype).itemsize
+        # the detail tile's cube, rounded to whole chunks below
+        edge = (tile_bytes / itemsize) ** (1 / 3)
+        factors = self._data._scale_factors
+        center = (
+            np.asarray(min_coord, dtype=float)
+            + np.asarray(max_coord, dtype=float)
+        ) / 2
+        rings = []
+        for index in range(1, limit + 1):
+            level = target + _RING_LEVEL_STEP * index
+            if level >= self._resident_level:
+                break
+            vdata = self._data[level]
+            shape = np.asarray(vdata.shape, dtype=np.int64)
+            chunks = np.asarray(vdata.chunk_shape, dtype=np.int64)
+            ratio = np.asarray(factors[target], float) / np.asarray(
+                factors[level], float
+            )
+            extent = np.minimum(
+                np.maximum(np.round(edge / chunks), 1).astype(np.int64)
+                * chunks,
+                shape,
+            )
+            low = np.floor(center * ratio - extent / 2).astype(np.int64)
+            low = np.clip(low // chunks * chunks, 0, shape - extent)
+            rings.append(
+                (
+                    level,
+                    tuple(int(v) for v in low),
+                    tuple(int(v) for v in low + extent),
+                )
+            )
+            if np.all(extent >= shape):
+                break
+        return tuple(rings)
+
+    def _configure_rings(self, level: int, min_coord, max_coord) -> bool:
+        """Place the clipmap rings around this pass's target region.
+
+        Each ring level's resident interval grows to hold its ring (new
+        voxels start as the upsampled overview), and the ring's texture
+        is (re)built from it; chunks then stream in after the target's
+        (see _build_plan) and patch it (_on_ring_chunks).
+        """
+        rings = self._ring_layout(level, min_coord, max_coord)
+        node = self._get_volume_node()
+        factors = self._data._scale_factors
+        footprints = {}
+        pending = False
+        resident_loaded = bool(self._data[self._resident_level].loaded_chunks)
+        for index, (ring_level, low, high) in enumerate(rings):
+            vdata = self._data[ring_level]
+            low_a, high_a = np.asarray(low), np.asarray(high)
+            ratio = np.asarray(factors[level], float) / np.asarray(
+                factors[ring_level], float
+            )
+            footprints[ring_level] = (
+                np.floor(np.asarray(min_coord) * ratio).astype(np.int64),
+                np.ceil(np.asarray(max_coord) * ratio).astype(np.int64),
+            )
+            if not vdata.covers(low_a, high_a):
+                new_low, new_high = low_a, high_a
+                existing = vdata.interval
+                if existing is not None:
+                    union_low, union_high = self._clamp_interval(
+                        vdata,
+                        np.minimum(low_a, existing[0]),
+                        np.maximum(high_a, existing[1]),
+                    )
+                    if np.all(union_low <= low_a) and np.all(
+                        high_a <= union_high
+                    ):
+                        new_low, new_high = union_low, union_high
+                self._data.set_interval(
+                    ring_level,
+                    new_low,
+                    new_high,
+                    backdrop_level=self._resident_level
+                    if resident_loaded
+                    else None,
+                )
+            previous = self._rings[index] if index < len(self._rings) else None
+            if previous != (ring_level, low, high) or index not in (
+                node.clipmap_rings
+            ):
+                with vdata.lock:
+                    start = np.asarray(vdata.interval[0])
+                    crop = tuple(
+                        slice(int(a - s), int(b - s))
+                        for a, b, s in zip(low_a, high_a, start, strict=True)
+                    )
+                    data = np.array(vdata.hyperslice[crop])
+                node.set_clipmap_ring(
+                    index,
+                    data,
+                    low,
+                    high,
+                    scale=self._layer.downsample_factors[ring_level],
+                )
+            pending = pending or bool(
+                self._stage_queue(ring_level, region=(low_a, high_a))
+            )
+        if node is not None and hasattr(node, 'clear_clipmap_rings'):
+            node.clear_clipmap_rings(len(rings))
+        self._rings = rings
+        self._ring_footprints = footprints
+        return pending
+
+    def _ring_stages(self) -> list[tuple[int, list]]:
+        """Every chunk of every ring, nearest the view first."""
+        stages = []
+        for level, low, high in self._rings:
+            region = (np.asarray(low), np.asarray(high))
+            keys = chunk_slices(self._data[level], interval=region)
+            stages.append((level, self._prioritize_3d(level, keys, region)))
+        return stages
+
+    def _ring_only(self, level: int, key) -> bool:
+        """A ring chunk outside the ladder's share of its level."""
+        footprint = self._ring_footprints.get(level)
+        if footprint is None:
+            return False
+        low, high = footprint
+        return any(
+            part.stop <= lo or part.start >= hi
+            for part, lo, hi in zip(key, low, high, strict=False)
+        )
+
+    def _on_ring_chunks(self, level: int, batch, block):
+        """Patch ring textures with fetched chunks (Qt thread).
+
+        Returns the chunks the rest of the pipeline handles: those in the
+        ladder's share of the level (they also refine the target's
+        backdrop); ring-only ones end here.
+        """
+        index = next(
+            (i for i, ring in enumerate(self._rings) if ring[0] == level),
+            None,
+        )
+        if index is None:
+            return batch
+        node = self._get_volume_node()
+        if (
+            block is not None
+            and node is not None
+            and index in getattr(node, 'clipmap_rings', ())
+        ):
+            _level, ring_low, ring_high = self._rings[index]
+            block_low, block_high, data = block
+            low = np.maximum(np.asarray(block_low), ring_low)
+            high = np.minimum(np.asarray(block_high), ring_high)
+            if np.all(high > low):
+                crop = tuple(
+                    slice(int(a - b), int(c - b))
+                    for a, b, c in zip(low, block_low, high, strict=True)
+                )
+                node.set_clipmap_ring_data(
+                    index, data[crop], offset=low - np.asarray(ring_low)
+                )
+        return [key for key in batch if not self._ring_only(level, key)]
 
     def _desired_stages(self, target: int) -> list[tuple[int, list]]:
         """Reconstruct napari's complete ladder, including cached chunks."""
@@ -1026,9 +1284,16 @@ def add_lodstone_loading_image(
     interactive_step_rate=4.0,
     coarse_first=True,
     debug_overlay=None,
+    clipmap_rings=None,
     **layer_kwargs: Any,
 ):
-    """Add a progressive image rendered by napari and loaded by Lodstone."""
+    """Add a progressive image rendered by napari and loaded by Lodstone.
+
+    ``clipmap_rings`` sets how many 3D clipmap rings (boxes of
+    intermediate levels around the detail tile, up to 3) to draw: ``None``
+    uses them only for deep pyramids, where the overview is five or more
+    levels coarser than the detail, and ``0`` never does.
+    """
     viewer, tile_max_bytes_3d = _resolve_viewer_and_tile_cap(
         viewer,
         tile_max_bytes_3d,
@@ -1063,6 +1328,7 @@ def add_lodstone_loading_image(
         coarse_first=coarse_first,
         debug_overlay=debug_overlay,
         loader_class=LodstoneProgressiveLoader,
+        loader_kwargs={'clipmap_rings': clipmap_rings},
     )
     return layer
 

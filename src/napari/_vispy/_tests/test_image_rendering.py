@@ -207,6 +207,60 @@ def test_clipmap_floating_origin_composes_the_same_transforms(
     assert node._compute_bounds(0, None)[0] == 0  # no origin offset
 
 
+def test_clipmap_rings_draw_between_detail_and_overview(
+    qapp, make_napari_viewer
+):
+    """A ring is a coarser box around the detail box: where it covers the
+    ray it replaces the overview, and the detail box still wins inside
+    itself."""
+    viewer = make_napari_viewer(show=True)
+    viewer.dims.ndisplay = 3
+    layer = viewer.add_image(
+        np.zeros((16, 16, 16), dtype=np.uint8),
+        contrast_limits=(0, 1),
+        rendering='mip',
+    )
+    visual = viewer.window._qt_viewer.layer_to_visual[layer]
+    node = visual.node
+    node.enable_clipmap(
+        np.zeros((4, 4, 4), dtype=np.uint8), full_shape=(64, 64, 64)
+    )
+    node.set_clipmap_detail_bounds((24, 24, 24), (40, 40, 40))
+    visual._on_matrix_change()
+    viewer.reset_view()
+    qapp.processEvents()
+
+    def lit() -> int:
+        shot = viewer.screenshot(canvas_only=True, flash=False)
+        return int(np.count_nonzero(shot[..., :3].max(axis=-1) > 64))
+
+    assert lit() == 0
+    # a 12^3 ring at 4x the detail's voxel size, voxels 2..14 of its level
+    node.set_clipmap_ring(
+        0, np.ones((12, 12, 12), dtype=np.uint8), (2, 2, 2), (14, 14, 14), 4
+    )
+    assert node.clipmap_rings == (0,)
+    with_ring = lit()
+    assert with_ring > 100
+
+    program = node.shared_program
+    assert program['u_ring0_active'] == 1.0
+    np.testing.assert_allclose(program['u_ring0_voxel'], [4 / 64] * 3)
+    # the ring's voxels are 4 full-resolution voxels, the overview's 16
+    assert program['u_ring0_fraction'] == pytest.approx(0.25)
+
+    # patching the ring texture shows through
+    node.set_clipmap_ring_data(0, np.zeros((12, 12, 12), np.uint8), (0, 0, 0))
+    assert lit() == 0
+    node.set_clipmap_ring_data(0, np.ones((12, 12, 12), np.uint8), (0, 0, 0))
+    assert lit() == with_ring
+
+    node.clear_clipmap_rings()
+    assert node.clipmap_rings == ()
+    assert program['u_ring0_active'] == 0.0
+    assert lit() == 0
+
+
 def test_volume_sets_every_ray_uniform_without_an_origin(
     qapp, make_napari_viewer
 ):

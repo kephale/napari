@@ -278,9 +278,7 @@ def _front_depth_segment(
     direction: np.ndarray,
     shape: np.ndarray,
     length: float,
-    first_content: Callable[
-        [float, float], float | tuple[float, float] | None
-    ]
+    first_content: Callable[[float, float], float | tuple[float, float] | None]
     | None = None,
 ) -> tuple[np.ndarray, float] | None:
     """Center and half-length of a camera-facing ray segment in a box.
@@ -1430,9 +1428,9 @@ class ProgressiveLoader:
             and np.array_equal(cached[0][1], key[1])
             and cached[0][2] == key[2]
             and coarse_low <= cached[1] <= coarse_high
+            and cached[2] < voxel
         ):
-            if cached[2] < voxel:
-                hit, voxel = cached[1], cached[2]
+            hit, voxel = cached[1], cached[2]
         self._content_hit_cache = (key, hit, voxel)
         return max(hit - voxel, enter), 2 * voxel
 
@@ -1509,9 +1507,7 @@ class ProgressiveLoader:
             inside = np.all(
                 (index >= 0) & (index < np.asarray(slab.shape)), axis=1
             )
-            if not np.any(inside) or (
-                require_coverage and not np.all(inside)
-            ):
+            if not np.any(inside) or (require_coverage and not np.all(inside)):
                 return None
             order = np.argsort(displayed_axes)
             picked = index[inside][:, order]
@@ -2444,10 +2440,11 @@ class ProgressiveLoader:
                 )
         self._repair_backdrop()
         self._active = (level, tuple(min_coord), tuple(max_coord))
+        rings_pending = self._configure_rings(level, min_coord, max_coord)
 
         queue = self._stage_queue(level)
 
-        if not queue:
+        if not queue and not rings_pending:
             # Everything visible is already resident (e.g. carried over
             # from the previous interval); make sure the canvas shows it.
             # Release any present veto BEFORE the refresh: the resident
@@ -2641,6 +2638,11 @@ class ProgressiveLoader:
     def _start_stage(self, generation: int, index: int) -> None:
         """Submit the renderer plan through the configured loading engine."""
         raise NotImplementedError
+
+    def _configure_rings(self, level: int, min_coord, max_coord) -> bool:
+        """Place clipmap rings around a pass's target; True if any of
+        their chunks still need fetching. No rings by default."""
+        return False
 
     def _prioritize_3d(self, level, keys, interval):
         camera = self._viewer.scene.camera
@@ -3405,6 +3407,7 @@ def _attach_progressive_loader(
     coarse_first,
     debug_overlay=None,
     loader_class=ProgressiveLoader,
+    loader_kwargs: dict | None = None,
 ) -> ProgressiveLoader:
     """Wire a constructed multiscale layer to a :class:`ProgressiveLoader`.
 
@@ -3462,6 +3465,7 @@ def _attach_progressive_loader(
         interaction_hold=interaction_hold,
         interactive_step_rate=interactive_step_rate,
         coarse_first=coarse_first,
+        **(loader_kwargs or {}),
     )
     loader._slicing_restore = slicing_restore
     layer.metadata['progressive_loader'] = loader

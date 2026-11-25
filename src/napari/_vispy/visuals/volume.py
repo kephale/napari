@@ -349,6 +349,7 @@ uniform float u_max_fine_steps;
 uniform float u_coarse_weight;
 uniform vec3 u_detail_voxel;
 uniform vec3 u_overview_voxel;
+$ring_uniforms
 
 // Floating origin (see CLIPMAP_ORIGIN_SETUP): rays from the pixel position
 // and per-frame values composed in float64, relative to an origin at the
@@ -368,11 +369,48 @@ vec3 clipmap_gradient_step(vec3 loc, vec3 dstep) {
     if (u_clipmap_adaptive < 0.5) {
         return dstep;
     }
-    bool in_detail = all(greaterThanEqual(loc, u_detail_min))
-        && all(lessThan(loc, u_detail_max));
-    return 1.5 * (in_detail ? u_detail_voxel : u_overview_voxel);
+    if (all(greaterThanEqual(loc, u_detail_min))
+            && all(lessThan(loc, u_detail_max))) {
+        return 1.5 * u_detail_voxel;
+    }
+$ring_gradient
+    return 1.5 * u_overview_voxel;
 }
 """
+
+# Rings: up to CLIPMAP_MAX_RINGS more textures between the detail box and
+# the overview, each a coarser level over a larger box around the detail
+# (a clipmap's nested levels). Rays step and take gradients at each ring's
+# own resolution, finest box first. Unused rings have empty bounds.
+CLIPMAP_MAX_RINGS = 3
+
+
+def _ring_source(template: str) -> str:
+    return ''.join(
+        template.replace('K', str(index)) for index in range(CLIPMAP_MAX_RINGS)
+    )
+
+
+CLIPMAP_STEPPING_UNIFORMS = CLIPMAP_STEPPING_UNIFORMS.replace(
+    '$ring_uniforms\n',
+    _ring_source(
+        """uniform float u_ringK_active;
+uniform vec3 u_ringK_min;
+uniform vec3 u_ringK_max;
+uniform vec3 u_ringK_voxel;
+uniform float u_ringK_fraction;
+"""
+    ),
+).replace(
+    '$ring_gradient\n',
+    _ring_source(
+        """    if (u_ringK_active > 0.5 && all(greaterThanEqual(loc, u_ringK_min))
+            && all(lessThan(loc, u_ringK_max))) {
+        return 1.5 * u_ringK_voxel;
+    }
+"""
+    ),
+)
 
 CLIPMAP_STEPPING_SETUP = """$raycasting_setup
 
@@ -411,20 +449,23 @@ CLIPMAP_STEPPING_SETUP = """$raycasting_setup
             nsteps += int((detail_t1 - detail_t0) / fine_fraction) + 2;
         }
     }
-"""
+$ring_setup"""
 
 CLIPMAP_STEPPING_ADVANCE = """
             if (u_clipmap_adaptive > 0.5) {
-                float next_t = ray_t + 1.0;
-                // tolerance in fine steps: a fixed one is wider than the
+                // the finest box holding the ray sets the step; tolerance
+                // in that box's steps: a fixed one is wider than the
                 // whole detail box at deep levels (1e-4 of an overview
                 // voxel is 340 level-0 voxels at 23 levels)
-                if (ray_t >= detail_t0 - 0.5 * fine_fraction && ray_t < detail_t1) {
-                    next_t = ray_t + fine_fraction;
-                } else if (ray_t < detail_t0 && detail_t0 - ray_t <= 1.0) {
-                    // land exactly on the detail box entry rather than
-                    // step over it (or carry far-away rounding into it)
-                    next_t = detail_t0;
+                float fraction = 1.0;
+$ring_inside                if (ray_t >= detail_t0 - 0.5 * fine_fraction && ray_t < detail_t1) {
+                    fraction = min(fraction, fine_fraction);
+                }
+                float next_t = ray_t + fraction;
+                // land exactly on the entry of a finer box rather than
+                // step over it (or carry far-away rounding into it)
+$ring_landing                if (fine_fraction < fraction && detail_t0 > ray_t && detail_t0 <= next_t) {
+                    next_t = min(next_t, detail_t0);
                 }
                 step = coarse_step * (next_t - ray_t);
                 ray_t = next_t;
@@ -436,6 +477,53 @@ CLIPMAP_STEPPING_ADVANCE = """
                 loc += step;
             }
 """
+
+CLIPMAP_STEPPING_SETUP = CLIPMAP_STEPPING_SETUP.replace(
+    '$ring_setup',
+    _ring_source(
+        """    float ringK_t0 = 1e30;
+    float ringK_t1 = -1e30;
+    float ringK_fraction = 1.0;
+    if (u_clipmap_adaptive > 0.5 && u_ringK_active > 0.5) {
+        vec3 safe_step = coarse_step + vec3(equal(coarse_step, vec3(0.0))) * 1e-20;
+        vec3 ta = (u_ringK_min - ray_anchor) / safe_step;
+        vec3 tb = (u_ringK_max - ray_anchor) / safe_step;
+        vec3 tlo = min(ta, tb);
+        vec3 thi = max(ta, tb);
+        ringK_t0 = max(max(tlo.x, tlo.y), max(tlo.z, ray_t));
+        ringK_t1 = min(min(thi.x, thi.y), min(thi.z, ray_steps));
+        if (ringK_t1 > ringK_t0) {
+            ringK_fraction = clamp(
+                max(u_ringK_fraction, (ringK_t1 - ringK_t0) / u_max_fine_steps),
+                1e-12, 1.0
+            );
+            nsteps += int((ringK_t1 - ringK_t0) / ringK_fraction) + 2;
+        } else {
+            ringK_t0 = 1e30;
+            ringK_t1 = -1e30;
+        }
+    }
+"""
+    ),
+)
+
+CLIPMAP_STEPPING_ADVANCE = CLIPMAP_STEPPING_ADVANCE.replace(
+    '$ring_inside',
+    _ring_source(
+        """                if (ray_t >= ringK_t0 - 0.5 * ringK_fraction && ray_t < ringK_t1) {
+                    fraction = min(fraction, ringK_fraction);
+                }
+"""
+    ),
+).replace(
+    '$ring_landing',
+    _ring_source(
+        """                if (ringK_fraction < fraction && ringK_t0 > ray_t && ringK_t0 <= next_t) {
+                    next_t = min(next_t, ringK_t0);
+                }
+"""
+    ),
+)
 
 _VOLUME_SETUP = BaseVolume._raycasting_modes['volume']
 for _declared in (
@@ -639,8 +727,9 @@ rendering_methods['translucent_categorical'] = TRANSLUCENT_CATEGORICAL_SNIPPETS
 
 CLIPMAP_LOOKUP = """
 vec4 clipmap_lookup(vec3 texcoord) {
-    // texcoord and the detail bounds are relative to the floating origin
-    // (zero when it is off); the overview spans the whole volume
+    // texcoord and the box bounds are relative to the floating origin
+    // (zero when it is off); the overview spans the whole volume. The
+    // finest box holding texcoord answers.
     bool in_detail = all(greaterThanEqual(texcoord, $detail_min))
         && all(lessThan(texcoord, $detail_max));
     if (in_detail) {
@@ -649,9 +738,56 @@ vec4 clipmap_lookup(vec3 texcoord) {
             $detail_texture, (texcoord - $detail_min) / span
         );
     }
+$rings
     return texture3D($overview_texture, texcoord + $origin_tex);
 }
 """
+
+# Rings sit in front of the detail box as well as around it. Where a ray
+# crosses the detail box, its samples before the box keep reading the
+# overview, as without rings: a ring level's surfaces need not match the
+# detail's (a generated fractal's levels each sample the function
+# independently), and a coarser one in front would hide the detail. A
+# sample is in front when the view ray onward from it enters the detail
+# box; $view_dir is that direction in texture coordinates (from $view_eye
+# under perspective), zero to never skip rings.
+CLIPMAP_RING_GATE = """
+    bool use_rings = true;
+    vec3 gate_dir = $view_perspective > 0.5 ? texcoord - $view_eye : $view_dir;
+    if (any(notEqual(gate_dir, vec3(0.0)))) {
+        vec3 safe_dir = gate_dir + vec3(equal(gate_dir, vec3(0.0))) * 1e-30;
+        vec3 ta = ($detail_min - texcoord) / safe_dir;
+        vec3 tb = ($detail_max - texcoord) / safe_dir;
+        vec3 tlo = min(ta, tb);
+        vec3 thi = max(ta, tb);
+        float t_in = max(max(tlo.x, tlo.y), tlo.z);
+        float t_out = min(min(thi.x, thi.y), thi.z);
+        use_rings = !(t_out > max(t_in, 0.0));
+    }
+"""
+
+CLIPMAP_RING_LOOKUP = """
+    if (use_rings && all(greaterThanEqual(texcoord, $ringK_min))
+            && all(lessThan(texcoord, $ringK_max))) {
+        return texture3D(
+            $ringK_texture,
+            (texcoord - $ringK_min) / max($ringK_max - $ringK_min, vec3(1e-12))
+        );
+    }
+"""
+
+
+def _clipmap_lookup_source(rings: Sequence[int]) -> str:
+    """The lookup, checking the given rings (finest first)."""
+    if not rings:
+        return CLIPMAP_LOOKUP.replace('$rings\n', '')
+    return CLIPMAP_LOOKUP.replace(
+        '$rings\n',
+        CLIPMAP_RING_GATE
+        + ''.join(
+            CLIPMAP_RING_LOOKUP.replace('K', str(index)) for index in rings
+        ),
+    )
 
 
 class Volume(TextureMixin, BaseVolume):
@@ -678,6 +814,9 @@ class Volume(TextureMixin, BaseVolume):
         self._overview_texture: Any | None = None
         self._clipmap_lookup = None
         self._clipmap_detail_bounds = None
+        # per ring index: None, or {'texture', 'bounds'} with bounds in
+        # normalized full-volume xyz coordinates
+        self._clipmap_rings: list[dict | None] = [None] * CLIPMAP_MAX_RINGS
         self.clamp_at_border = False
         self.iso_gradient_mode = IsoCategoricalGradientMode.FAST.value
         self.freeze()
@@ -711,6 +850,7 @@ class Volume(TextureMixin, BaseVolume):
         self._overview_texture = None
         self._clipmap_lookup = None
         self._clipmap_detail_bounds = None
+        self._clipmap_rings = [None] * CLIPMAP_MAX_RINGS
         self.freeze()
         self._refresh_origin()
         if self._requested_step_size is not None:
@@ -763,6 +903,88 @@ class Volume(TextureMixin, BaseVolume):
             data = data.astype(texture_dtype)
         self._overview_texture.set_data(data, offset=tuple(offset))
         self.update()
+
+    @property
+    def clipmap_rings(self) -> tuple[int, ...]:
+        """Indices of the rings in use."""
+        return tuple(
+            index
+            for index, ring in enumerate(self._clipmap_rings)
+            if ring is not None
+        )
+
+    def set_clipmap_ring(
+        self,
+        index: int,
+        data: np.ndarray,
+        low: Sequence[float],
+        high: Sequence[float],
+        scale: float | Sequence[float] | None = None,
+    ) -> None:
+        """Show ``data`` over ``[low, high)`` as clipmap ring ``index``.
+
+        A ring is a box of a level coarser than the detail texture and
+        finer than the overview, drawn wherever no finer box covers the
+        ray. Ring 0 is the finest. ``low`` and ``high`` are zyx voxels of
+        the ring's level, which ``scale`` maps to full-resolution voxels,
+        as for :meth:`set_clipmap_detail_bounds`.
+        """
+        if not self._clipmap_enabled or self._clipmap_shape is None:
+            return
+        data = np.ascontiguousarray(data)
+        ring = self._clipmap_rings[index]
+        texture = None if ring is None else ring['texture']
+        rebuild = texture is None or tuple(texture.shape[:3]) != data.shape[:3]
+        if rebuild:
+            texture = self._create_texture(self.texture_format, data)
+            texture.set_clim(self._texture.clim)
+            texture.interpolation = self._texture.interpolation
+            texture.scale_and_set_data(data, copy=False)
+        else:
+            self._set_texture_data(texture, data, (0, 0, 0))
+        if scale is None:
+            scale = 1
+        shape = np.asarray(self._clipmap_shape, dtype=float)[::-1]
+        ring_min = np.asarray(low, dtype=float) * np.asarray(scale)
+        ring_max = np.asarray(high, dtype=float) * np.asarray(scale)
+        bounds = (
+            tuple(float(v) for v in ring_min[::-1] / shape),
+            tuple(float(v) for v in ring_max[::-1] / shape),
+        )
+        self._clipmap_rings[index] = {'texture': texture, 'bounds': bounds}
+        if rebuild:
+            self._install_clipmap_lookup()
+        else:
+            self._refresh_origin()
+
+    def set_clipmap_ring_data(
+        self, index: int, data: np.ndarray, offset: Sequence[int]
+    ) -> None:
+        """Patch ring ``index``'s texture at ``offset`` (zyx texels)."""
+        ring = self._clipmap_rings[index] if self._clipmap_enabled else None
+        if ring is None:
+            return
+        self._set_texture_data(ring['texture'], data, offset)
+        self.update()
+
+    def clear_clipmap_rings(self, start: int = 0) -> None:
+        """Stop drawing rings ``start`` and up."""
+        if not any(ring is not None for ring in self._clipmap_rings[start:]):
+            return
+        for index in range(start, CLIPMAP_MAX_RINGS):
+            self._clipmap_rings[index] = None
+        self._install_clipmap_lookup()
+        self._refresh_origin()
+
+    @staticmethod
+    def _set_texture_data(
+        texture: Any, data: np.ndarray, offset: Sequence[int]
+    ) -> None:
+        data = np.ascontiguousarray(data)
+        texture_dtype = getattr(texture, '_data_dtype', None)
+        if texture_dtype is not None and data.dtype != texture_dtype:
+            data = data.astype(texture_dtype)
+        texture.set_data(data, offset=tuple(int(v) for v in offset))
 
     def rebind_clipmap_detail_texture(self) -> None:
         """Point the clipmap lookup at the currently presented detail."""
@@ -874,6 +1096,7 @@ class Volume(TextureMixin, BaseVolume):
             program['u_coarse_weight'] = 1.0
             program['u_detail_voxel'] = (0.0, 0.0, 0.0)
             program['u_overview_voxel'] = (0.0, 0.0, 0.0)
+            self._update_ring_stepping(None, None)
             return
         coarse, fine, weight = sizes
         low, high = self._clipmap_detail_bounds or ((0.0,) * 3, (0.0,) * 3)
@@ -891,6 +1114,43 @@ class Volume(TextureMixin, BaseVolume):
         program['u_fine_fraction'] = fine
         program['u_max_fine_steps'] = float(self._max_fine_steps_per_ray)
         program['u_coarse_weight'] = weight
+        self._update_ring_stepping(coarse, origin_tex)
+
+    def _update_ring_stepping(
+        self, coarse: float | None, origin_tex: np.ndarray | None
+    ) -> None:
+        """Each ring's box, texel and step, like the detail box's."""
+        program = self.shared_program
+        requested = self._requested_step_size
+        if requested is None:
+            requested = float(BaseVolume.relative_step_size.fget(self))  # type: ignore[attr-defined]
+        full = (
+            None
+            if self._clipmap_shape is None
+            else np.asarray(self._clipmap_shape[-3:], dtype=float)[::-1]
+        )
+        for index in range(CLIPMAP_MAX_RINGS):
+            name = f'u_ring{index}'
+            ring = self._clipmap_rings[index]
+            if ring is None or coarse is None or full is None:
+                program[f'{name}_active'] = 0.0
+                program[f'{name}_min'] = (0.0, 0.0, 0.0)
+                program[f'{name}_max'] = (0.0, 0.0, 0.0)
+                program[f'{name}_voxel'] = (0.0, 0.0, 0.0)
+                program[f'{name}_fraction'] = 1.0
+                continue
+            low, high = (np.asarray(b, dtype=float) for b in ring['bounds'])
+            span = np.maximum(high - low, 0)
+            texels = np.asarray(ring['texture'].shape[:3], dtype=float)[::-1]
+            texels = np.maximum(texels, 1)
+            voxel = float(np.min(span * full / texels))
+            program[f'{name}_active'] = 1.0 if np.all(span > 0) else 0.0
+            program[f'{name}_min'] = tuple(low - origin_tex)
+            program[f'{name}_max'] = tuple(high - origin_tex)
+            program[f'{name}_voxel'] = tuple(span / texels)
+            program[f'{name}_fraction'] = float(
+                np.clip(requested * voxel / coarse, 1e-12, 1.0)
+            )
 
     # -- floating origin --
 
@@ -963,6 +1223,16 @@ class Volume(TextureMixin, BaseVolume):
                 np.asarray(high, float) - origin_tex
             )
             self._clipmap_lookup['origin_tex'] = tuple(origin_tex)
+            for index, ring in enumerate(self._clipmap_rings):
+                if ring is None:
+                    continue
+                ring_low, ring_high = ring['bounds']
+                self._clipmap_lookup[f'ring{index}_min'] = tuple(
+                    np.asarray(ring_low, float) - origin_tex
+                )
+                self._clipmap_lookup[f'ring{index}_max'] = tuple(
+                    np.asarray(ring_high, float) - origin_tex
+                )
         self._update_clipmap_stepping()
         if toggled:
             # (un)install the composed transforms
@@ -1079,15 +1349,36 @@ class Volume(TextureMixin, BaseVolume):
         program['u_near_t'] = float(np.dot(near - anchor, direction))
         perspective = not np.allclose(to_pixels[:, 3], (0.0, 0.0, 0.0, 1.0))
         program['u_perspective'] = 1.0 if perspective else 0.0
-        if perspective:
-            program['u_eye'] = tuple(_eye_point(unproject, fx, fy))
+        eye = _eye_point(unproject, fx, fy) if perspective else None
+        if eye is not None:
+            program['u_eye'] = tuple(eye)
+        lookup = self._clipmap_lookup
+        if lookup is not None and self.clipmap_rings:
+            # the ring gate (CLIPMAP_RING_GATE), in texture coordinates
+            # relative to the origin
+            full = np.asarray(self._clipmap_shape[-3:], dtype=float)[::-1]
+            lookup['view_dir'] = tuple(direction / full)
+            lookup['view_eye'] = tuple(
+                (eye + 0.5) / full if eye is not None else np.zeros(3)
+            )
+            lookup['view_perspective'] = 1.0 if perspective else 0.0
 
     def _install_clipmap_lookup(self) -> None:
         if not self._clipmap_enabled or self._overview_texture is None:
             return
-        lookup = Function(CLIPMAP_LOOKUP)
+        lookup = Function(_clipmap_lookup_source(self.clipmap_rings))
         lookup['detail_texture'] = self._texture
         lookup['overview_texture'] = self._overview_texture
+        for index in self.clipmap_rings:
+            ring = self._clipmap_rings[index]
+            lookup[f'ring{index}_texture'] = ring['texture']  # type: ignore[index]
+            ring_low, ring_high = ring['bounds']  # type: ignore[index]
+            lookup[f'ring{index}_min'] = ring_low
+            lookup[f'ring{index}_max'] = ring_high
+        if self.clipmap_rings:
+            lookup['view_dir'] = (0.0, 0.0, 0.0)
+            lookup['view_eye'] = (0.0, 0.0, 0.0)
+            lookup['view_perspective'] = 0.0
         detail_min, detail_max = self._clipmap_detail_bounds or (
             (0.0, 0.0, 0.0),
             (1.0, 1.0, 1.0),
@@ -1108,6 +1399,9 @@ class Volume(TextureMixin, BaseVolume):
         super()._build_interpolation()
         if self._clipmap_enabled and self._overview_texture is not None:
             self._overview_texture.interpolation = self._texture.interpolation
+            for ring in self._clipmap_rings:
+                if ring is not None:
+                    ring['texture'].interpolation = self._texture.interpolation
             self._install_clipmap_lookup()
 
     @property

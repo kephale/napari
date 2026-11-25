@@ -737,3 +737,105 @@ def test_bounded_region_plan_is_used_when_generic_plan_differs(
         _assert_submitted_uses_selected_geometry(loader)
     finally:
         loader.close()
+
+
+def _deep_pyramid(levels: int = 6, size: int = 256):
+    """A uint8 cube pyramid, bright in a central block at every level."""
+    arrays = []
+    for level in range(levels):
+        n = size >> level
+        data = np.zeros((n, n, n), dtype=np.uint8)
+        data[n // 4 : 3 * n // 4, n // 4 : 3 * n // 4, n // 4 : 3 * n // 4] = (
+            200
+        )
+        arrays.append(da.from_array(data, chunks=(8, 8, 8)))
+    return arrays
+
+
+def test_clipmap_rings_surround_deep_targets_only(
+    qtbot, make_napari_viewer
+) -> None:
+    """Rings (intermediate levels around the detail tile) are placed every
+    two levels between the target and the overview, by default only when
+    the overview is five or more levels coarser, and never with
+    clipmap_rings=0."""
+    viewer = make_napari_viewer()
+    layer = add_lodstone_loading_image(
+        _deep_pyramid(),
+        viewer=viewer,
+        contrast_limits=(0, 255),
+        interval_max_bytes=32**3,
+        tile_max_bytes_3d=16**3,
+    )
+    loader = layer.metadata['progressive_loader']
+    try:
+        viewer.dims.ndisplay = 3
+        qtbot.waitUntil(
+            lambda: layer._slice_input.ndisplay == 3, timeout=10000
+        )
+        loader._ensure_persistent_overview()
+        assert loader._resident_level == 5
+
+        rings = loader._ring_layout(0, (120, 120, 120), (136, 136, 136))
+        # levels 2 and 4, 16^3 cubes (the tile budget) centered on the
+        # target: (128 / 4, 128 / 16) on chunk boundaries
+        assert [level for level, _, _ in rings] == [2, 4]
+        assert rings[0][1:] == ((24, 24, 24), (40, 40, 40))
+        # level 4 is 16^3: the ring holds the whole level, the last one
+        assert rings[1][1:] == ((0, 0, 0), (16, 16, 16))
+
+        # four levels from the overview: no rings by default
+        assert loader._ring_layout(1, (56, 56, 56), (72, 72, 72)) == ()
+        loader._clipmap_ring_limit = 1
+        assert len(loader._ring_layout(0, (120,) * 3, (136,) * 3)) == 1
+        loader._clipmap_ring_limit = 0
+        assert loader._ring_layout(0, (120,) * 3, (136,) * 3) == ()
+    finally:
+        loader.close()
+
+
+def test_clipmap_rings_receive_their_chunks(qtbot, make_napari_viewer) -> None:
+    """A ring's texture starts from the upsampled overview and fetched
+    ring chunks patch it; chunks outside the coarse-first ladder's part
+    of the ring level stop there."""
+    viewer = make_napari_viewer()
+    layer = add_lodstone_loading_image(
+        _deep_pyramid(),
+        viewer=viewer,
+        contrast_limits=(0, 255),
+        interval_max_bytes=32**3,
+        tile_max_bytes_3d=16**3,
+        clipmap_rings=1,
+    )
+    loader = layer.metadata['progressive_loader']
+    try:
+        viewer.dims.ndisplay = 3
+        qtbot.waitUntil(
+            lambda: layer._slice_input.ndisplay == 3, timeout=10000
+        )
+        loader._ensure_persistent_overview()
+        node = viewer.window._qt_viewer.layer_to_visual[layer].node
+        assert node.clipmap_enabled
+
+        loader._configure_rings(0, (128, 128, 128), (136, 136, 136))
+        assert node.clipmap_rings == (0,)
+        assert loader._rings == ((2, (24, 24, 24), (40, 40, 40)),)
+        stages = loader._ring_stages()
+        assert [level for level, _ in stages] == [2]
+        assert len(stages[0][1]) == 8  # 2^3 chunks of 8^3
+
+        patched = []
+        node.set_clipmap_ring_data = lambda index, data, offset: (
+            patched.append((index, data.shape, tuple(int(v) for v in offset)))
+        )
+        inside = (slice(32, 40), slice(32, 40), slice(32, 40))
+        outside = (slice(24, 32), slice(24, 32), slice(24, 32))
+        block = ([24, 24, 24], [40, 40, 40], np.ones((16, 16, 16), np.uint8))
+        remaining = loader._on_ring_chunks(2, [inside, outside], block)
+        # the ladder's share of level 2 is the target region / 4: 32-34
+        assert remaining == [inside]
+        assert patched == [(0, (16, 16, 16), (0, 0, 0))]
+        # other levels pass through untouched
+        assert loader._on_ring_chunks(1, [inside], None) == [inside]
+    finally:
+        loader.close()
