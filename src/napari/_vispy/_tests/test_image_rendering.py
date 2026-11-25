@@ -255,6 +255,13 @@ def test_clipmap_rings_draw_between_detail_and_overview(
     node.set_clipmap_ring_data(0, np.ones((12, 12, 12), np.uint8), (0, 0, 0))
     assert lit() == with_ring
 
+    # only surface methods skip rings in front of the detail box
+    assert node._clipmap_lookup['ring_gate'].value == 0.0
+    node.method = 'iso'
+    viewer.screenshot(canvas_only=True, flash=False)
+    assert node._clipmap_lookup['ring_gate'].value == 1.0
+    node.method = 'mip'
+
     node.clear_clipmap_rings()
     assert node.clipmap_rings == ()
     assert program['u_ring0_active'] == 0.0

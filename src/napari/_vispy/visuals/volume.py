@@ -750,11 +750,14 @@ $rings
 # independently), and a coarser one in front would hide the detail. A
 # sample is in front when the view ray onward from it enters the detail
 # box; $view_dir is that direction in texture coordinates (from $view_eye
-# under perspective), zero to never skip rings.
+# under perspective), zero to never skip rings. Only surface methods
+# ($ring_gate): the others blend everything along the ray, and skipping
+# rings would leave overview resolution wherever the detail box's sides
+# show around its front.
 CLIPMAP_RING_GATE = """
     bool use_rings = true;
     vec3 gate_dir = $view_perspective > 0.5 ? texcoord - $view_eye : $view_dir;
-    if (any(notEqual(gate_dir, vec3(0.0)))) {
+    if ($ring_gate > 0.5 && any(notEqual(gate_dir, vec3(0.0)))) {
         vec3 safe_dir = gate_dir + vec3(equal(gate_dir, vec3(0.0))) * 1e-30;
         vec3 ta = ($detail_min - texcoord) / safe_dir;
         vec3 tb = ($detail_max - texcoord) / safe_dir;
@@ -1362,6 +1365,11 @@ class Volume(TextureMixin, BaseVolume):
                 (eye + 0.5) / full if eye is not None else np.zeros(3)
             )
             lookup['view_perspective'] = 1.0 if perspective else 0.0
+            lookup['ring_gate'] = self._ring_gate()
+
+    def _ring_gate(self) -> float:
+        """1 when rings must not hide the detail box (CLIPMAP_RING_GATE)."""
+        return 1.0 if str(self.method).startswith('iso') else 0.0
 
     def _install_clipmap_lookup(self) -> None:
         if not self._clipmap_enabled or self._overview_texture is None:
@@ -1379,6 +1387,7 @@ class Volume(TextureMixin, BaseVolume):
             lookup['view_dir'] = (0.0, 0.0, 0.0)
             lookup['view_eye'] = (0.0, 0.0, 0.0)
             lookup['view_perspective'] = 0.0
+            lookup['ring_gate'] = self._ring_gate()
         detail_min, detail_max = self._clipmap_detail_bounds or (
             (0.0, 0.0, 0.0),
             (1.0, 1.0, 1.0),
