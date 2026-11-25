@@ -937,14 +937,63 @@ def test_locked_tile_anchors_to_camera_facing_surface(
     layer._tile_max_bytes_3d = None
     displayed = list(layer._slice_input.displayed)
 
+    corners = layer._corners_for_locked_level(0, displayed, None, direction)
+
+    assert tuple(corners[:, displayed[0]]) == expected
+
+
+@pytest.mark.parametrize(
+    ('direction', 'expected'),
+    [
+        # the page starts at the bbox's near side, not the dataset face
+        ((1, 0, 0), (20, 51)),
+        ((-1, 0, 0), (12, 43)),
+    ],
+)
+def test_locked_tile_anchors_to_the_near_side_of_the_view_bbox(
+    make_napari_viewer,
+    multiscale_3d_arrays,
+    direction,
+    expected,
+):
+    """Sparse data: the loader starts the view bbox at the first content
+    along the ray, deep inside the box. A page pinned to the dataset face
+    would sit in the empty space in front of it and never cover the view,
+    so finer levels could not be selected.
+    """
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = viewer.add_image(list(multiscale_3d_arrays), multiscale=True)
+    layer._max_tile_extent_3d = 32
+    layer._tile_max_bytes_3d = None
+    displayed = list(layer._slice_input.displayed)
+
     corners = layer._corners_for_locked_level(
         0,
         displayed,
-        np.array([[32, 32, 32]] * 2),
+        np.array([[20, 28, 28], [44, 36, 36]]),
         direction,
     )
 
     assert tuple(corners[:, displayed[0]]) == expected
+
+
+def test_locked_tile_near_side_stays_inside_the_level(
+    make_napari_viewer,
+    multiscale_3d_arrays,
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = viewer.add_image(list(multiscale_3d_arrays), multiscale=True)
+    layer._max_tile_extent_3d = 32
+    layer._tile_max_bytes_3d = None
+    displayed = list(layer._slice_input.displayed)
+
+    corners = layer._corners_for_locked_level(
+        0, displayed, np.array([[50, 28, 28], [60, 36, 36]]), (1, 0, 0)
+    )
+
+    assert tuple(corners[:, displayed[0]]) == (32, 63)
 
 
 def test_progressive_loading_3d_subvolume_tile(

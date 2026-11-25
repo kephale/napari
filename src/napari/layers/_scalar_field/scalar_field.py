@@ -780,6 +780,7 @@ class ScalarFieldBase(Layer, ABC):
         else:
             tile_extent = np.minimum(shape_at_level, extent_cap)
         base = None
+        bbox = None
         if data_bbox_int is not None and np.all(np.isfinite(data_bbox_int)):
             bbox = np.asarray(data_bbox_int, dtype=float) / downsample
             bbox = np.stack(
@@ -834,7 +835,13 @@ class ScalarFieldBase(Layer, ABC):
         # the page remains centered through the volume, coarse samples in
         # front of it dominate attenuated/MIP and categorical raycasts, so
         # successfully loaded fine data still looks coarse.  Anchor the page
-        # at the camera-facing surface along the dominant viewing axis.  The
+        # at the camera-facing side along the dominant viewing axis: the
+        # near side of the view bbox when one is given (the progressive
+        # loader already starts it at the first content along the view ray,
+        # which is the box face for dense data), else the dataset face.
+        # Pinning to the face regardless left sparse data (a fractal in a
+        # large box) with a fine page in the empty space in front of it, so
+        # no finer level could cover the view and refinement stalled.  The
         # other axes remain centered on the viewport, preserving pan and
         # rotated-footprint coverage.
         if view_direction is not None:
@@ -844,11 +851,21 @@ class ScalarFieldBase(Layer, ABC):
             ):
                 depth_axis = int(np.argmax(np.abs(direction)))
                 if abs(direction[depth_axis]) >= 1e-12:
-                    low[depth_axis] = (
-                        0
-                        if direction[depth_axis] > 0
-                        else shape_at_level[depth_axis]
-                        - tile_extent[depth_axis]
+                    forward = direction[depth_axis] > 0
+                    if bbox is None:
+                        near = 0 if forward else shape_at_level[depth_axis]
+                    elif forward:
+                        near = int(np.floor(bbox[0][depth_axis]))
+                    else:
+                        near = int(np.ceil(bbox[1][depth_axis]))
+                    start = near if forward else near - tile_extent[depth_axis]
+                    low[depth_axis] = int(
+                        np.clip(
+                            start,
+                            0,
+                            shape_at_level[depth_axis]
+                            - tile_extent[depth_axis],
+                        )
                     )
         high = low + tile_extent
         corners[0, displayed_axes] = low
