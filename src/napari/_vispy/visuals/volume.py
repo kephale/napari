@@ -4,13 +4,13 @@ from typing import Any
 import numpy as np
 from vispy.scene.visuals import Volume as BaseVolume
 from vispy.visuals.shaders import Function
-from vispy.visuals.transforms.base_transform import InverseTransform
 from vispy.visuals.transforms import (
     ChainTransform,
     MatrixTransform,
     NullTransform,
     STTransform,
 )
+from vispy.visuals.transforms.base_transform import InverseTransform
 
 from napari._vispy.visuals.util import TextureMixin
 from napari.layers.labels._labels_constants import IsoCategoricalGradientMode
@@ -305,6 +305,7 @@ TRANSLUCENT_CATEGORICAL_SNIPPETS = {
         """,
 }
 
+
 def _patch(source: str, old: str, new: str) -> str:
     """Replace ``old``, which must occur exactly once, in shader text."""
     if source.count(old) != 1:
@@ -445,7 +446,9 @@ for _declared in (
     'vec3 step =',
     'vec3 start_loc =',
 ):
-    _VOLUME_SETUP = _patch(_VOLUME_SETUP, _declared, _declared.split(' ', 1)[1])
+    _VOLUME_SETUP = _patch(
+        _VOLUME_SETUP, _declared, _declared.split(' ', 1)[1]
+    )
 
 CLIPMAP_ORIGIN_SETUP = (
     """
@@ -575,6 +578,7 @@ SMOOTH_GRADIENT_SHADER = (
 )
 
 shaders['fragment'] = FAST_GRADIENT_SHADER
+
 
 def _position_tracking(snippets: dict, index: str) -> dict:
     """Make a MIP/MinIP snippet record where its extremum was sampled.
@@ -844,7 +848,9 @@ class Volume(TextureMixin, BaseVolume):
         coarse = max(requested * overview_voxel, float(np.min(full)) / 15360)
         fine = 1.0
         if self._clipmap_detail_bounds is not None:
-            low, high = (np.asarray(b, dtype=float) for b in self._clipmap_detail_bounds)
+            low, high = (
+                np.asarray(b, dtype=float) for b in self._clipmap_detail_bounds
+            )
             span = np.maximum(high - low, 0) * full
             if np.all(span > 0):
                 detail_voxel = float(np.min(span / detail))
@@ -929,12 +935,22 @@ class Volume(TextureMixin, BaseVolume):
             self._need_vertex_update = True
         program = self.shared_program
         program['u_origin_mode'] = 1.0 if active else 0.0
+        if not active:
+            # the shader ignores the per-frame ray uniforms without an
+            # origin, but vispy warns about any that were never set
+            program['u_frag_origin'] = (0.0, 0.0)
+            program['u_frag_dx'] = (0.0, 0.0, 0.0)
+            program['u_frag_dy'] = (0.0, 0.0, 0.0)
+            program['u_ray_dir'] = (0.0, 0.0, 1.0)
+            program['u_perspective'] = 0.0
+            program['u_eye'] = (0.0, 0.0, 0.0)
+            program['u_near_t'] = 0.0
         if self._clipmap_shape is not None:
             full = np.asarray(self._clipmap_shape[-3:], dtype=float)[::-1]
         else:
-            full = np.asarray(getattr(self, '_vol_shape', (1, 1, 1))[-3:], float)[
-                ::-1
-            ]
+            full = np.asarray(
+                getattr(self, '_vol_shape', (1, 1, 1))[-3:], float
+            )[::-1]
         program['u_box_min'] = tuple(-0.5 - origin)
         program['u_box_max'] = tuple(full - 0.5 - origin)
         if self._clipmap_lookup is not None:
@@ -1077,8 +1093,12 @@ class Volume(TextureMixin, BaseVolume):
             (1.0, 1.0, 1.0),
         )
         origin_tex = self._origin_tex()
-        lookup['detail_min'] = tuple(np.asarray(detail_min, float) - origin_tex)
-        lookup['detail_max'] = tuple(np.asarray(detail_max, float) - origin_tex)
+        lookup['detail_min'] = tuple(
+            np.asarray(detail_min, float) - origin_tex
+        )
+        lookup['detail_max'] = tuple(
+            np.asarray(detail_max, float) - origin_tex
+        )
         lookup['origin_tex'] = tuple(origin_tex)
         self._clipmap_lookup = lookup
         self.shared_program.frag['get_data'] = lookup

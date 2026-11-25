@@ -192,14 +192,45 @@ def test_clipmap_floating_origin_composes_the_same_transforms(
     inverse = node._origin_transforms['document_inv'].map(
         node._origin_transforms['document'].map(points)
     )
-    np.testing.assert_allclose(inverse[:, :3] / inverse[:, 3:], points, atol=1e-4)
-    assert _chain_matrix(node.transforms.get_transform('visual', 'render')) is not None
+    np.testing.assert_allclose(
+        inverse[:, :3] / inverse[:, 3:], points, atol=1e-4
+    )
+    assert (
+        _chain_matrix(node.transforms.get_transform('visual', 'render'))
+        is not None
+    )
 
     # the ray box is drawn relative to the origin
     assert node._compute_bounds(0, None) == (-8, 56)
     node.disable_clipmap()
     assert not node._origin_active
     assert node._compute_bounds(0, None)[0] == 0  # no origin offset
+
+
+def test_volume_sets_every_ray_uniform_without_an_origin(
+    qapp, make_napari_viewer
+):
+    """The floating-origin ray uniforms are set per frame only while an
+    origin is active; without one vispy must still find them set, or it
+    warns about unset variables on the first draw."""
+    import io
+    import logging
+
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    vispy_logger = logging.getLogger('vispy')
+    vispy_logger.addHandler(handler)
+    try:
+        viewer = make_napari_viewer(show=True)
+        layer = viewer.add_image(np.zeros((16, 16, 16), dtype=np.float32))
+        viewer.dims.ndisplay = 3
+        qapp.processEvents()
+        viewer.screenshot(canvas_only=True, flash=False)
+    finally:
+        vispy_logger.removeHandler(handler)
+    node = viewer.window._qt_viewer.layer_to_visual[layer].node
+    assert not node._origin_active
+    assert 'unset variables' not in buffer.getvalue()
 
 
 @skip_on_win_ci
