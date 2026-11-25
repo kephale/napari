@@ -107,6 +107,47 @@ def test_volume_clipmap_renders_overview_outside_detail(
     assert np.count_nonzero(screenshot[..., :3]) > 100
 
 
+def test_clipmap_steps_follow_each_texture_resolution(make_napari_viewer):
+    """A clipmap ray box is the full-resolution level, so one vispy step
+    sized for it is far finer than the overview needs and, for deep
+    pyramids, far coarser than the detail texture. Steps are instead the
+    requested step in overview voxels outside the detail box and in detail
+    voxels inside it."""
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = viewer.add_image(np.zeros((16, 16, 16), dtype=np.uint8))
+    node = viewer.window._qt_viewer.layer_to_visual[layer].node
+    node.relative_step_size = 0.5
+    node.enable_clipmap(
+        np.zeros((16, 16, 16), dtype=np.uint8), full_shape=(64, 64, 64)
+    )
+    # a 16^3 detail texture spanning 16 voxels: one full-resolution voxel
+    node.set_clipmap_detail_bounds((24, 24, 24), (40, 40, 40))
+
+    program = node.shared_program
+    assert program['u_clipmap_adaptive'] == 1.0
+    # overview voxels are 4 full-resolution voxels wide
+    assert program['u_relative_step_size'] == pytest.approx(2.0)
+    assert program['u_fine_fraction'] == pytest.approx(0.25)
+    # each sample spans the requested step in its own texture's voxels
+    assert program['u_coarse_weight'] == pytest.approx(0.5)
+    # surface gradients sample one texel of the texture being read
+    np.testing.assert_allclose(program['u_overview_voxel'], [1 / 16] * 3)
+    np.testing.assert_allclose(program['u_detail_voxel'], [0.25 / 16] * 3)
+    np.testing.assert_allclose(program['u_detail_min'], [0.375] * 3)
+    np.testing.assert_allclose(program['u_detail_max'], [0.625] * 3)
+    assert node.relative_step_size == 0.5
+
+    # interaction coarsens both steps together
+    node.relative_step_size = 2.0
+    assert program['u_relative_step_size'] == pytest.approx(8.0)
+    assert program['u_fine_fraction'] == pytest.approx(0.25)
+
+    node.disable_clipmap()
+    assert program['u_clipmap_adaptive'] == 0.0
+    assert program['u_relative_step_size'] == pytest.approx(2.0)
+
+
 @skip_on_win_ci
 def test_visibility_consistency(qapp, make_napari_viewer):
     """Make sure toggling visibility maintains image contrast.

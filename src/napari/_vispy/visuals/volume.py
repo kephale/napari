@@ -298,8 +298,114 @@ TRANSLUCENT_CATEGORICAL_SNIPPETS = {
         """,
 }
 
+def _patch(source: str, old: str, new: str) -> str:
+    """Replace ``old``, which must occur exactly once, in shader text."""
+    if source.count(old) != 1:
+        raise RuntimeError(
+            f'vispy volume shader changed: expected one {old!r}; the '
+            'clipmap ray stepping in napari/_vispy/visuals/volume.py needs '
+            'updating'
+        )
+    return source.replace(old, new)
+
+
+# Clipmap ray stepping.
+#
+# A clipmap volume ray-marches a box the size of the full-resolution level
+# (``u_shape``), sampling a coarse overview texture everywhere except inside
+# a movable detail box. vispy marches with one fixed step, and bounds it
+# below by ``side / 15360`` voxels of that box to keep the iteration count
+# sane. For a deep pyramid that step is tens or hundreds of full-resolution
+# voxels: far coarser than the detail texture, so thin structures fall
+# between samples (striped or empty frames), while still finer than the
+# overview needs.
+#
+# With ``u_clipmap_adaptive`` set the march instead takes overview-sized
+# steps (``u_relative_step_size`` is set to the requested step in overview
+# voxels), lands exactly on the detail box's entry so no step jumps over it,
+# and takes ``u_fine_fraction`` of a step inside it (the requested step in
+# detail voxels). Extra iterations for the detail box are capped per ray.
+# Each sample therefore spans the requested step in voxels of the texture
+# it reads, as when that level is rendered alone, so snippets that
+# integrate along the ray (attenuation, compositing) keep their per-voxel
+# meaning in both regions: ``step_weight`` is the requested step. Surface
+# gradients likewise sample one voxel of that texture
+# (``clipmap_gradient_step``): a full-resolution voxel lies inside a single
+# overview voxel, where the gradient is zero and surfaces render unlit.
+CLIPMAP_STEPPING_UNIFORMS = """
+uniform float u_clipmap_adaptive;
+uniform vec3 u_detail_min;
+uniform vec3 u_detail_max;
+uniform float u_fine_fraction;
+uniform float u_max_fine_steps;
+uniform float u_coarse_weight;
+uniform vec3 u_detail_voxel;
+uniform vec3 u_overview_voxel;
+
+vec3 clipmap_gradient_step(vec3 loc, vec3 dstep) {
+    if (u_clipmap_adaptive < 0.5) {
+        return dstep;
+    }
+    bool in_detail = all(greaterThanEqual(loc, u_detail_min))
+        && all(lessThan(loc, u_detail_max));
+    return 1.5 * (in_detail ? u_detail_voxel : u_overview_voxel);
+}
+"""
+
+CLIPMAP_STEPPING_SETUP = """$raycasting_setup
+
+    vec3 coarse_step = step;
+    float ray_steps = float(nsteps);
+    float ray_t = 0.0;
+    float step_weight = u_relative_step_size;
+    float fine_fraction = 1.0;
+    float detail_t0 = 1e30;
+    float detail_t1 = -1e30;
+    if (u_clipmap_adaptive > 0.5) {
+        step_weight = u_coarse_weight;
+        // ray/box slab test with loc(t) = start_loc + t * coarse_step
+        vec3 safe_step = coarse_step + vec3(equal(coarse_step, vec3(0.0))) * 1e-20;
+        vec3 ta = (u_detail_min - start_loc) / safe_step;
+        vec3 tb = (u_detail_max - start_loc) / safe_step;
+        vec3 tlo = min(ta, tb);
+        vec3 thi = max(ta, tb);
+        detail_t0 = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
+        detail_t1 = min(min(thi.x, thi.y), min(thi.z, ray_steps));
+        if (detail_t1 > detail_t0) {
+            fine_fraction = clamp(
+                max(u_fine_fraction, (detail_t1 - detail_t0) / u_max_fine_steps),
+                1e-6, 1.0
+            );
+            nsteps += int((detail_t1 - detail_t0) / fine_fraction) + 2;
+        }
+    }
+"""
+
+CLIPMAP_STEPPING_ADVANCE = """
+            if (u_clipmap_adaptive > 0.5) {
+                float dt = 1.0;
+                if (ray_t >= detail_t0 - 1e-4 && ray_t < detail_t1) {
+                    dt = fine_fraction;
+                } else if (ray_t < detail_t0) {
+                    // land on the detail box entry rather than step over it
+                    dt = min(1.0, detail_t0 - ray_t);
+                }
+                ray_t += dt;
+                step = coarse_step * dt;
+                loc = start_loc + coarse_step * ray_t;
+                if (ray_t >= ray_steps) {
+                    iter = nsteps;
+                }
+            } else {
+                loc += step;
+            }
+"""
+
 shaders = BaseVolume._shaders.copy()
 before, after = shaders['fragment'].split('void main()')
+after = _patch(after, '$raycasting_setup', CLIPMAP_STEPPING_SETUP)
+after = _patch(after, 'loc += step;', CLIPMAP_STEPPING_ADVANCE)
+FUNCTION_DEFINITIONS = FUNCTION_DEFINITIONS + CLIPMAP_STEPPING_UNIFORMS
 FAST_GRADIENT_SHADER = (
     before
     + FUNCTION_DEFINITIONS
@@ -319,7 +425,59 @@ SMOOTH_GRADIENT_SHADER = (
 
 shaders['fragment'] = FAST_GRADIENT_SHADER
 
+def _position_tracking(snippets: dict, index: str) -> dict:
+    """Make a MIP/MinIP snippet record where its extremum was sampled.
+
+    vispy rebuilds that position as ``start_loc + step * index``, which only
+    holds for a uniform step; clipmap rays vary their step.
+    """
+    snippets = dict(snippets)
+    snippets['before_loop'] += (
+        '\n        vec3 extreme_loc = vec3(0.0);'
+        '\n        vec3 extreme_step = vec3(0.0);\n'
+    )
+    snippets['in_loop'] = _patch(
+        snippets['in_loop'],
+        f'{index} = iter;',
+        f'{index} = iter;\n'
+        '            extreme_loc = loc;\n'
+        '            extreme_step = step;',
+    )
+    after = snippets['after_loop']
+    after = _patch(
+        after,
+        f'start_loc + step * (float({index}) - 0.5)',
+        'extreme_loc - extreme_step * 0.5',
+    )
+    after = _patch(after, 'step * 0.1', 'extreme_step * 0.1')
+    after = _patch(after, f'start_loc + step * float({index})', 'extreme_loc')
+    snippets['after_loop'] = after
+    return snippets
+
+
+def _patch_in_loop(snippets: dict, old: str, new: str) -> dict:
+    snippets = dict(snippets)
+    snippets['in_loop'] = _patch(snippets['in_loop'], old, new)
+    return snippets
+
+
 rendering_methods = BaseVolume._rendering_methods.copy()
+rendering_methods['mip'] = _position_tracking(rendering_methods['mip'], 'maxi')
+rendering_methods['minip'] = _position_tracking(
+    rendering_methods['minip'], 'mini'
+)
+rendering_methods['attenuated_mip'] = _patch_in_loop(
+    rendering_methods['attenuated_mip'],
+    'u_relative_step_size * clamp(',
+    'step_weight * clamp(',
+)
+iso_snippets = dict(rendering_methods['iso'])
+iso_snippets['in_loop'] = _patch(
+    iso_snippets['in_loop'],
+    'calculateColor(color, iloc, dstep)',
+    'calculateColor(color, iloc, clipmap_gradient_step(iloc, dstep))',
+)
+rendering_methods['iso'] = iso_snippets
 rendering_methods['iso_categorical'] = ISO_CATEGORICAL_SNIPPETS
 rendering_methods['translucent_categorical'] = TRANSLUCENT_CATEGORICAL_SNIPPETS
 
@@ -357,6 +515,7 @@ class Volume(TextureMixin, BaseVolume):
         self.clamp_at_border = False
         self.iso_gradient_mode = IsoCategoricalGradientMode.FAST.value
         self.freeze()
+        self._update_clipmap_stepping()
 
     @property
     def clipmap_enabled(self) -> bool:
@@ -387,6 +546,10 @@ class Volume(TextureMixin, BaseVolume):
         self._clipmap_lookup = None
         self._clipmap_detail_bounds = None
         self.freeze()
+        self._update_clipmap_stepping()
+        if self._requested_step_size is not None:
+            # back to one uniform step, with vispy's bound
+            BaseVolume.relative_step_size.fset(self, self._requested_step_size)  # type: ignore[attr-defined]
         self._need_interpolation_update = True
         self.update()
 
@@ -422,6 +585,7 @@ class Volume(TextureMixin, BaseVolume):
         self._clipmap_lookup['detail_min'] = detail_min
         self._clipmap_lookup['detail_max'] = detail_max
         self._clipmap_detail_bounds = (detail_min, detail_max)
+        self._update_clipmap_stepping()
 
     def set_overview_data(
         self, data: np.ndarray, offset: Sequence[int] = (0, 0, 0)
@@ -440,6 +604,7 @@ class Volume(TextureMixin, BaseVolume):
         """Point the clipmap lookup at the currently presented detail."""
         if self._clipmap_lookup is not None:
             self._clipmap_lookup['detail_texture'] = self._texture
+        self._update_clipmap_stepping()
 
     def set_clipmap_geometry(self) -> None:
         """Keep the ray box in full-resolution level-zero coordinates."""
@@ -450,7 +615,99 @@ class Volume(TextureMixin, BaseVolume):
         if getattr(self, '_vol_shape', None) != shape:
             self._vol_shape = shape
             self._need_vertex_update = True
+        self._update_clipmap_stepping()
         self.update()
+
+    # Requested relative step, before vispy's lower bound; see
+    # CLIPMAP_STEPPING_SETUP. In clipmap mode it is measured in overview
+    # voxels outside the detail box and detail voxels inside it.
+    _requested_step_size: float | None = None
+    _max_fine_steps_per_ray = 1024
+
+    @property
+    def relative_step_size(self) -> float:
+        if self._requested_step_size is not None:
+            return self._requested_step_size
+        return BaseVolume.relative_step_size.fget(self)  # type: ignore[attr-defined]
+
+    @relative_step_size.setter
+    def relative_step_size(self, value: float) -> None:
+        value = float(value)
+        if value <= 0:
+            raise ValueError('relative_step_size cannot be 0 or negative.')
+        self._requested_step_size = value
+        if getattr(self, '_clipmap_enabled', False):
+            # vispy's bound applies to a single full-resolution step; the
+            # clipmap sizes its steps from the textures instead
+            self._update_clipmap_stepping()
+            self.update()
+        else:
+            BaseVolume.relative_step_size.fset(self, value)  # type: ignore[attr-defined]
+
+    def _clipmap_step_sizes(self) -> tuple[float, float, float] | None:
+        """(coarse step, fine fraction, coarse weight), or None.
+
+        Steps are in full-resolution voxels, the ray box's units. The coarse
+        step is the requested step in overview voxels; the fine fraction
+        scales it to the requested step in detail voxels. Every sample thus
+        spans the requested step in its own texture's voxels, which is the
+        weight integrating snippets (attenuated MIP) give it.
+        """
+        if (
+            not getattr(self, '_clipmap_enabled', False)
+            or self._clipmap_shape is None
+            or self._overview_texture is None
+        ):
+            return None
+        full = np.asarray(self._clipmap_shape[-3:], dtype=float)[::-1]
+        overview = np.asarray(self._overview_texture.shape[:3], dtype=float)[
+            ::-1
+        ]
+        detail = np.asarray(self._texture.shape[:3], dtype=float)[::-1]
+        if np.any(full <= 0) or np.any(overview <= 0) or np.any(detail <= 0):
+            return None
+        requested = self._requested_step_size
+        if requested is None:
+            requested = float(BaseVolume.relative_step_size.fget(self))  # type: ignore[attr-defined]
+        overview_voxel = float(np.min(full / overview))
+        coarse = max(requested * overview_voxel, float(np.min(full)) / 15360)
+        fine = 1.0
+        if self._clipmap_detail_bounds is not None:
+            low, high = (np.asarray(b, dtype=float) for b in self._clipmap_detail_bounds)
+            span = np.maximum(high - low, 0) * full
+            if np.all(span > 0):
+                detail_voxel = float(np.min(span / detail))
+                fine = float(np.clip(requested * detail_voxel / coarse, 1e-6, 1.0))
+        return coarse, fine, coarse / overview_voxel
+
+    def _update_clipmap_stepping(self) -> None:
+        program = self.shared_program
+        sizes = self._clipmap_step_sizes()
+        if sizes is None:
+            program['u_clipmap_adaptive'] = 0.0
+            program['u_detail_min'] = (0.0, 0.0, 0.0)
+            program['u_detail_max'] = (0.0, 0.0, 0.0)
+            program['u_fine_fraction'] = 1.0
+            program['u_max_fine_steps'] = float(self._max_fine_steps_per_ray)
+            program['u_coarse_weight'] = 1.0
+            program['u_detail_voxel'] = (0.0, 0.0, 0.0)
+            program['u_overview_voxel'] = (0.0, 0.0, 0.0)
+            return
+        coarse, fine, weight = sizes
+        low, high = self._clipmap_detail_bounds or ((0.0,) * 3, (0.0,) * 3)
+        overview = np.asarray(self._overview_texture.shape[:3], dtype=float)
+        detail = np.asarray(self._texture.shape[:3], dtype=float)
+        span = np.maximum(np.asarray(high, float) - np.asarray(low, float), 0)
+        # one texel of each texture, in normalized xyz box coordinates
+        program['u_overview_voxel'] = tuple(1.0 / overview[::-1])
+        program['u_detail_voxel'] = tuple(span / np.maximum(detail[::-1], 1))
+        program['u_clipmap_adaptive'] = 1.0
+        program['u_relative_step_size'] = coarse
+        program['u_detail_min'] = tuple(float(v) for v in low)
+        program['u_detail_max'] = tuple(float(v) for v in high)
+        program['u_fine_fraction'] = fine
+        program['u_max_fine_steps'] = float(self._max_fine_steps_per_ray)
+        program['u_coarse_weight'] = weight
 
     def _install_clipmap_lookup(self) -> None:
         if not self._clipmap_enabled or self._overview_texture is None:
@@ -486,6 +743,8 @@ class Volume(TextureMixin, BaseVolume):
             else FAST_GRADIENT_SHADER
         )
         self.shared_program['u_clamp_at_border'] = self._clamp_at_border
+        if hasattr(self, '_clipmap_enabled'):
+            self._update_clipmap_stepping()
         self.update()
 
     @property
