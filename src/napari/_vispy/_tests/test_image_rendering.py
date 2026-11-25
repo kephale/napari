@@ -134,8 +134,10 @@ def test_clipmap_steps_follow_each_texture_resolution(make_napari_viewer):
     # surface gradients sample one texel of the texture being read
     np.testing.assert_allclose(program['u_overview_voxel'], [1 / 16] * 3)
     np.testing.assert_allclose(program['u_detail_voxel'], [0.25 / 16] * 3)
-    np.testing.assert_allclose(program['u_detail_min'], [0.375] * 3)
-    np.testing.assert_allclose(program['u_detail_max'], [0.625] * 3)
+    # relative to the floating origin at the detail box's low corner
+    np.testing.assert_allclose(node._origin, [24, 24, 24])
+    np.testing.assert_allclose(program['u_detail_min'], [0.0] * 3)
+    np.testing.assert_allclose(program['u_detail_max'], [0.25] * 3)
     assert node.relative_step_size == 0.5
 
     # interaction coarsens both steps together
@@ -146,6 +148,58 @@ def test_clipmap_steps_follow_each_texture_resolution(make_napari_viewer):
     node.disable_clipmap()
     assert program['u_clipmap_adaptive'] == 0.0
     assert program['u_relative_step_size'] == pytest.approx(2.0)
+
+
+def test_clipmap_floating_origin_composes_the_same_transforms(
+    qapp, make_napari_viewer
+):
+    """Clipmap volumes draw relative to an origin at the detail box, with
+    transforms composed in float64; they must map points exactly as the
+    vispy chains do from absolute coordinates."""
+    from napari._vispy.visuals.volume import _chain_matrix
+
+    viewer = make_napari_viewer(show=True)
+    viewer.dims.ndisplay = 3
+    layer = viewer.add_image(
+        np.zeros((16, 16, 16), dtype=np.uint8), scale=(2, 3, 4)
+    )
+    viewer.scene.camera.angles = (10, 20, 30)
+    visual = viewer.window._qt_viewer.layer_to_visual[layer]
+    node = visual.node
+    node.enable_clipmap(
+        np.zeros((16, 16, 16), dtype=np.uint8), full_shape=(64, 64, 64)
+    )
+    node.set_clipmap_detail_bounds((24, 20, 8), (40, 36, 24))
+    visual._on_matrix_change()
+    viewer.reset_view()
+    qapp.processEvents()
+    viewer.screenshot(canvas_only=True, flash=False)
+
+    assert node._origin_active
+    origin = node._origin
+    np.testing.assert_array_equal(origin, [8, 20, 24])  # xyz
+    points = np.array([[0.0, 0.0, 0.0], [3.5, -2.0, 7.0], [-30.0, 12.0, 1.0]])
+    for name, target in (('render', 'render'), ('document', 'document')):
+        chain = node.transforms.get_transform('visual', target)
+        expected = chain.map(points + origin)
+        composed = node._origin_transforms[name].map(points)
+        np.testing.assert_allclose(
+            composed[:, :3] / composed[:, 3:],
+            expected[:, :3] / expected[:, 3:],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+    inverse = node._origin_transforms['document_inv'].map(
+        node._origin_transforms['document'].map(points)
+    )
+    np.testing.assert_allclose(inverse[:, :3] / inverse[:, 3:], points, atol=1e-4)
+    assert _chain_matrix(node.transforms.get_transform('visual', 'render')) is not None
+
+    # the ray box is drawn relative to the origin
+    assert node._compute_bounds(0, None) == (-8, 56)
+    node.disable_clipmap()
+    assert not node._origin_active
+    assert node._compute_bounds(0, None)[0] == 0  # no origin offset
 
 
 @skip_on_win_ci

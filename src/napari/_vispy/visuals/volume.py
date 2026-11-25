@@ -4,6 +4,13 @@ from typing import Any
 import numpy as np
 from vispy.scene.visuals import Volume as BaseVolume
 from vispy.visuals.shaders import Function
+from vispy.visuals.transforms.base_transform import InverseTransform
+from vispy.visuals.transforms import (
+    ChainTransform,
+    MatrixTransform,
+    NullTransform,
+    STTransform,
+)
 
 from napari._vispy.visuals.util import TextureMixin
 from napari.layers.labels._labels_constants import IsoCategoricalGradientMode
@@ -342,6 +349,20 @@ uniform float u_coarse_weight;
 uniform vec3 u_detail_voxel;
 uniform vec3 u_overview_voxel;
 
+// Floating origin (see CLIPMAP_ORIGIN_SETUP): rays from the pixel position
+// and per-frame values composed in float64, relative to an origin at the
+// detail box.
+uniform float u_origin_mode;
+uniform vec2 u_frag_origin;
+uniform vec3 u_frag_dx;
+uniform vec3 u_frag_dy;
+uniform vec3 u_ray_dir;
+uniform float u_perspective;
+uniform vec3 u_eye;
+uniform float u_near_t;
+uniform vec3 u_box_min;
+uniform vec3 u_box_max;
+
 vec3 clipmap_gradient_step(vec3 loc, vec3 dstep) {
     if (u_clipmap_adaptive < 0.5) {
         return dstep;
@@ -355,26 +376,36 @@ vec3 clipmap_gradient_step(vec3 loc, vec3 dstep) {
 CLIPMAP_STEPPING_SETUP = """$raycasting_setup
 
     vec3 coarse_step = step;
-    float ray_steps = float(nsteps);
+    // loc(ray_t) = ray_anchor + ray_t * coarse_step; the ray ends at
+    // ray_t == ray_steps. With a floating origin the anchor is the ray's
+    // point near the origin, so positions near the detail box are small,
+    // exactly representable numbers rather than a far box face plus steps.
+    vec3 ray_anchor = start_loc;
     float ray_t = 0.0;
+    float ray_steps = float(nsteps);
+    if (origin_ray) {
+        ray_anchor = (origin_anchor + 0.5) / u_shape;
+        ray_t = origin_t_start;
+        ray_steps = origin_t_start + float(nsteps);
+    }
     float step_weight = u_relative_step_size;
     float fine_fraction = 1.0;
     float detail_t0 = 1e30;
     float detail_t1 = -1e30;
     if (u_clipmap_adaptive > 0.5) {
         step_weight = u_coarse_weight;
-        // ray/box slab test with loc(t) = start_loc + t * coarse_step
+        // ray/box slab test with loc(t) = ray_anchor + t * coarse_step
         vec3 safe_step = coarse_step + vec3(equal(coarse_step, vec3(0.0))) * 1e-20;
-        vec3 ta = (u_detail_min - start_loc) / safe_step;
-        vec3 tb = (u_detail_max - start_loc) / safe_step;
+        vec3 ta = (u_detail_min - ray_anchor) / safe_step;
+        vec3 tb = (u_detail_max - ray_anchor) / safe_step;
         vec3 tlo = min(ta, tb);
         vec3 thi = max(ta, tb);
-        detail_t0 = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
+        detail_t0 = max(max(tlo.x, tlo.y), max(tlo.z, ray_t));
         detail_t1 = min(min(thi.x, thi.y), min(thi.z, ray_steps));
         if (detail_t1 > detail_t0) {
             fine_fraction = clamp(
                 max(u_fine_fraction, (detail_t1 - detail_t0) / u_max_fine_steps),
-                1e-6, 1.0
+                1e-12, 1.0
             );
             nsteps += int((detail_t1 - detail_t0) / fine_fraction) + 2;
         }
@@ -383,16 +414,20 @@ CLIPMAP_STEPPING_SETUP = """$raycasting_setup
 
 CLIPMAP_STEPPING_ADVANCE = """
             if (u_clipmap_adaptive > 0.5) {
-                float dt = 1.0;
-                if (ray_t >= detail_t0 - 1e-4 && ray_t < detail_t1) {
-                    dt = fine_fraction;
-                } else if (ray_t < detail_t0) {
-                    // land on the detail box entry rather than step over it
-                    dt = min(1.0, detail_t0 - ray_t);
+                float next_t = ray_t + 1.0;
+                // tolerance in fine steps: a fixed one is wider than the
+                // whole detail box at deep levels (1e-4 of an overview
+                // voxel is 340 level-0 voxels at 23 levels)
+                if (ray_t >= detail_t0 - 0.5 * fine_fraction && ray_t < detail_t1) {
+                    next_t = ray_t + fine_fraction;
+                } else if (ray_t < detail_t0 && detail_t0 - ray_t <= 1.0) {
+                    // land exactly on the detail box entry rather than
+                    // step over it (or carry far-away rounding into it)
+                    next_t = detail_t0;
                 }
-                ray_t += dt;
-                step = coarse_step * dt;
-                loc = start_loc + coarse_step * ray_t;
+                step = coarse_step * (next_t - ray_t);
+                ray_t = next_t;
+                loc = ray_anchor + coarse_step * ray_t;
                 if (ray_t >= ray_steps) {
                     iter = nsteps;
                 }
@@ -400,6 +435,122 @@ CLIPMAP_STEPPING_ADVANCE = """
                 loc += step;
             }
 """
+
+_VOLUME_SETUP = BaseVolume._raycasting_modes['volume']
+for _declared in (
+    'float distance =',
+    'vec3 front =',
+    'int nsteps =',
+    'float f_nsteps =',
+    'vec3 step =',
+    'vec3 start_loc =',
+):
+    _VOLUME_SETUP = _patch(_VOLUME_SETUP, _declared, _declared.split(' ', 1)[1])
+
+CLIPMAP_ORIGIN_SETUP = (
+    """
+    float distance;
+    vec3 front;
+    int nsteps;
+    float f_nsteps;
+    vec3 step;
+    vec3 start_loc;
+    bool origin_ray = u_origin_mode > 0.5;
+    vec3 origin_anchor = vec3(0.0);
+    float origin_t_start = 0.0;
+    if (origin_ray) {
+        // The interpolated box face (v_position) and near/far points are up
+        // to the whole volume away, so in float32 they place a deep
+        // pyramid's ray several voxels off. Build the ray from the pixel
+        // instead: its point on the plane through the origin facing the
+        // camera, and its direction, from values composed in float64.
+        origin_anchor = (gl_FragCoord.x - u_frag_origin.x) * u_frag_dx
+            + (gl_FragCoord.y - u_frag_origin.y) * u_frag_dy;
+        vec3 dir = u_ray_dir;
+        float t_near = u_near_t;
+        if (u_perspective > 0.5) {
+            dir = normalize(origin_anchor - u_eye);
+            t_near = dot(u_eye - origin_anchor, dir);
+        }
+        view_ray = dir;
+        vec3 safe_dir = dir + vec3(equal(dir, vec3(0.0))) * 1e-20;
+        vec3 ta = (u_box_min - origin_anchor) / safe_dir;
+        vec3 tb = (u_box_max - origin_anchor) / safe_dir;
+        vec3 tlo = min(ta, tb);
+        vec3 thi = max(ta, tb);
+        float t_enter = max(max(max(tlo.x, tlo.y), tlo.z), t_near);
+        float t_exit = min(min(thi.x, thi.y), thi.z);
+        if (t_exit <= t_enter)
+            discard;
+        nsteps = int((t_exit - t_enter) / u_relative_step_size + 0.5);
+        f_nsteps = float(nsteps);
+        if (nsteps < 1)
+            discard;
+        front = origin_anchor + dir * t_enter;
+        step = dir * u_relative_step_size / u_shape;
+        start_loc = (front + 0.5) / u_shape;
+        origin_t_start = t_enter / u_relative_step_size;
+        frag_depth_point = front;
+    } else {
+"""
+    + _VOLUME_SETUP
+    + """
+    }
+"""
+)
+
+_ORIGIN_OFF = """
+    bool origin_ray = false;
+    vec3 origin_anchor = vec3(0.0);
+    float origin_t_start = 0.0;
+"""
+raycasting_modes = {
+    'volume': CLIPMAP_ORIGIN_SETUP,
+    'plane': _ORIGIN_OFF + BaseVolume._raycasting_modes['plane'],
+}
+
+
+def _chain_matrix(transform: Any) -> np.ndarray | None:
+    """A vispy transform chain as one float64 matrix (row vectors), or None
+    if it holds a transform that is not a matrix."""
+    if isinstance(transform, ChainTransform):
+        matrix = np.eye(4)
+        # the last transform in a chain is applied first
+        for inner in reversed(transform.transforms):
+            inner_matrix = _chain_matrix(inner)
+            if inner_matrix is None:
+                return None
+            matrix = matrix @ inner_matrix
+        return matrix
+    if isinstance(transform, NullTransform):
+        return np.eye(4)
+    if isinstance(transform, STTransform):
+        return np.asarray(transform.as_matrix().matrix, dtype=np.float64)
+    if isinstance(transform, MatrixTransform):
+        return np.asarray(transform.matrix, dtype=np.float64)
+    if isinstance(transform, InverseTransform):
+        # e.g. the scene transform: the inverse of the camera transform
+        forward = _chain_matrix(transform._inverse)
+        return None if forward is None else np.linalg.inv(forward)
+    return None
+
+
+def _eye_point(unproject: Any, fx: float, fy: float) -> np.ndarray:
+    """Least-squares meeting point of the rays through three pixels."""
+    lines = []
+    for x, y in ((fx, fy), (fx + 64.0, fy), (fx, fy + 64.0)):
+        near = unproject(x, y, -1.0)
+        far = unproject(x, y, 1.0)
+        direction = (far - near) / np.linalg.norm(far - near)
+        lines.append((near, direction))
+    system = np.zeros((3, 3))
+    target = np.zeros(3)
+    for point, direction in lines:
+        projector = np.eye(3) - np.outer(direction, direction)
+        system += projector
+        target += projector @ point
+    return np.linalg.solve(system, target)
+
 
 shaders = BaseVolume._shaders.copy()
 before, after = shaders['fragment'].split('void main()')
@@ -484,6 +635,8 @@ rendering_methods['translucent_categorical'] = TRANSLUCENT_CATEGORICAL_SNIPPETS
 
 CLIPMAP_LOOKUP = """
 vec4 clipmap_lookup(vec3 texcoord) {
+    // texcoord and the detail bounds are relative to the floating origin
+    // (zero when it is off); the overview spans the whole volume
     bool in_detail = all(greaterThanEqual(texcoord, $detail_min))
         && all(lessThan(texcoord, $detail_max));
     if (in_detail) {
@@ -492,7 +645,7 @@ vec4 clipmap_lookup(vec3 texcoord) {
             $detail_texture, (texcoord - $detail_min) / span
         );
     }
-    return texture3D($overview_texture, texcoord);
+    return texture3D($overview_texture, texcoord + $origin_tex);
 }
 """
 
@@ -503,6 +656,15 @@ class Volume(TextureMixin, BaseVolume):
     # add the new rendering method to the snippets dict
     _shaders = shaders
     _rendering_methods = rendering_methods
+    _raycasting_modes = raycasting_modes
+
+    # Floating origin, xyz full-resolution voxels: the clipmap ray box is
+    # drawn relative to it, so float32 stays precise near the detail box
+    # whatever the volume's size. Zero when off.
+    _origin = np.zeros(3)
+    _origin_active = False
+    _origin_supported = True
+    _origin_transforms: dict | None = None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -546,7 +708,7 @@ class Volume(TextureMixin, BaseVolume):
         self._clipmap_lookup = None
         self._clipmap_detail_bounds = None
         self.freeze()
-        self._update_clipmap_stepping()
+        self._refresh_origin()
         if self._requested_step_size is not None:
             # back to one uniform step, with vispy's bound
             BaseVolume.relative_step_size.fset(self, self._requested_step_size)  # type: ignore[attr-defined]
@@ -582,10 +744,8 @@ class Volume(TextureMixin, BaseVolume):
             return
         detail_min = tuple(float(value) for value in detail_min)
         detail_max = tuple(float(value) for value in detail_max)
-        self._clipmap_lookup['detail_min'] = detail_min
-        self._clipmap_lookup['detail_max'] = detail_max
         self._clipmap_detail_bounds = (detail_min, detail_max)
-        self._update_clipmap_stepping()
+        self._refresh_origin()
 
     def set_overview_data(
         self, data: np.ndarray, offset: Sequence[int] = (0, 0, 0)
@@ -615,8 +775,19 @@ class Volume(TextureMixin, BaseVolume):
         if getattr(self, '_vol_shape', None) != shape:
             self._vol_shape = shape
             self._need_vertex_update = True
-        self._update_clipmap_stepping()
+        self._refresh_origin()
         self.update()
+
+    @property
+    def raycasting_mode(self) -> str:
+        return BaseVolume.raycasting_mode.fget(self)  # type: ignore[attr-defined]
+
+    @raycasting_mode.setter
+    def raycasting_mode(self, value: str) -> None:
+        BaseVolume.raycasting_mode.fset(self, value)  # type: ignore[attr-defined]
+        if hasattr(self, '_clipmap_enabled'):
+            # the floating origin applies to volume rays only
+            self._refresh_origin()
 
     # Requested relative step, before vispy's lower bound; see
     # CLIPMAP_STEPPING_SETUP. In clipmap mode it is measured in overview
@@ -677,7 +848,12 @@ class Volume(TextureMixin, BaseVolume):
             span = np.maximum(high - low, 0) * full
             if np.all(span > 0):
                 detail_voxel = float(np.min(span / detail))
-                fine = float(np.clip(requested * detail_voxel / coarse, 1e-6, 1.0))
+                # deep pyramids: a detail voxel is ~1e-7 of an overview
+                # voxel at 23 levels; with the floating origin such steps
+                # stay exact near the detail box
+                fine = float(
+                    np.clip(requested * detail_voxel / coarse, 1e-12, 1.0)
+                )
         return coarse, fine, coarse / overview_voxel
 
     def _update_clipmap_stepping(self) -> None:
@@ -703,11 +879,192 @@ class Volume(TextureMixin, BaseVolume):
         program['u_detail_voxel'] = tuple(span / np.maximum(detail[::-1], 1))
         program['u_clipmap_adaptive'] = 1.0
         program['u_relative_step_size'] = coarse
-        program['u_detail_min'] = tuple(float(v) for v in low)
-        program['u_detail_max'] = tuple(float(v) for v in high)
+        origin_tex = self._origin_tex()
+        program['u_detail_min'] = tuple(np.asarray(low, float) - origin_tex)
+        program['u_detail_max'] = tuple(np.asarray(high, float) - origin_tex)
         program['u_fine_fraction'] = fine
         program['u_max_fine_steps'] = float(self._max_fine_steps_per_ray)
         program['u_coarse_weight'] = weight
+
+    # -- floating origin --
+
+    def _desired_origin(self) -> np.ndarray | None:
+        """The detail box's low corner in xyz full-resolution voxels, or
+        None when the floating origin does not apply."""
+        if (
+            not self._origin_supported
+            or not getattr(self, '_clipmap_enabled', False)
+            or self._clipmap_shape is None
+            or self._clipmap_detail_bounds is None
+            or self.raycasting_mode != 'volume'
+        ):
+            return None
+        full = np.asarray(self._clipmap_shape[-3:], dtype=float)[::-1]
+        low = np.asarray(self._clipmap_detail_bounds[0], dtype=float) * full
+        if not np.all(np.isfinite(low)):
+            return None
+        return np.floor(low)
+
+    def _origin_tex(self) -> np.ndarray:
+        """The origin in normalized xyz box coordinates."""
+        if not self._origin_active or self._clipmap_shape is None:
+            return np.zeros(3)
+        full = np.asarray(self._clipmap_shape[-3:], dtype=float)[::-1]
+        return self._origin / full
+
+    def _refresh_origin(self, force: bool = False) -> None:
+        """Move the origin to the detail box and re-express everything
+        drawn relative to it."""
+        origin = self._desired_origin()
+        active = origin is not None
+        if origin is None:
+            origin = np.zeros(3)
+        toggled = active != self._origin_active
+        moved = not np.array_equal(origin, self._origin)
+        self.unfreeze()
+        self._origin = origin
+        self._origin_active = active
+        self.freeze()
+        if toggled or moved or force:
+            self._need_vertex_update = True
+        program = self.shared_program
+        program['u_origin_mode'] = 1.0 if active else 0.0
+        if self._clipmap_shape is not None:
+            full = np.asarray(self._clipmap_shape[-3:], dtype=float)[::-1]
+        else:
+            full = np.asarray(getattr(self, '_vol_shape', (1, 1, 1))[-3:], float)[
+                ::-1
+            ]
+        program['u_box_min'] = tuple(-0.5 - origin)
+        program['u_box_max'] = tuple(full - 0.5 - origin)
+        if self._clipmap_lookup is not None:
+            low, high = self._clipmap_detail_bounds or ((0.0,) * 3, (1.0,) * 3)
+            origin_tex = self._origin_tex()
+            self._clipmap_lookup['detail_min'] = tuple(
+                np.asarray(low, float) - origin_tex
+            )
+            self._clipmap_lookup['detail_max'] = tuple(
+                np.asarray(high, float) - origin_tex
+            )
+            self._clipmap_lookup['origin_tex'] = tuple(origin_tex)
+        self._update_clipmap_stepping()
+        if toggled:
+            # (un)install the composed transforms
+            self._prepare_transforms(self)
+        self.update()
+
+    def _create_vertex_data(self) -> None:
+        super()._create_vertex_data()
+        if not self._origin_active:
+            return
+        shape = self._vol_shape
+        ox, oy, oz = self._origin
+        x0, x1 = -0.5 - ox, shape[2] - 0.5 - ox
+        y0, y1 = -0.5 - oy, shape[1] - 0.5 - oy
+        z0, z1 = -0.5 - oz, shape[0] - 0.5 - oz
+        pos = np.array(
+            [
+                [x0, y0, z0],
+                [x1, y0, z0],
+                [x0, y1, z0],
+                [x1, y1, z0],
+                [x0, y0, z1],
+                [x1, y0, z1],
+                [x0, y1, z1],
+                [x1, y1, z1],
+            ],
+            dtype=np.float32,
+        )
+        self._vertices.set_data(pos)
+
+    def _compute_bounds(self, axis: int, view: Any) -> tuple[float, float]:
+        low, high = super()._compute_bounds(axis, view)
+        if not self._origin_active:
+            return low, high
+        return low - self._origin[axis], high - self._origin[axis]
+
+    def _prepare_transforms(self, view: Any) -> None:
+        super()._prepare_transforms(view)
+        if not getattr(self, '_origin_active', False):
+            return
+        if self._origin_transforms is None:
+            self.unfreeze()
+            self._origin_transforms = {
+                name: MatrixTransform()
+                for name in ('render', 'document', 'document_inv', 'clip')
+            }
+            self.freeze()
+        transforms = self._origin_transforms
+        view.view_program.vert['transform'] = transforms['render']
+        view.view_program.vert['viewtransformf'] = transforms['document']
+        view.view_program.vert['viewtransformi'] = transforms['document_inv']
+        view.view_program.frag['viewtransformf'] = transforms['document']
+        self._clip_transform = transforms['clip']
+        clip_func = getattr(self, '_clip_func', None)
+        if clip_func is not None:
+            clip_func['clip_transform'] = transforms['clip']
+        self._update_origin_frame(view)
+
+    def _prepare_draw(self, view: Any) -> Any:
+        result = super()._prepare_draw(view)
+        if self._origin_active:
+            self._update_origin_frame(view)
+        return result
+
+    def _update_origin_frame(self, view: Any) -> None:
+        """Compose this frame's transforms with the origin in float64 and
+        derive each pixel's ray from them (see CLIPMAP_ORIGIN_SETUP)."""
+        transforms = self._origin_transforms
+        if transforms is None:
+            return
+        system = view.transforms
+        to_origin = np.eye(4)
+        to_origin[3, :3] = self._origin
+        matrices = {}
+        for name, target in (
+            ('render', 'render'),
+            ('document', 'document'),
+            ('framebuffer', 'framebuffer'),
+            ('clip', self._clipping_planes_coord_system),
+        ):
+            matrix = _chain_matrix(system.get_transform('visual', target))
+            if matrix is None:
+                # not a matrix chain: draw without the floating origin
+                self.unfreeze()
+                self._origin_supported = False
+                self.freeze()
+                self._refresh_origin()
+                return
+            matrices[name] = to_origin @ matrix
+        transforms['render'].matrix = matrices['render']
+        transforms['document'].matrix = matrices['document']
+        transforms['document_inv'].matrix = np.linalg.inv(matrices['document'])
+        transforms['clip'].matrix = matrices['clip']
+
+        to_pixels = matrices['framebuffer']
+        from_pixels = np.linalg.inv(to_pixels)
+
+        def unproject(x: float, y: float, z: float) -> np.ndarray:
+            point = np.array([x, y, z, 1.0]) @ from_pixels
+            return point[:3] / point[3]
+
+        origin_px = np.array([0.0, 0.0, 0.0, 1.0]) @ to_pixels
+        fx, fy, fz = origin_px[:3] / origin_px[3]
+        anchor = unproject(fx, fy, fz)
+        near = unproject(fx, fy, -1.0)
+        far = unproject(fx, fy, 1.0)
+        direction = far - near
+        direction /= np.linalg.norm(direction)
+        program = self.shared_program
+        program['u_frag_origin'] = (float(fx), float(fy))
+        program['u_frag_dx'] = tuple(unproject(fx + 1.0, fy, fz) - anchor)
+        program['u_frag_dy'] = tuple(unproject(fx, fy + 1.0, fz) - anchor)
+        program['u_ray_dir'] = tuple(direction)
+        program['u_near_t'] = float(np.dot(near - anchor, direction))
+        perspective = not np.allclose(to_pixels[:, 3], (0.0, 0.0, 0.0, 1.0))
+        program['u_perspective'] = 1.0 if perspective else 0.0
+        if perspective:
+            program['u_eye'] = tuple(_eye_point(unproject, fx, fy))
 
     def _install_clipmap_lookup(self) -> None:
         if not self._clipmap_enabled or self._overview_texture is None:
@@ -719,10 +1076,13 @@ class Volume(TextureMixin, BaseVolume):
             (0.0, 0.0, 0.0),
             (1.0, 1.0, 1.0),
         )
-        lookup['detail_min'] = detail_min
-        lookup['detail_max'] = detail_max
+        origin_tex = self._origin_tex()
+        lookup['detail_min'] = tuple(np.asarray(detail_min, float) - origin_tex)
+        lookup['detail_max'] = tuple(np.asarray(detail_max, float) - origin_tex)
+        lookup['origin_tex'] = tuple(origin_tex)
         self._clipmap_lookup = lookup
         self.shared_program.frag['get_data'] = lookup
+        self._refresh_origin(force=True)
 
     def _build_interpolation(self) -> None:
         super()._build_interpolation()
