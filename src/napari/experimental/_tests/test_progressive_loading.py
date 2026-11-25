@@ -28,6 +28,7 @@ from napari.experimental._lodstone_loading import (  # noqa: E402
 from napari.experimental._progressive_loading import (  # noqa: E402
     ProgressiveLoader,
     _front_depth_segment,
+    _rotation_damping,
     add_progressive_loading_image,
     chunk_priority_3D,
     chunk_slices,
@@ -2905,6 +2906,41 @@ def test_2d_level_clamped_to_3d_texture_limit(
 
     loader.close()
     qtbot.wait(100)
+
+
+@pytest.mark.parametrize(
+    ('ratio', 'expected'),
+    [(0.5, 1.0), (1.0, 1.0), (10.0, 10**-0.15), (1e6, 0.25)],
+)
+def test_rotation_damping_grows_gently_with_zoom(ratio, expected):
+    assert _rotation_damping(ratio * 2.0, 2.0, 0.15, 0.25) == pytest.approx(
+        expected
+    )
+
+
+@pytest.mark.parametrize('fit', [None, 0.0, float('nan')])
+def test_rotation_damping_is_off_without_a_fit_zoom(fit):
+    assert _rotation_damping(5.0, fit, 0.15, 0.25) == 1.0
+
+
+def test_loader_damps_drag_rotation_at_deep_zoom_and_restores_it(
+    qtbot, make_napari_viewer, multiscale_3d_arrays
+):
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    layer = add_progressive_loading_image(multiscale_3d_arrays, viewer=viewer)
+    loader = layer.metadata['progressive_loader']
+    camera = viewer.scene.camera
+    vispy_camera = viewer.window._qt_viewer.canvas.camera._3D_camera
+
+    viewer.reset_view()
+    assert camera._rotation_scale == 1.0
+    camera.zoom *= 1000
+    assert camera._rotation_scale < 0.5
+    assert vispy_camera.rotation_scale_source() == camera._rotation_scale
+
+    loader.close()
+    assert camera._rotation_scale == 1.0
 
 
 def test_first_content_along_ray_keeps_a_refined_hit_for_the_same_ray():

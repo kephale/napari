@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 
 import numpy as np
 from vispy.scene import ArcballCamera, BaseCamera, PanZoomCamera
+from vispy.scene.cameras.arcball import _arcball
 from vispy.util.quaternion import Quaternion
 
 from napari.utils.camera_orientations import (
@@ -12,7 +13,7 @@ from napari.utils.camera_orientations import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from vispy.scene.widgets.viewbox import ViewBox
     from vispy.util.event import Event as VispyEvent
@@ -189,6 +190,9 @@ class VispyCamera:
 
         # Create 3D camera
         self._3D_camera = MouseToggledArcballCamera(fov=0)
+        self._3D_camera.rotation_scale_source = lambda: (
+            self._camera._rotation_scale
+        )
 
         self._view.camera = (
             self._2D_camera if dims.ndisplay == 2 else self._3D_camera
@@ -445,4 +449,35 @@ def add_mouse_pan_zoom_toggles(
 
 
 MouseToggledPanZoomCamera = add_mouse_pan_zoom_toggles(PanZoomCamera)
-MouseToggledArcballCamera = add_mouse_pan_zoom_toggles(ArcballCamera)
+class MouseToggledArcballCamera(add_mouse_pan_zoom_toggles(ArcballCamera)):  # type: ignore[misc]
+    """Arcball camera whose drag rotation can be scaled down.
+
+    ``rotation_scale_source`` returns the fraction of each drag's arcball
+    rotation to apply (1 when unset).
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.rotation_scale_source: Callable[[], float] | None = None
+
+    def _update_rotation(self, event: VispyEvent) -> None:
+        scale = 1.0
+        if self.rotation_scale_source is not None:
+            scale = float(self.rotation_scale_source())
+        if not np.isfinite(scale) or scale >= 1.0:
+            super()._update_rotation(event)
+            return
+        p2 = event.pos[:2]
+        if self._event_value is None:
+            self._event_value = p2
+        wh = self._viewbox.size
+        p1 = self._event_value[:2]
+        # the same incremental rotation vispy applies, with its angle scaled
+        step = Quaternion(*_arcball(p2, wh)) * Quaternion(*_arcball(p1, wh))
+        angle, x, y, z = step.get_axis_angle()
+        step = Quaternion.create_from_axis_angle(
+            angle * max(scale, 0.0), x, y, z
+        )
+        self._quaternion = step * self._quaternion
+        self._event_value = p2
+        self.view_changed()

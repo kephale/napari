@@ -255,6 +255,24 @@ def _drawn_camera_axes(
     return view, up, handedness * np.cross(view, up)
 
 
+def _rotation_damping(
+    zoom: float, fit_zoom: float | None, exponent: float, floor: float
+) -> float:
+    """Fraction of drag rotation to apply at ``zoom``: 1 up to the zoom
+    that fits the data, then ``(zoom / fit_zoom) ** -exponent``, at least
+    ``floor``."""
+    if (
+        fit_zoom is None
+        or not np.isfinite(zoom)
+        or not np.isfinite(fit_zoom)
+        or zoom <= 0
+        or fit_zoom <= 0
+    ):
+        return 1.0
+    ratio = max(zoom / fit_zoom, 1.0)
+    return float(max(ratio**-exponent, floor))
+
+
 def _front_depth_segment(
     center: np.ndarray,
     direction: np.ndarray,
@@ -786,6 +804,7 @@ class ProgressiveLoader:
             # moment interaction starts, so drag frames stay free of
             # uploads, slice cascades and fetch GIL pressure
             (viewer.scene.camera.events, self._on_interaction),
+            (viewer.scene.camera.events.zoom, self._update_rotation_damping),
             (viewer.dims.events.current_step, self._on_dims_step_change),
             (viewer.scene.camera.events, self._debounced_check),
             (viewer.dims.events.current_step, self._debounced_check),
@@ -815,6 +834,8 @@ class ProgressiveLoader:
                 emitter.connect(callback, position='first')
             else:
                 emitter.connect(callback)
+        with contextlib.suppress(Exception):
+            self._update_rotation_damping()
         viewer.layers.events.removed.connect(self._on_layer_removed)
         # engage the interaction hold on the raw pointer events too:
         # a press/wheel precedes the first camera event by one event,
@@ -958,6 +979,8 @@ class ProgressiveLoader:
             # the hooks call back into this loader's pyramid and viewer
             self._layer._full_level_fetchable_3d = None
             self._layer._view_bbox_3d = None
+        with contextlib.suppress(Exception):
+            self._viewer.scene.camera._rotation_scale = 1.0
         self._data = []
         self._viewer = None  # type: ignore[assignment]
         self._layer = None  # type: ignore[assignment]
@@ -1293,6 +1316,34 @@ class ProgressiveLoader:
             ):
                 return level
         return n_levels - 1
+
+    # Drag rotation is scaled by (zoom / zoom that fits the layer) ** -k,
+    # never below the floor: at deep zoom the arcball's fixed rotation per
+    # dragged pixel swings a tiny field of view across the volume.
+    _ROTATION_DAMPING_EXPONENT = 0.15
+    _ROTATION_DAMPING_FLOOR = 0.25
+
+    def _update_rotation_damping(self, event=None) -> None:
+        camera = self._viewer.scene.camera
+        camera._rotation_scale = _rotation_damping(
+            float(camera.zoom),
+            self._fit_zoom(),
+            self._ROTATION_DAMPING_EXPONENT,
+            self._ROTATION_DAMPING_FLOOR,
+        )
+
+    def _fit_zoom(self) -> float | None:
+        """Zoom at which the layer's displayed extent fills the canvas."""
+        try:
+            displayed = list(self._layer._slice_input.displayed)
+            extent = np.asarray(self._layer.extent.world, dtype=float)
+            span = float(np.max(np.take(extent[1] - extent[0], displayed)))
+            canvas = np.asarray(self._viewer.canvas.size, dtype=float)[:2]
+        except Exception:  # noqa: BLE001
+            return None
+        if not np.isfinite(span) or span <= 0 or np.any(canvas <= 0):
+            return None
+        return float(np.min(canvas)) / span
 
     def _first_content_along_ray(
         self,

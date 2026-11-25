@@ -89,6 +89,10 @@ class Camera(EventedModel):
     # Per-mode camera state cache for the "separate" (synced=False) mode.
     _cached_2d_state: _CameraState | None = PrivateAttr(None)
     _cached_3d_state: _CameraState | None = PrivateAttr(None)
+    # Experimental: fraction of the usual 3D drag rotation to apply. The
+    # progressive loader lowers it at deep zoom, where the arcball's fixed
+    # rotation per dragged pixel swings the view too far.
+    _rotation_scale: float = PrivateAttr(1.0)
 
     def _cache_state(self, ndisplay_mode: int) -> None:
         """Save current camera state for a given ndisplay mode."""
