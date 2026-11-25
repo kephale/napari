@@ -42,6 +42,13 @@ if TYPE_CHECKING:
 SLIDER_MINIMUM_WIDTH = 150
 
 
+_QT_INT_MAX = 2**31 - 1
+
+
+def _qt_int(value: int) -> int:
+    """Clamp to the 32-bit range Qt widgets hold (see _update_range)."""
+    return min(int(value), _QT_INT_MAX)
+
 class _ModifiedScrollBar(ModifiedScrollBar):
     def mousePressEvent(self, event):
         """Update the slider, or, on right-click, pop-up the margin controls.
@@ -179,10 +186,10 @@ class QtDimSliderWidget(QWidget):
         slider.setMinimumWidth(SLIDER_MINIMUM_WIDTH)
         slider.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         slider.setMinimum(0)
-        slider.setMaximum(self.dims.nsteps[self.axis] - 1)
+        slider.setMaximum(_qt_int(self.dims.nsteps[self.axis] - 1))
         slider.setSingleStep(1)
         slider.setPageStep(1)
-        slider.setValue(self.dims.current_step[self.axis])
+        slider.setValue(_qt_int(self.dims.current_step[self.axis]))
 
         slider.setToolTip('Right click to open the thick slicing controls.')
 
@@ -269,12 +276,18 @@ class QtDimSliderWidget(QWidget):
                 displayed_sliders[self.axis] = True
                 self.last_used = self.axis
                 self.show()
+            # Qt sliders and validators hold 32-bit ints; a deep pyramid's
+            # axis can have more steps (2**31 at 26 levels of 32-voxel
+            # tiles). Clamp rather than raise: such an axis is normally
+            # displayed, its slider hidden.
             self.slider.setMinimum(0)
-            self.slider.setMaximum(nsteps)
+            self.slider.setMaximum(_qt_int(nsteps))
             self.slider.setSingleStep(1)
             self.slider.setPageStep(1)
-            self.slider.setValue(self.dims.current_step[self.axis])
-            self.curslice_label.validator().setTop(10 ** len(str(nsteps + 1)))
+            self.slider.setValue(_qt_int(self.dims.current_step[self.axis]))
+            self.curslice_label.validator().setTop(
+                _qt_int(10 ** len(str(nsteps + 1)))
+            )
             self.totslice_label.setText(str(nsteps))
             self.totslice_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
             self._update_slice_labels()
@@ -284,7 +297,7 @@ class QtDimSliderWidget(QWidget):
 
     def _update_slider(self) -> None:
         """Update dimension slider."""
-        self.slider.setValue(self.dims.current_step[self.axis])
+        self.slider.setValue(_qt_int(self.dims.current_step[self.axis]))
         self._update_slice_labels()
 
     def _update_slice_labels(self) -> None:
@@ -814,7 +827,7 @@ class QMarginSlidersPopup(QMirroredSlidersPopup):
             qt_signals_blocked(self.left_slider),
             qt_signals_blocked(self.right_slider),
         ):
-            self.left_slider.setRange(0, dims.nsteps[self.axis] - 1)
-            self.left_slider.setValue(dims.margin_left_step[self.axis])
-            self.right_slider.setRange(0, dims.nsteps[self.axis] - 1)
-            self.right_slider.setValue(dims.margin_right_step[self.axis])
+            self.left_slider.setRange(0, _qt_int(dims.nsteps[self.axis] - 1))
+            self.left_slider.setValue(_qt_int(dims.margin_left_step[self.axis]))
+            self.right_slider.setRange(0, _qt_int(dims.nsteps[self.axis] - 1))
+            self.right_slider.setValue(_qt_int(dims.margin_right_step[self.axis]))
