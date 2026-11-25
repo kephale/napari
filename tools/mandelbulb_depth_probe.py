@@ -2,12 +2,15 @@
 
 Usage:
     python mandelbulb_depth_probe.py LEVELS OUTDIR [--zoom 8] [--wait 120]
-        [--overview 30] [--maxiter 64] [--no-content]
+        [--overview 30] [--maxiter 64] [--rendering iso] [--no-content]
 
 Opens the Mandelbulb with LEVELS levels in 3-D, waits ``--overview`` seconds,
-then centers the camera on a point on the bulb surface at ``--zoom`` and waits
-``--wait`` seconds. Writes LEVELS.json (samples, focus-box diagnostics), a log
-and screenshots to OUTDIR. ``--no-content`` restores box-face anchoring of the
+then centers the camera on a point on the bulb surface at ``--zoom`` screen
+pixels per level-0 voxel (whatever scale napari gives a deep layer) and waits
+``--wait`` seconds. Writes LEVELS.json (samples, focus-box diagnostics), a log,
+the clipmap ray uniforms (LEVELS-uniforms.json) and screenshots (overview, 10 s
+into the dive, final) to OUTDIR. ``--rendering`` defaults to iso at
+``maxiter - 1``, which draws the bulb surface. ``--no-content`` restores box-face anchoring of the
 3-D focus segment for an A/B comparison. Needs numba and a real GPU: software
 GL renders a frame in seconds and starves delivery.
 """
@@ -29,6 +32,12 @@ parser.add_argument("--wait", type=float, default=45)
 parser.add_argument("--zoom", type=float, default=8.0)
 parser.add_argument("--no-content", action="store_true")
 parser.add_argument("--overview", type=float, default=30)
+parser.add_argument(
+    "--rendering",
+    default="iso",
+    help="volume rendering mode; iso draws the bulb surface (attenuated_mip"
+    " goes dark on deep pyramids and mip saturates on the bulb interior)",
+)
 parser.add_argument(
     "--target-level",
     type=int,
@@ -107,8 +116,11 @@ layer = add_lodstone_loading_image(
     viewer=viewer,
     contrast_limits=(0, args.maxiter),
     colormap="magma",
-    rendering="attenuated_mip",
+    rendering=args.rendering,
 )
+if args.rendering == "iso":
+    # the bulb interior is maxiter; just below it is the fractal surface
+    layer.iso_threshold = args.maxiter - 1
 t_add = time.perf_counter() - t1
 viewer.dims.ndisplay = 3
 viewer.reset_view()
@@ -160,12 +172,20 @@ def dive():
     viewer.screenshot(
         str(args.outdir / f"L{args.levels:02d}-overview.png"), canvas_only=True
     )
+    QTimer.singleShot(
+        10000,
+        lambda: viewer.screenshot(
+            str(args.outdir / f"L{args.levels:02d}-dive10s.png"),
+            canvas_only=True,
+        ),
+    )
     # napari may rescale very large layers to stay within float32
     # precision, so convert the data-space point to world space
     world = np.asarray(layer.data_to_world(point_zyx), dtype=float)
     viewer.scene.camera.center = tuple(world)
-    # napari 3-D zoom is screen pixels per world unit
-    viewer.scene.camera.zoom = args.zoom
+    # --zoom is screen pixels per level-0 voxel; napari scales deep
+    # pyramids down (layer.scale) to keep world coordinates small
+    viewer.scene.camera.zoom = args.zoom / float(np.max(layer.scale))
     viewer.scene.camera.angles = (0, -30, 60)
     t_dive = time.perf_counter()
     QTimer.singleShot(5000, lambda: diagnose("dive+5s"))
@@ -201,6 +221,27 @@ def diagnose(tag):
 
 
 def finish():
+    try:
+        node = viewer.window._qt_viewer.layer_to_visual[layer].node
+        prog = node.shared_program
+        # the clipmap ray uniforms, to replay a pixel's ray offline
+        names = (
+            "u_origin_mode u_frag_origin u_frag_dx u_frag_dy u_ray_dir "
+            "u_perspective u_near_t u_box_min u_box_max u_detail_min "
+            "u_detail_max u_fine_fraction u_relative_step_size u_shape "
+            "u_max_fine_steps u_clipmap_adaptive u_threshold"
+        ).split()
+        dump = {name: np.asarray(prog[name]).tolist() for name in names}
+        dump["origin"] = np.asarray(node._origin).tolist()
+        canvas = viewer.window._qt_viewer.canvas._scene_canvas
+        dump["fb_size"] = list(canvas.physical_size)
+        dump["detail_tex"] = list(node._texture.shape)
+        dump["bounds"] = node._clipmap_detail_bounds
+        (args.outdir / f"L{args.levels:02d}-uniforms.json").write_text(
+            json.dumps(dump, indent=1, default=str)
+        )
+    except Exception as exc:  # noqa: BLE001
+        print("uniform dump failed", repr(exc))
     diagnose("final")
     sample("final")
     shot = args.outdir / f"L{args.levels:02d}.png"
