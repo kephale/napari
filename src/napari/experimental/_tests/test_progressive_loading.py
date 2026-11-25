@@ -124,21 +124,40 @@ def test_front_depth_segment_ignores_content_outside_the_box(start):
     assert half == 10
 
 
-def _ray_probe_loader(overview, factor, contrast=(0, 100), loaded=True):
+def _ray_probe_level(data, translate=(0, 0, 0), loaded=True):
+    return types.SimpleNamespace(
+        ndim=data.ndim,
+        loaded_chunks={'chunk'} if loaded else set(),
+        lock=threading.RLock(),
+        hyperslice=data,
+        translate=translate,
+    )
+
+
+def _ray_probe_loader(
+    overview,
+    factor,
+    contrast=(0, 100),
+    loaded=True,
+    finer=None,
+    finer_factor=1,
+    **layer,
+):
+    """A loader whose coarsest resident level (1) is ``overview``; level 0
+    optionally holds ``finer``, a (data, translate) resident interval."""
+
     class _Levels(list):
         pass
 
     levels = _Levels([None, None])
-    levels._scale_factors = [(1, 1, 1), (factor,) * 3]
-    levels[1] = types.SimpleNamespace(
-        ndim=overview.ndim,
-        loaded_chunks={'chunk'} if loaded else set(),
-        lock=threading.RLock(),
-        hyperslice=overview,
-        translate=(0, 0, 0),
-    )
+    levels._scale_factors = [(finer_factor,) * 3, (factor,) * 3]
+    levels[1] = _ray_probe_level(overview, loaded=loaded)
+    if finer is not None:
+        levels[0] = _ray_probe_level(*finer)
     loader = ProgressiveLoader.__new__(ProgressiveLoader)
-    loader._layer = types.SimpleNamespace(contrast_limits=contrast, rgb=False)
+    loader._layer = types.SimpleNamespace(
+        contrast_limits=contrast, rgb=False, **layer
+    )
     loader._resident_level = 1
     loader._data = levels
     return loader
@@ -153,14 +172,93 @@ def test_first_content_along_ray_finds_sparse_content_in_a_large_box():
     center = np.array([512.0, 512.0, 512.0])
     direction = np.array([1.0, 0.0, 0.0])
 
-    start = loader._first_content_along_ray(
+    found = loader._first_content_along_ray(
         center, direction, -512.0, 512.0, [0, 1, 2]
     )
 
     # the block starts at level-0 depth 640, i.e. ray parameter 128; the
-    # result backs off by at most one coarse voxel (16) plus sampling
-    assert start is not None
+    # result backs off by at most one coarse voxel (16) plus sampling, and
+    # asks for a segment two coarse voxels deep to contain it
+    assert found is not None
+    start, depth = found
     assert 128 - 2 * 16 <= start <= 128
+    assert depth == 2 * 16
+
+
+def test_first_content_along_ray_narrows_the_hit_with_finer_resident_data():
+    """One coarse voxel can be far deeper than the focus segment: at 14
+    levels a Mandelbulb overview voxel is 16384 level-0 voxels, the focus
+    tile 256, so a segment backed off by a coarse voxel sat in empty space
+    in front of the surface. A finer resident level narrows the hit."""
+    overview = np.zeros((64, 64, 64), dtype=np.uint8)
+    overview[40:, :, :] = 80  # coarse: content from level-0 depth 640
+    # level 0 resident around there: the surface is really at depth 650
+    fine = np.zeros((64, 64, 64), dtype=np.uint8)
+    fine[650 - 608 :, :, :] = 80
+    loader = _ray_probe_loader(
+        overview, factor=16, finer=(fine, (608, 480, 480))
+    )
+    center = np.array([512.0, 512.0, 512.0])
+    direction = np.array([1.0, 0.0, 0.0])
+
+    start, depth = loader._first_content_along_ray(
+        center, direction, -512.0, 512.0, [0, 1, 2]
+    )
+
+    # surface at ray parameter 138; one level-0 voxel of slack
+    assert 138 - 2 <= start <= 138
+    assert depth == 2
+
+
+def test_first_content_along_ray_keeps_the_coarse_hit_without_finer_data():
+    overview = np.zeros((64, 64, 64), dtype=np.uint8)
+    overview[40:, :, :] = 80
+    # level 0 is resident, but elsewhere
+    fine = np.full((16, 16, 16), 80, dtype=np.uint8)
+    loader = _ray_probe_loader(overview, factor=16, finer=(fine, (0, 0, 0)))
+
+    start, depth = loader._first_content_along_ray(
+        np.array([512.0, 512.0, 512.0]),
+        np.array([1.0, 0.0, 0.0]),
+        -512.0,
+        512.0,
+        [0, 1, 2],
+    )
+
+    assert 128 - 2 * 16 <= start <= 128
+    assert depth == 2 * 16
+
+
+def test_first_content_along_ray_uses_the_iso_threshold():
+    # a faint halo in front of the surface: content for MIP-like
+    # rendering, empty space for an isosurface above it
+    overview = np.zeros((64, 64, 64), dtype=np.uint8)
+    overview[36:40, :, :] = 20
+    overview[40:, :, :] = 80
+    args = (np.array([512.0] * 3), np.array([1.0, 0, 0]), -512.0, 512.0)
+
+    mip = _ray_probe_loader(overview, factor=16, rendering='mip')
+    iso = _ray_probe_loader(
+        overview, factor=16, rendering='iso', iso_threshold=50
+    )
+
+    assert mip._first_content_along_ray(*args, [0, 1, 2])[0] < 64 + 1
+    assert iso._first_content_along_ray(*args, [0, 1, 2])[0] >= 128 - 2 * 16
+
+
+def test_front_depth_segment_is_deep_enough_for_the_content_uncertainty():
+    segment = _front_depth_segment(
+        np.array((50, 50, 50)),
+        np.array((1, 0, 0)),
+        np.array((100, 100, 100)),
+        length=10,
+        first_content=lambda enter, leave: (0.0, 30.0),
+    )
+
+    assert segment is not None
+    center, half = segment
+    np.testing.assert_allclose(center, (65, 50, 50))
+    assert half == 15
 
 
 def test_first_content_along_ray_keeps_the_face_without_overview_content():
@@ -2807,3 +2905,27 @@ def test_2d_level_clamped_to_3d_texture_limit(
 
     loader.close()
     qtbot.wait(100)
+
+
+def test_first_content_along_ray_keeps_a_refined_hit_for_the_same_ray():
+    """Finer levels' resident intervals follow the selected level, so the
+    data that narrowed a hit can move away while the camera is still. The
+    focus must not then coarsen again."""
+    overview = np.zeros((64, 64, 64), dtype=np.uint8)
+    overview[40:, :, :] = 80
+    fine = np.zeros((64, 64, 64), dtype=np.uint8)
+    fine[650 - 608 :, :, :] = 80
+    loader = _ray_probe_loader(
+        overview, factor=16, finer=(fine, (608, 480, 480))
+    )
+    args = (np.array([512.0] * 3), np.array([1.0, 0, 0]), -512.0, 512.0)
+
+    refined = loader._first_content_along_ray(*args, [0, 1, 2])
+    # level 0 moves elsewhere
+    loader._data[0].translate = (0, 0, 0)
+    assert loader._first_content_along_ray(*args, [0, 1, 2]) == refined
+
+    # a different ray searches afresh
+    moved = (np.array([512.0, 520.0, 512.0]), *args[1:])
+    _, depth = loader._first_content_along_ray(*moved, [0, 1, 2])
+    assert depth == 2 * 16

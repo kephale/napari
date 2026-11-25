@@ -260,7 +260,10 @@ def _front_depth_segment(
     direction: np.ndarray,
     shape: np.ndarray,
     length: float,
-    first_content: Callable[[float, float], float | None] | None = None,
+    first_content: Callable[
+        [float, float], float | tuple[float, float] | None
+    ]
+    | None = None,
 ) -> tuple[np.ndarray, float] | None:
     """Center and half-length of a camera-facing ray segment in a box.
 
@@ -273,7 +276,10 @@ def _front_depth_segment(
     where content first appears between the box entry and exit, or None.
     The segment then starts there instead of at the box face, so sparse
     data inside a large box (a fractal, a cell in a wide field) keeps its
-    focus on the content rather than on empty space in front of it.
+    focus on the content rather than on empty space in front of it. It may
+    instead return ``(start, depth)``: the segment is then at least
+    ``depth`` long, so it still contains content located only to within
+    that depth (e.g. one coarse voxel).
     """
     center = np.asarray(center, dtype=float)
     direction = np.asarray(direction, dtype=float)
@@ -305,9 +311,14 @@ def _front_depth_segment(
         return None
 
     if first_content is not None:
-        start = first_content(enter, leave)
-        if start is not None and np.isfinite(start) and enter < start < leave:
-            enter = float(start)
+        found = first_content(enter, leave)
+        depth = 0.0
+        if isinstance(found, tuple):
+            found, depth = found
+        if found is not None and np.isfinite(found) and enter < found < leave:
+            enter = float(found)
+            if np.isfinite(depth):
+                length = max(length, float(depth))
 
     stop = min(enter + length, leave)
     half = (stop - enter) / 2.0
@@ -1290,38 +1301,153 @@ class ProgressiveLoader:
         enter: float,
         leave: float,
         displayed_axes: list[int],
-    ) -> float | None:
-        """Ray parameter where the resident overview first shows content.
+    ) -> tuple[float, float] | None:
+        """Where resident data first shows content along the center ray.
 
-        Samples the coarsest level's loaded voxels along the center ray in
-        level-0 coordinates and returns where a value first rises above a
-        tenth of the contrast range, backed off by one coarse voxel so the
-        surface falls inside the focus segment. Returns None, keeping the
+        Searches the coarsest resident level between ``enter`` and
+        ``leave`` (level-0 ray parameters), then narrows the hit with each
+        finer level that has resident data around it. Content is a value
+        above the iso threshold for iso rendering, else above a tenth of
+        the contrast range.
+
+        Returns ``(start, depth)``: start one voxel of the finest level
+        that located the content before the hit, and a depth of two such
+        voxels, so a focus segment of at least that depth contains the
+        content. Locating it to within a coarse voxel only, the segment
+        then asks for a coarse level; once that loads, the next call
+        narrows the hit and the focus refines. Returns None, keeping the
         box face, when the overview has nothing loaded, the data is not a
         plain 3-D scalar volume, or no content is found.
         """
         layer = self._layer
         if len(displayed_axes) != 3 or getattr(layer, 'rgb', False):
             return None
-        level = self._resident_level
-        vdata = self._data[level]
+        coarsest = self._resident_level
+        vdata = self._data[coarsest]
         if vdata.ndim != 3 or not vdata.loaded_chunks:
             return None
+        threshold = self._content_threshold()
+        hit = self._sample_ray_for_content(
+            coarsest,
+            center,
+            direction,
+            enter,
+            leave,
+            displayed_axes,
+            threshold,
+            blocking=True,
+        )
+        if hit is None:
+            return None
+        voxel = self._level_voxel(coarsest, displayed_axes)
+        coarse_low, coarse_high = hit - 2 * voxel, hit + voxel
+        for level in range(coarsest - 1, -1, -1):
+            finer_voxel = self._level_voxel(level, displayed_axes)
+            # the crossing lies within one coarser voxel before the hit
+            low = max(hit - 2 * voxel, enter)
+            high = min(hit + voxel, leave)
+            finer = self._sample_ray_for_content(
+                level,
+                center,
+                direction,
+                low,
+                high,
+                displayed_axes,
+                threshold,
+                blocking=False,
+                require_coverage=True,
+            )
+            if finer is None:
+                # not resident around the hit, busy, or no content found:
+                # keep the coarser estimate; a finer level may still have it
+                continue
+            hit, voxel = finer, finer_voxel
+        # The finer levels that narrowed a hit can later move away from it
+        # (their resident intervals follow the selected level). While the
+        # ray is unchanged, keep the best estimate seen, if the coarse
+        # search still agrees with it, rather than coarsening the focus and
+        # reloading what was already shown.
+        key = (
+            np.asarray(center, dtype=float).copy(),
+            np.asarray(direction, dtype=float).copy(),
+            threshold,
+        )
+        cached = self._content_hit_cache
+        if (
+            cached is not None
+            and np.array_equal(cached[0][0], key[0])
+            and np.array_equal(cached[0][1], key[1])
+            and cached[0][2] == key[2]
+            and coarse_low <= cached[1] <= coarse_high
+        ):
+            if cached[2] < voxel:
+                hit, voxel = cached[1], cached[2]
+        self._content_hit_cache = (key, hit, voxel)
+        return max(hit - voxel, enter), 2 * voxel
+
+    # (ray key, hit, voxel) of the last content search; see
+    # _first_content_along_ray
+    _content_hit_cache: tuple | None = None
+
+    def _content_threshold(self) -> float:
+        layer = self._layer
+        if str(getattr(layer, 'rendering', '')) == 'iso':
+            iso = getattr(layer, 'iso_threshold', None)
+            if iso is not None and np.isfinite(iso):
+                return float(iso)
         contrast = getattr(layer, 'contrast_limits', None)
         if contrast is None:
-            threshold = 0.0
-        else:
-            low, high = (float(value) for value in contrast)
-            threshold = low + 0.1 * (high - low)
+            return 0.0
+        low, high = (float(value) for value in contrast)
+        return low + 0.1 * (high - low)
+
+    def _level_voxel(self, level: int, displayed_axes: list[int]) -> float:
         factors = np.take(
             np.asarray(self._data._scale_factors[level], dtype=float),
             displayed_axes,
         )
-        coarse_step = float(np.max(factors))
-        count = int(np.clip(2 * (leave - enter) / coarse_step, 2, 4096))
-        steps = np.linspace(enter, leave, count)
+        return float(np.max(factors))
+
+    def _sample_ray_for_content(
+        self,
+        level: int,
+        center: np.ndarray,
+        direction: np.ndarray,
+        low: float,
+        high: float,
+        displayed_axes: list[int],
+        threshold: float,
+        *,
+        blocking: bool,
+        require_coverage: bool = False,
+    ) -> float | None:
+        """First ray parameter in [low, high] whose ``level`` value exceeds
+        ``threshold``, sampled at half-voxel steps; None if not found.
+
+        With ``require_coverage``, None also when the level's resident data
+        does not cover the whole range. Without ``blocking``, a level whose
+        lock a loading thread holds is skipped rather than waited on.
+        """
+        vdata = self._data[level]
+        if (
+            vdata is None
+            or getattr(vdata, 'ndim', 0) != 3
+            or not getattr(vdata, 'loaded_chunks', None)
+            or not high > low
+        ):
+            return None
+        factors = np.take(
+            np.asarray(self._data._scale_factors[level], dtype=float),
+            displayed_axes,
+        )
+        step = 0.5 * float(np.max(factors))
+        count = int(np.clip((high - low) / step, 2, 4096))
+        steps = np.linspace(low, high, count)
         points = center[None, :] + steps[:, None] * direction[None, :]
-        with vdata.lock:
+        lock = vdata.lock
+        if not lock.acquire(blocking=blocking):
+            return None
+        try:
             slab = vdata.hyperslice
             if slab is None or slab.ndim != 3 or 0 in slab.shape:
                 return None
@@ -1332,18 +1458,21 @@ class ProgressiveLoader:
             inside = np.all(
                 (index >= 0) & (index < np.asarray(slab.shape)), axis=1
             )
-            if not np.any(inside):
+            if not np.any(inside) or (
+                require_coverage and not np.all(inside)
+            ):
                 return None
             order = np.argsort(displayed_axes)
             picked = index[inside][:, order]
             values = np.asarray(
                 slab[picked[:, 0], picked[:, 1], picked[:, 2]], dtype=float
             )
+        finally:
+            lock.release()
         hits = np.flatnonzero(values > threshold)
         if not len(hits):
             return None
-        first = float(steps[np.flatnonzero(inside)[hits[0]]])
-        return max(first - coarse_step, enter)
+        return float(steps[np.flatnonzero(inside)[hits[0]]])
 
     def _camera_bbox_level0(self, displayed_axes) -> np.ndarray | None:
         """Approximate visible bbox around the camera, in level-0 coords.
