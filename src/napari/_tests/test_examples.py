@@ -28,6 +28,8 @@ skip = [
     'embed_ipython_.py',  # fails without monkeypatch
     'new_theme.py',  # testing theme is extremely slow on CI
     'dynamic-projections-dask.py',  # extremely slow / does not finish
+    'progressive_loading_viewer_uv_.py',  # uv-only launcher, requires network access
+    'progressive_surface_lodstone_uv_.py',  # uv-only launcher, needs lodstone[mesh]
 ]
 # To skip examples during docs build end name with `_.py`
 

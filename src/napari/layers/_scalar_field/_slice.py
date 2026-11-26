@@ -252,6 +252,11 @@ class _ScalarFieldSliceRequest:
         The dtype of the layer's data.
     data_slice : _ThickNDSlice
         The slicing coordinates and margins in data space.
+    crop_to_corners_3d : bool
+        Whether ``corner_pixels`` describes a 3D sub-volume tile to crop to.
+        False (the default) slices the full level in 3D; set by the
+        experimental progressive loader, which renders view-centered tiles
+        of levels too large for a single texture.
     others
         See the corresponding attributes in `Layer` and `Image`.
     id : int
@@ -272,6 +277,7 @@ class _ScalarFieldSliceRequest:
     thumbnail_level: int = field(repr=False)
     level_shapes: np.ndarray = field(repr=False)
     downsample_factors: np.ndarray = field(repr=False)
+    crop_to_corners_3d: bool = field(default=False, repr=False)
     id: int = field(default_factory=_next_request_id)
 
     def __call__(self) -> _ScalarFieldSliceResponse:
@@ -332,9 +338,12 @@ class _ScalarFieldSliceRequest:
         for d in self.slice_input.displayed:
             scale[d] = self.downsample_factors[self.data_level][d]
 
+        # Crop the displayed dimensions to the corner pixels: in 2D the
+        # visible canvas region, in 3D only when the corners describe a
+        # sub-volume tile (see ``_max_tile_extent_3d``).
         translate = np.zeros(self.slice_input.ndim)
         disp_slice = [slice(None)] * self.slice_input.ndim
-        if self.slice_input.ndisplay == 2:
+        if self.slice_input.ndisplay == 2 or self.crop_to_corners_3d:
             for d in self.slice_input.displayed:
                 disp_slice[d] = slice(
                     self.corner_pixels[0, d],
@@ -374,9 +383,20 @@ class _ScalarFieldSliceRequest:
         # The thumbnail only needs the full extent, not a particular level.
         if self._tile_covers_level():
             thumbnail = image
-        else:
+        elif self._thumbnail_level_is_plane():
             thumbnail = _ScalarFieldView.from_view(
                 np.transpose(self._thumbnail_plane(), order)
+            )
+        else:
+            # a cropped 3D tile: project the whole thumbnail volume, uncached
+            thumbnail_slice = self._thick_slice_at_level(self.thumbnail_level)
+            thumbnail = _ScalarFieldView.from_view(
+                np.transpose(
+                    self._project_thick_slice(
+                        self.data[self.thumbnail_level], thumbnail_slice
+                    ),
+                    order,
+                )
             )
 
         return _ScalarFieldSliceResponse(
@@ -398,7 +418,7 @@ class _ScalarFieldSliceRequest:
 
     def _tile_covers_level(self) -> bool:
         """Whether the image tile spans the full extent of its data level."""
-        if self.slice_input.ndisplay == 3:
+        if self.slice_input.ndisplay == 3 and not self.crop_to_corners_3d:
             return True  # volume display ignores corner bounds
         shape = self.level_shapes[self.data_level]
         return all(

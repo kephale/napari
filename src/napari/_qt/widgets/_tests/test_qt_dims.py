@@ -473,3 +473,19 @@ def test_loop_mode_model_update_emits_once(qtbot):
     assert slider.loop_mode == 'once'
     assert slider.play_button.mode_combo.currentText() == 'once'
     assert observed == ['once']
+
+
+@pytest.mark.parametrize('nsteps', [2**30 + 1, 2**33])
+def test_dims_sliders_accept_more_steps_than_qt_ints(qtbot, nsteps):
+    """A deep pyramid's axis can have more steps than Qt's 32-bit sliders
+    and validators hold (2**30 at 25 levels of 32-voxel tiles overflowed
+    the slice label's validator; 2**31 at 26 levels the slider)."""
+    dims = Dims(ndim=3, ndisplay=2, range=((0, nsteps, 1),) * 3)
+    view = QtDims(dims)
+    qtbot.addWidget(view)
+
+    slider = view.slider_widgets[0]
+    assert 0 < slider.slider.maximum() <= 2**31 - 1
+    dims.set_current_step(0, nsteps - 1)
+    assert slider.slider.value() == min(dims.current_step[0], 2**31 - 1)
+    dims.range = ((0, nsteps + 10, 1),) * 3

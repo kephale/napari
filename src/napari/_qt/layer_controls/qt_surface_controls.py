@@ -8,7 +8,10 @@ from napari._qt.layer_controls.qt_image_controls_base import (
 from napari._qt.layer_controls.widgets import (
     QtProjectionModeControl,
 )
-from napari._qt.layer_controls.widgets._surface import QtShadingComboBoxControl
+from napari._qt.layer_controls.widgets._surface import (
+    QtShadingComboBoxControl,
+    QtStreamedLevelControl,
+)
 from napari._qt.utils import set_widgets_enabled_with_opacity
 
 if TYPE_CHECKING:
@@ -44,6 +47,8 @@ class QtSurfaceControls(QtBaseImageControls):
         self._add_widget_controls(self._shading_combobox_control)
         self._projection_mode_control = QtProjectionModeControl(self, layer)
         self._add_widget_controls(self._projection_mode_control)
+        self._streamed_level_control = QtStreamedLevelControl(self, layer)
+        self._add_widget_controls(self._streamed_level_control)
 
         self._on_surface_coloring_change()
 

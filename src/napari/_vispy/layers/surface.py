@@ -103,6 +103,7 @@ class VispySurfaceLayer(VispyBaseLayer):
             self._meshdata = MeshData()
         else:
             self._meshdata = self.node.mesh_data
+            self._use_precomputed_normals(vertices, faces)
         self._on_face_normals_change()
         self._on_vertex_normals_change()
 
@@ -113,6 +114,45 @@ class VispySurfaceLayer(VispyBaseLayer):
 
         # Call to update order of translation values with new dims:
         self._on_matrix_change()
+
+    def _use_precomputed_normals(self, vertices, faces) -> None:
+        """Take normals and per-corner arrays computed off the Qt thread
+        for exactly this mesh.
+
+        Streamed surfaces (``napari.experimental._lodstone_meshes``) compute
+        them as vispy would, for the vertices and faces they publish; vispy
+        otherwise derives them here when the shading is set, which takes
+        seconds for millions of faces.
+        """
+        hint = getattr(self.layer, '_precomputed_normals', None)
+        if hint is None or vertices is None or faces is None:
+            return
+        # kept while it matches: the node can be given the same mesh again
+        (
+            source_vertices,
+            source_faces,
+            face_normals,
+            vertex_normals,
+            corners,
+            corner_normals,
+        ) = hint
+        data = self.layer.data
+        if (
+            data[0] is not source_vertices
+            or data[1] is not source_faces
+            or vertices.shape != source_vertices.shape
+            or faces.shape != source_faces.shape
+            or not np.array_equal(
+                vertices[[0, -1]], source_vertices[[0, -1], ::-1]
+            )
+            or not np.array_equal(faces[[0, -1]], source_faces[[0, -1], ::-1])
+        ):
+            return
+        meshdata = self._meshdata
+        meshdata._face_normals = face_normals
+        meshdata._vertex_normals = vertex_normals
+        meshdata._vertices_indexed_by_faces = corners
+        meshdata._vertex_normals_indexed_by_faces = corner_normals
 
     def _on_texture_change(self) -> None:
         """Update or apply the texture filter"""

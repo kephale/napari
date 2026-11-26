@@ -366,3 +366,28 @@ def test_vispy_quat_roundtrip(qapp, orientation, angles):
     view, up = view_and_up_directions_from_angles(angles, orientation)
     assert np.allclose(view_recovered, view)
     assert np.allclose(up_recovered, up)
+
+
+def test_arcball_drag_rotation_follows_the_rotation_scale(make_napari_viewer):
+    from types import SimpleNamespace
+
+    from vispy.util.quaternion import Quaternion
+
+    viewer = make_napari_viewer()
+    viewer.dims.ndisplay = 3
+    arcball = viewer.window._qt_viewer.canvas.camera._3D_camera
+
+    def drag_angle(scale):
+        """How far one drag turns the view, in radians."""
+        viewer.scene.camera._rotation_scale = scale
+        arcball._quaternion = Quaternion()
+        arcball._event_value = (100.0, 100.0)
+        arcball._update_rotation(SimpleNamespace(pos=(130.0, 110.0)))
+        # rotation angle independent of the quaternion's sign
+        w = abs(arcball._quaternion.w)
+        return 2 * np.arccos(min(w, 1.0))
+
+    full = drag_angle(1.0)
+    assert 0 < full < 1.0  # a short drag turns the view a little
+    assert drag_angle(0.5) == pytest.approx(full / 2, rel=1e-6)
+    assert drag_angle(0.25) == pytest.approx(full / 4, rel=1e-6)
