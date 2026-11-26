@@ -784,6 +784,15 @@ def test_clipmap_rings_surround_deep_targets_only(
         # level 4 is 16^3: the ring holds the whole level, the last one
         assert rings[1][1:] == ((0, 0, 0), (16, 16, 16))
 
+        # a ring stays put while the target stays well inside it, and
+        # moves once it nears an edge
+        loader._rings = rings
+        nudged = loader._ring_layout(0, (124, 124, 124), (140, 140, 140))
+        assert nudged[0][1:] == rings[0][1:]
+        moved = loader._ring_layout(0, (60, 60, 60), (76, 76, 76))
+        assert moved[0][1:] != rings[0][1:]
+        loader._rings = ()
+
         # four levels from the overview: no rings by default
         assert loader._ring_layout(1, (56, 56, 56), (72, 72, 72)) == ()
         loader._clipmap_ring_limit = 1
@@ -818,6 +827,10 @@ def test_clipmap_rings_receive_their_chunks(qtbot, make_napari_viewer) -> None:
         assert node.clipmap_enabled
 
         loader._configure_rings(0, (128, 128, 128), (136, 136, 136))
+        # staged until its upload drains, then shown
+        assert node.clipmap_rings_staged == (0,)
+        assert node.clipmap_rings == ()
+        loader._commit_ring_uploads()
         assert node.clipmap_rings == (0,)
         assert loader._rings == ((2, (24, 24, 24), (40, 40, 40)),)
         stages = loader._ring_stages()

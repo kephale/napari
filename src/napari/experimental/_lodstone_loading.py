@@ -908,6 +908,11 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             )
             low = np.floor(center * ratio - extent / 2).astype(np.int64)
             low = np.clip(low // chunks * chunks, 0, shape - extent)
+            kept = self._kept_ring(
+                index - 1, level, min_coord, max_coord, ratio, extent, shape
+            )
+            if kept is not None:
+                low = kept
             rings.append(
                 (
                     level,
@@ -918,6 +923,44 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             if np.all(extent >= shape):
                 break
         return tuple(rings)
+
+    def _kept_ring(
+        self, index, level, min_coord, max_coord, ratio, extent, shape
+    ) -> np.ndarray | None:
+        """The current ring's low corner if it can stay where it is.
+
+        A ring stays put while the target's footprint at its level keeps
+        an eighth of the ring's extent from its sides (or touches the
+        volume's edge, where the ring cannot move further): moving it
+        re-uploads its whole texture, which a rotating camera would
+        otherwise do at every pass.
+        """
+        if index >= len(self._rings):
+            return None
+        previous_level, previous_low, previous_high = self._rings[index]
+        previous_low = np.asarray(previous_low)
+        previous_high = np.asarray(previous_high)
+        if previous_level != level or not np.array_equal(
+            previous_high - previous_low, extent
+        ):
+            return None
+        foot_low = np.floor(np.asarray(min_coord) * ratio)
+        foot_high = np.ceil(np.asarray(max_coord) * ratio)
+        margin = extent // 8
+        low_ok = (foot_low >= previous_low + margin) | (previous_low == 0)
+        high_ok = (foot_high <= previous_high - margin) | (
+            previous_high == shape
+        )
+        return previous_low if np.all(low_ok & high_ok) else None
+
+    def _commit_ring_uploads(self) -> None:
+        """Show staged rings once their texture uploads have drained."""
+        from napari.experimental import _glir_metering
+
+        _glir_metering.remove_drain_callback(self._commit_ring_uploads)
+        node = self._get_volume_node()
+        if node is not None and hasattr(node, 'commit_clipmap_rings'):
+            node.commit_clipmap_rings()
 
     def _configure_rings(self, level: int, min_coord, max_coord) -> bool:
         """Place the clipmap rings around this pass's target region.
@@ -966,7 +1009,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
                 )
             previous = self._rings[index] if index < len(self._rings) else None
             if previous != (ring_level, low, high) or index not in (
-                node.clipmap_rings
+                node.clipmap_rings + node.clipmap_rings_staged
             ):
                 with vdata.lock:
                     start = np.asarray(vdata.interval[0])
@@ -975,7 +1018,7 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
                         for a, b, s in zip(low_a, high_a, start, strict=True)
                     )
                     data = np.array(vdata.hyperslice[crop])
-                node.set_clipmap_ring(
+                node.stage_clipmap_ring(
                     index,
                     data,
                     low,
@@ -987,6 +1030,18 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
             )
         if node is not None and hasattr(node, 'clear_clipmap_rings'):
             node.clear_clipmap_rings(len(rings))
+            if node.clipmap_rings_staged:
+                # a moved ring keeps drawing its old texture at its old
+                # place until the new upload lands (uploads are deferred
+                # while interacting); then texture and bounds swap together
+                from napari.experimental import _glir_metering
+
+                if _glir_metering.is_installed():
+                    _glir_metering.add_drain_callback(
+                        self._commit_ring_uploads
+                    )
+                else:
+                    node.commit_clipmap_rings()
         self._rings = rings
         self._ring_footprints = footprints
         return pending
@@ -1028,7 +1083,9 @@ class LodstoneProgressiveLoader(ProgressiveLoader):
         if (
             block is not None
             and node is not None
-            and index in getattr(node, 'clipmap_rings', ())
+            and index
+            in getattr(node, 'clipmap_rings', ())
+            + getattr(node, 'clipmap_rings_staged', ())
         ):
             _level, ring_low, ring_high = self._rings[index]
             block_low, block_high, data = block

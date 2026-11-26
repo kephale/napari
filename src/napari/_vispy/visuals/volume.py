@@ -820,6 +820,7 @@ class Volume(TextureMixin, BaseVolume):
         # per ring index: None, or {'texture', 'bounds'} with bounds in
         # normalized full-volume xyz coordinates
         self._clipmap_rings: list[dict | None] = [None] * CLIPMAP_MAX_RINGS
+        self._staged_rings: dict[int, dict] = {}
         self.clamp_at_border = False
         self.iso_gradient_mode = IsoCategoricalGradientMode.FAST.value
         self.freeze()
@@ -854,6 +855,7 @@ class Volume(TextureMixin, BaseVolume):
         self._clipmap_lookup = None
         self._clipmap_detail_bounds = None
         self._clipmap_rings = [None] * CLIPMAP_MAX_RINGS
+        self._staged_rings = {}
         self.freeze()
         self._refresh_origin()
         if self._requested_step_size is not None:
@@ -931,14 +933,47 @@ class Volume(TextureMixin, BaseVolume):
         ray. Ring 0 is the finest. ``low`` and ``high`` are zyx voxels of
         the ring's level, which ``scale`` maps to full-resolution voxels,
         as for :meth:`set_clipmap_detail_bounds`.
+
+        Shows it right away: when texture uploads are deferred (napari's
+        GLIR metering), use :meth:`stage_clipmap_ring` and commit once
+        they are done instead.
+        """
+        self.stage_clipmap_ring(index, data, low, high, scale)
+        self.commit_clipmap_rings()
+
+    def stage_clipmap_ring(
+        self,
+        index: int,
+        data: np.ndarray,
+        low: Sequence[float],
+        high: Sequence[float],
+        scale: float | Sequence[float] | None = None,
+    ) -> None:
+        """Upload ring ``index``'s next contents and bounds off-screen.
+
+        The ring keeps drawing its current texture at its current bounds
+        until :meth:`commit_clipmap_rings`: moving the bounds before a
+        deferred upload lands would draw the old contents displaced by
+        the move. Patches (:meth:`set_clipmap_ring_data`) go to the
+        staged texture meanwhile.
         """
         if not self._clipmap_enabled or self._clipmap_shape is None:
             return
         data = np.ascontiguousarray(data)
+        staged = self._staged_rings.get(index)
         ring = self._clipmap_rings[index]
-        texture = None if ring is None else ring['texture']
-        rebuild = texture is None or tuple(texture.shape[:3]) != data.shape[:3]
-        if rebuild:
+        texture = None
+        for candidate in (
+            None if staged is None else staged['texture'],
+            None if ring is None else ring.get('spare'),
+        ):
+            if (
+                candidate is not None
+                and tuple(candidate.shape[:3]) == data.shape[:3]
+            ):
+                texture = candidate
+                break
+        if texture is None:
             texture = self._create_texture(self.texture_format, data)
             texture.set_clim(self._texture.clim)
             texture.interpolation = self._texture.interpolation
@@ -954,17 +989,41 @@ class Volume(TextureMixin, BaseVolume):
             tuple(float(v) for v in ring_min[::-1] / shape),
             tuple(float(v) for v in ring_max[::-1] / shape),
         )
-        self._clipmap_rings[index] = {'texture': texture, 'bounds': bounds}
-        if rebuild:
+        self._staged_rings[index] = {'texture': texture, 'bounds': bounds}
+
+    @property
+    def clipmap_rings_staged(self) -> tuple[int, ...]:
+        """Indices of rings with staged contents not yet shown."""
+        return tuple(sorted(self._staged_rings))
+
+    def commit_clipmap_rings(self) -> None:
+        """Show every staged ring: its texture and bounds together."""
+        if not self._staged_rings:
+            return
+        before = self.clipmap_rings
+        for index, staged in self._staged_rings.items():
+            old = self._clipmap_rings[index]
+            # the texture it replaces takes the next staged upload
+            staged['spare'] = None if old is None else old['texture']
+            self._clipmap_rings[index] = staged
+        self._staged_rings.clear()
+        if self.clipmap_rings != before or self._clipmap_lookup is None:
             self._install_clipmap_lookup()
-        else:
-            self._refresh_origin()
+            return
+        for index in self.clipmap_rings:
+            self._clipmap_lookup[f'ring{index}_texture'] = self._clipmap_rings[
+                index
+            ]['texture']  # type: ignore[index]
+        self._refresh_origin()
 
     def set_clipmap_ring_data(
         self, index: int, data: np.ndarray, offset: Sequence[int]
     ) -> None:
-        """Patch ring ``index``'s texture at ``offset`` (zyx texels)."""
-        ring = self._clipmap_rings[index] if self._clipmap_enabled else None
+        """Patch ring ``index``'s texture at ``offset`` (zyx texels): the
+        staged one if the ring is moving, else the one shown."""
+        if not self._clipmap_enabled:
+            return
+        ring = self._staged_rings.get(index) or self._clipmap_rings[index]
         if ring is None:
             return
         self._set_texture_data(ring['texture'], data, offset)
@@ -972,6 +1031,9 @@ class Volume(TextureMixin, BaseVolume):
 
     def clear_clipmap_rings(self, start: int = 0) -> None:
         """Stop drawing rings ``start`` and up."""
+        for index in list(self._staged_rings):
+            if index >= start:
+                del self._staged_rings[index]
         if not any(ring is not None for ring in self._clipmap_rings[start:]):
             return
         for index in range(start, CLIPMAP_MAX_RINGS):

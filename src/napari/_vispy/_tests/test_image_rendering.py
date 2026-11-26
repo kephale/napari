@@ -262,6 +262,20 @@ def test_clipmap_rings_draw_between_detail_and_overview(
     assert node._clipmap_lookup['ring_gate'].value == 1.0
     node.method = 'mip'
 
+    # a moving ring keeps drawing its old texture at its old bounds until
+    # committed: a deferred upload must not show displaced
+    shown = program['u_ring0_min']
+    node.stage_clipmap_ring(
+        0, np.zeros((12, 12, 12), dtype=np.uint8), (3, 3, 3), (15, 15, 15), 4
+    )
+    assert node.clipmap_rings_staged == (0,)
+    np.testing.assert_allclose(program['u_ring0_min'], shown)
+    assert lit() == with_ring
+    node.commit_clipmap_rings()
+    assert node.clipmap_rings_staged == ()
+    assert not np.allclose(program['u_ring0_min'], shown)
+    assert lit() == 0
+
     node.clear_clipmap_rings()
     assert node.clipmap_rings == ()
     assert program['u_ring0_active'] == 0.0
