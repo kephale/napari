@@ -265,10 +265,13 @@ def test_camera_gestures_update_the_stream_at_a_bounded_rate(
         monkeypatch.setattr(
             loader.stream,
             'update',
-            lambda view, **kwargs: (views.append(view), update(view, **kwargs)),
+            lambda view, **kwargs: (
+                views.append(view),
+                update(view, **kwargs),
+            ),
         )
         qtbot.wait(300)
-        for step in range(40):
+        for _step in range(40):
             viewer.scene.camera.zoom *= 1.05
         qtbot.wait(400)
         assert 1 <= len(views) <= 3
@@ -277,3 +280,58 @@ def test_camera_gestures_update_the_stream_at_a_bounded_rate(
         )
     finally:
         loader.close()
+
+
+def test_normals_match_vispy_and_reach_the_surface_node(make_napari_viewer):
+    """Streamed surfaces compute their normals off the Qt thread, as vispy
+    would for napari's surface node, which uses them instead of deriving
+    its own (seconds for meshes of millions of faces)."""
+    from vispy.geometry.meshdata import MeshData as VispyMeshData
+
+    from napari.experimental._lodstone_meshes import _vispy_normals
+
+    rng = np.random.default_rng(0)
+    data = _grid(6, 10.0, (0.0, 0.0, 0.0))
+    vertices = np.asarray(data.vertices) + rng.normal(
+        0, 0.5, data.vertices.shape
+    ).astype(np.float32)
+    faces = np.asarray(data.faces)
+    face_normals, vertex_normals, corners, corner_normals = _vispy_normals(
+        vertices, faces
+    )
+    expected = VispyMeshData(vertices[:, ::-1], faces[:, ::-1])
+    np.testing.assert_allclose(face_normals, expected.get_face_normals())
+    np.testing.assert_allclose(
+        vertex_normals, expected.get_vertex_normals(), atol=1e-6
+    )
+    np.testing.assert_array_equal(
+        corners, expected.get_vertices(indexed='faces')
+    )
+    np.testing.assert_allclose(
+        corner_normals,
+        expected.get_vertex_normals(indexed='faces'),
+        atol=1e-6,
+    )
+
+    viewer = make_napari_viewer()
+    layer = add_lodstone_surface(SheetSource(), viewer, dispatch=_inline)
+    loader = _loader(layer)
+    viewer.dims.ndisplay = 3
+    loader.stream.wait()
+    loader.refresh()
+    loader.stream.wait()
+    prepared = loader.target.prepare(
+        0, [((0, (0,)), data), ((0, (1,)), _grid(6, 10.0, (10.0, 0, 0)))]
+    )
+    loader.target.replace_prepared(0, [], prepared)
+    node = viewer.window._qt_viewer.layer_to_visual[layer].node
+    # the node's normals are the ones prepared off the Qt thread
+    assert node.mesh_data._vertex_normals is prepared[2][1]
+    assert node.mesh_data._face_normals is prepared[2][0]
+    assert node.mesh_data.get_vertices(indexed='faces') is prepared[2][2]
+
+    # other data replacing the published mesh never takes its normals
+    other = (prepared[0].copy(), prepared[1].copy())
+    layer.data = other
+    assert node.mesh_data._vertex_normals is not prepared[2][1]
+    loader.close()

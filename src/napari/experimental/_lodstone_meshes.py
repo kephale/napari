@@ -114,6 +114,44 @@ def _weld(
     return vertices[first], inverse.reshape(-1)[faces]
 
 
+def _vispy_normals(
+    vertices: np.ndarray, faces: np.ndarray
+) -> tuple[np.ndarray, ...]:
+    """The arrays vispy derives from a napari surface's mesh to draw it.
+
+    napari's surface node draws ``vertices[:, ::-1]`` with ``faces[:, ::-1]``,
+    and on the Qt thread derives face and vertex normals and per-corner
+    copies of the vertices and normals (vispy draws each triangle from
+    its own three corners), which takes seconds for meshes of millions of
+    faces. Computing them here, the same way, lets the node use them
+    instead (see ``VispySurfaceLayer._use_precomputed_normals``). Vertex
+    normals accumulate face normals with ``bincount``: what vispy's
+    ``np.add.at`` sums, faster.
+
+    Returns face normals, vertex normals, and the vertices and vertex
+    normals of each face's corners.
+    """
+    node_vertices = np.ascontiguousarray(vertices[:, ::-1], dtype=np.float32)
+    node_faces = np.ascontiguousarray(faces[:, ::-1])
+    corners = node_vertices[node_faces]
+    face_normals = np.cross(
+        corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]
+    )
+    index = node_faces.ravel()
+    repeated = np.repeat(face_normals, 3, axis=0)
+    vertex_normals = np.stack(
+        [
+            np.bincount(index, repeated[:, axis], minlength=len(vertices))
+            for axis in range(3)
+        ],
+        axis=1,
+    ).astype(node_vertices.dtype)
+    norms = np.sqrt((vertex_normals**2).sum(axis=1))
+    nonzero = norms > 0
+    vertex_normals[nonzero] /= norms[nonzero][:, None]
+    return face_normals, vertex_normals, corners, vertex_normals[node_faces]
+
+
 def _placeholder(
     low: np.ndarray, high: np.ndarray, source_to_data: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -151,16 +189,17 @@ class NapariSurfaceTarget:
 
     def prepare(
         self, level: int, chunks: Sequence[tuple[MeshKey, MeshData]]
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Merge and weld a phase's fragments (off the dispatch thread).
+    ) -> tuple[np.ndarray, np.ndarray, tuple | None]:
+        """Merge and weld a phase's fragments and compute its normals (off
+        the dispatch thread).
 
         Lodstone versions that support two-step targets call this from a
         worker, so only :meth:`replace_prepared` runs on the Qt thread.
         """
         vertices, faces = _combine(chunks, self.source_to_data)
         if not len(faces):
-            return self.placeholder
-        return vertices, faces
+            return (*self.placeholder, None)
+        return vertices, faces, _vispy_normals(vertices, faces)
 
     def replace_prepared(
         self,
@@ -168,12 +207,18 @@ class NapariSurfaceTarget:
         chunks: Sequence[tuple[MeshKey, MeshData]],
         prepared: tuple[np.ndarray, np.ndarray],
     ) -> None:
-        vertices, faces = prepared
+        vertices, faces, *rest = prepared
+        normals = rest[0] if rest else None
         # Record the publication first: ``layer.data`` emits synchronously and
         # listeners read the target to describe what is shown.
         self.level = level
         self.vertices, self.faces = len(vertices), len(faces)
         self.publications += 1
+        # the surface node takes these instead of computing its own when
+        # its mesh is exactly this one
+        self.layer._precomputed_normals = (
+            None if normals is None else (vertices, faces, *normals)
+        )
         self.layer.data = (vertices, faces)
 
     def replace(
