@@ -335,3 +335,74 @@ def test_normals_match_vispy_and_reach_the_surface_node(make_napari_viewer):
     layer.data = other
     assert node.mesh_data._vertex_normals is not prepared[2][1]
     loader.close()
+
+
+def test_locked_level_holds_whatever_the_camera(viewer):
+    source = SheetSource()
+    layer = add_lodstone_surface(source, viewer, dispatch=_inline)
+    loader = _loader(layer)
+    viewer.dims.ndisplay = 3
+    viewer.scene.camera.center = (5.0, 50.0, 100.0)
+    viewer.scene.camera.zoom = 0.02
+    loader.stream.wait()
+    assert loader.target.level == 2
+
+    loader.locked_level = 0
+    loader.stream.wait()
+    assert loader.target.level == 0
+    # zooming out keeps the locked level
+    viewer.scene.camera.zoom = 0.01
+    loader.stream.wait()
+    assert loader.target.level == 0
+
+    loader.locked_level = None
+    loader.stream.wait()
+    assert loader.target.level == 2
+    with pytest.raises(ValueError, match='outside the source'):
+        loader.locked_level = len(source.levels)
+    loader.close()
+
+
+def test_surface_controls_show_and_lock_the_streamed_level(
+    make_napari_viewer,
+):
+    """The resolution control names the level shown, like the multiscale
+    image control, and locks the stream to a chosen level."""
+    from napari.layers import Surface
+
+    viewer = make_napari_viewer()
+    plain = viewer.add_surface(
+        (np.eye(3, dtype=np.float32), np.array([[0, 1, 2]]))
+    )
+    controls = viewer.window._qt_viewer.controls.widgets
+    assert isinstance(plain, Surface)
+    assert controls[plain]._streamed_level_control.level_combobox.isHidden()
+
+    source = SheetSource()
+    layer = add_lodstone_surface(source, viewer, dispatch=_inline)
+    loader = _loader(layer)
+    viewer.dims.ndisplay = 3
+    viewer.scene.camera.center = (5.0, 50.0, 100.0)
+    viewer.scene.camera.zoom = 0.02
+    loader.stream.wait()
+    combo = controls[layer]._streamed_level_control.level_combobox
+    assert not combo.isHidden()
+    assert [combo.itemText(i) for i in range(combo.count())] == [
+        'Auto (2)',
+        '0: 2 chunks',
+        '1: 2 chunks',
+        '2: 2 chunks',
+    ]
+
+    combo.setCurrentIndex(1)
+    loader.stream.wait()
+    assert loader.locked_level == 0
+    assert loader.target.level == 0
+    assert combo.itemText(0) == 'Auto (0)'
+
+    combo.setCurrentIndex(0)
+    loader.stream.wait()
+    assert loader.locked_level is None
+    assert loader.target.level == 2
+    assert combo.itemText(0) == 'Auto (2)'
+    loader.close()

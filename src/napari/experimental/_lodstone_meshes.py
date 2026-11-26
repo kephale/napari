@@ -280,6 +280,7 @@ class LodstoneSurfaceLoader:
         )
         self._closed = False
         self._last_matrix: np.ndarray | None = None
+        self._locked_level: int | None = None
         self._connections = [
             (viewer.scene.camera.events.center, self._on_view_change),
             (viewer.scene.camera.events.zoom, self._on_view_change),
@@ -290,6 +291,23 @@ class LodstoneSurfaceLoader:
         ]
         for emitter, callback in self._connections:
             emitter.connect(callback)
+
+    @property
+    def locked_level(self) -> int | None:
+        """The level shown whatever the camera, or ``None`` to follow it."""
+        return self._locked_level
+
+    @locked_level.setter
+    def locked_level(self, level: int | None) -> None:
+        if level is not None:
+            level = int(level)
+            if not 0 <= level < len(self.source.levels):
+                raise ValueError('mesh level is outside the source')
+        if level == self._locked_level:
+            return
+        self._locked_level = level
+        self._last_matrix = None
+        self.refresh()
 
     def view(self) -> View | None:
         """The current camera in the source frame, or ``None`` outside 3D."""
@@ -354,7 +372,7 @@ class LodstoneSurfaceLoader:
         ):
             return
         self._last_matrix = np.array(view.world_to_clip)
-        self.stream.update(view)
+        self.stream.update(view, level=self._locked_level)
 
     def _request_coarsest(self) -> None:
         low, high = _source_bounds(self.source)
